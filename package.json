@@ -1,0 +1,19 @@
+{
+  "name": "xorgate-device-agent",
+  "version": "0.1.0",
+  "description": "Xorgate device telemetry agent (simulator-first). Publishes 1 Hz schema-valid telemetry to AWS IoT Core over mTLS.",
+  "type": "module",
+  "bin": {
+    "xorgate-agent": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "sim": "MODE=sim node src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "mqtt": "^5.1.0"
+  }
+}

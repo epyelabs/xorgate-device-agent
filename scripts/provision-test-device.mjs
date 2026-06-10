@@ -95,9 +95,34 @@ writeFileSync(resolve(credsDir, "private.key"), prov.iot.privateKey)
 const ca = await fetch(CA_URL).then((r) => r.text())
 writeFileSync(resolve(credsDir, "ca.pem"), ca)
 
-console.log("\n✅ wrote creds/cert.crt, creds/private.key, creds/ca.pem")
-console.log("\nRun the simulator with:\n")
+// 7. Write a KVS manifest the synthetic-video master needs (the cert bundle alone
+//    is missing the credential endpoint, role alias, region, and channel names —
+//    all of which the provision response returns but we'd otherwise drop).
+const kvsManifest = {
+  deviceId: device.id,
+  region: prov.kvs?.region,
+  credentialEndpoint: prov.iot.credentialEndpoint,
+  roleAlias: prov.iot.roleAlias,
+  channels: (prov.kvs?.channels ?? []).map((c) => ({
+    streamKey: c.streamKey,
+    channelName: c.channelName,
+    channelArn: c.channelArn,
+  })),
+}
+writeFileSync(
+  resolve(credsDir, "kvs.json"),
+  JSON.stringify(kvsManifest, null, 2),
+)
+
+console.log(
+  "\n✅ wrote creds/cert.crt, creds/private.key, creds/ca.pem, creds/kvs.json",
+)
+console.log("\nRun the telemetry simulator with:\n")
 console.log(
   `  DEVICE_ID=${device.id} IOT_DATA_ENDPOINT=${prov.iot.dataEndpoint} npm start\n`,
+)
+console.log("Run the synthetic-video master (feeds the live VIEWER) with:\n")
+console.log(
+  `  docker run --rm -v "${credsDir}:/creds:ro" xorgate-synthetic-master\n`,
 )
 console.log(`Live screen: /devices/${device.id}/live`)

@@ -1,0 +1,128 @@
+name: Device — deploy prod
+
+# Builds the device agent at a release tag and uploads the dist tarball to the
+# prod S3 bucket (xorgate-device-dist-<account>-<region>). install.sh on the
+# prod API downloads the build from this bucket.
+#
+# Triggered when a GitHub Release is published (or manually via workflow_dispatch
+# with an existing tag). The version baked into the tarball is the release tag,
+# so the prod install.sh can pin a specific build by setting DEVICE_DIST_VERSION
+# on the InstallScriptFn (defaults to `latest`).
+#
+# Prerequisites are the same IAM machine user / repo secrets as the dev workflow
+# (see .github/workflows/device-deploy-dev.yml). The user's policy must also
+# cover the prod dist bucket and the XorgateCoreStorageStack stack output.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: device-deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release event: the tag ref; manual: the provided tag input.
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          if [ -z "$VERSION" ]; then echo "no release tag"; exit 1; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Pack tarball
+        id: pack
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          TARBALL="xorgate-agent-${VERSION}.tar.gz"
+          tar -czf "$TARBALL" dist package.json package-lock.json systemd
+          echo "Contents:"
+          tar -tzf "$TARBALL" | head -30
+          tar -tzf "$TARBALL" | grep -q "^dist/worker.js$" || { echo "missing dist/worker.js"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^package.json$" || { echo "missing package.json"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^package-lock.json$" || { echo "missing package-lock.json"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^systemd/xorgate-agent.service$" || { echo "missing systemd unit"; exit 1; }
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Resolve dist bucket from CloudFormation
+        id: bucket
+        env:
+          STACK: XorgateCoreStorageStack
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='DeviceDistBucketName'].OutputValue" \
+            --output text)
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            echo "could not resolve DeviceDistBucketName from $STACK"
+            exit 1
+          fi
+          echo "Using dist bucket: $BUCKET"
+          echo "name=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to S3 (versioned + latest)
+        env:
+          BUCKET: ${{ steps.bucket.outputs.name }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          aws s3 cp "$TARBALL" "s3://$BUCKET/$TARBALL" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --content-type "application/gzip"
+          aws s3 cp "$TARBALL" "s3://$BUCKET/xorgate-agent-latest.tar.gz" \
+            --cache-control "no-cache" \
+            --content-type "application/gzip"
+
+      - name: Summary
+        if: always()
+        env:
+          BUCKET: ${{ steps.bucket.outputs.name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          {
+            echo "## Device prod deploy"
+            echo ""
+            echo "- Version: \`$VERSION\`"
+            echo "- Bucket: \`$BUCKET\`"
+            echo "  - \`s3://$BUCKET/xorgate-agent-$VERSION.tar.gz\` (immutable)"
+            echo "  - \`s3://$BUCKET/xorgate-agent-latest.tar.gz\` (alias)"
+          } >> "$GITHUB_STEP_SUMMARY"

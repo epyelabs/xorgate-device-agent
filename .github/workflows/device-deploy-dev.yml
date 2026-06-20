@@ -1,0 +1,134 @@
+name: Device — deploy dev
+
+# Builds the device agent and uploads the dist tarball to the dev S3 bucket
+# (xorgate-device-dist-dev-<account>-<region>). install.sh (served per-request
+# by `GET /get/:code` on the dev API) downloads the build from this bucket.
+#
+# # Prerequisites (one-time, manual, in AWS)
+#
+#   1. An IAM machine user (one user can cover both dev + prod CI) with an
+#      inline policy granting:
+#        - s3:PutObject, s3:PutObjectAcl, s3:DeleteObject on the dev AND prod
+#          dist buckets ("/*" suffix)
+#        - s3:ListBucket on the dev AND prod dist buckets (no suffix)
+#        - cloudformation:DescribeStacks on XorgateCoreStorageStackDev AND
+#          XorgateCoreStorageStack (so we read the dist bucket name from the
+#          stack output instead of hard-coding it)
+#   2. Mint one access-key pair for that user.
+#   3. Store as GitHub repo SECRETS (Settings → Secrets and variables → Actions):
+#        AWS_ACCESS_KEY_ID     = AKIA…
+#        AWS_SECRET_ACCESS_KEY = the secret half
+#      Optional repo VARIABLE (Variables tab), defaults to us-east-1:
+#        AWS_REGION            = us-east-1
+#
+# Static keys are a temporary measure; migrate to GitHub OIDC later.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "systemd/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/device-deploy-dev.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: device-deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack tarball
+        id: pack
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TARBALL="xorgate-agent-${SHORT_SHA}.tar.gz"
+          tar -czf "$TARBALL" dist package.json package-lock.json systemd
+          echo "Contents:"
+          tar -tzf "$TARBALL" | head -30
+          # install.sh extracts to /opt/xorgate and expects these entries.
+          tar -tzf "$TARBALL" | grep -q "^dist/worker.js$" || { echo "missing dist/worker.js"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^package.json$" || { echo "missing package.json"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^package-lock.json$" || { echo "missing package-lock.json"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^systemd/xorgate-agent.service$" || { echo "missing systemd unit"; exit 1; }
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "version=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Resolve dist bucket from CloudFormation
+        id: bucket
+        env:
+          STACK: XorgateCoreStorageStackDev
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='DeviceDistBucketName'].OutputValue" \
+            --output text)
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            echo "could not resolve DeviceDistBucketName from $STACK"
+            exit 1
+          fi
+          echo "Using dist bucket: $BUCKET"
+          echo "name=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to S3 (versioned + latest)
+        env:
+          BUCKET: ${{ steps.bucket.outputs.name }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          # Versioned tarball: immutable, cache forever.
+          aws s3 cp "$TARBALL" "s3://$BUCKET/$TARBALL" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --content-type "application/gzip"
+          # `latest` alias: install.sh's default DIST_VERSION points here.
+          aws s3 cp "$TARBALL" "s3://$BUCKET/xorgate-agent-latest.tar.gz" \
+            --cache-control "no-cache" \
+            --content-type "application/gzip"
+
+      - name: Summary
+        if: always()
+        env:
+          BUCKET: ${{ steps.bucket.outputs.name }}
+          VERSION: ${{ steps.pack.outputs.version }}
+        run: |
+          {
+            echo "## Device dev deploy"
+            echo ""
+            echo "- Version: \`$VERSION\`"
+            echo "- Bucket: \`$BUCKET\`"
+            echo "- Tarballs:"
+            echo "  - \`s3://$BUCKET/xorgate-agent-$VERSION.tar.gz\` (immutable)"
+            echo "  - \`s3://$BUCKET/xorgate-agent-latest.tar.gz\` (alias)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -40,35 +40,37 @@ export function createSimulator() {
   const cpuUsage = channel(31, 3, 1, 100); // %
   const cpuTemp = channel(54, 0.6, 35, 85); // °C
   const ramUsage = channel(47, 1.5, 10, 95); // %
+  const diskUsage = channel(38, 0.3, 5, 95); // %
 
   return function next() {
     const spd = speed();
     // Nudge position proportional to speed so the map track is coherent.
     const drift = (spd / 25) * 0.0004;
-    lat = clamp(lat + (Math.random() * 2 - 1) * drift, 37.70, 37.83);
+    lat = clamp(lat + (Math.random() * 2 - 1) * drift, 37.7, 37.83);
     lon = clamp(lon + (Math.random() * 2 - 1) * drift, -122.52, -122.36);
 
     return {
       metrics: {
         imu: {
-          x: { value: round(imuX(), 3), unit: 'm/s^2' },
-          y: { value: round(imuY(), 3), unit: 'm/s^2' },
-          z: { value: round(imuZ(), 3), unit: 'm/s^2' },
+          x: { value: round(imuX(), 3), unit: "m/s^2" },
+          y: { value: round(imuY(), 3), unit: "m/s^2" },
+          z: { value: round(imuZ(), 3), unit: "m/s^2" },
         },
         gps: {
           lat: { value: round(lat, 6) },
           lon: { value: round(lon, 6) },
-          alt: { value: round(alt(), 1), unit: 'm' },
-          speed: { value: round(spd, 1), unit: 'km/h' },
+          alt: { value: round(alt(), 1), unit: "m" },
+          speed: { value: round(spd, 1), unit: "km/h" },
         },
         lte: {
-          rssi: { value: round(rssi(), 0), unit: 'dBm' },
-          quality: { value: round(quality(), 0), unit: 'asu' },
+          rssi: { value: round(rssi(), 0), unit: "dBm" },
+          quality: { value: round(quality(), 0), unit: "asu" },
         },
         system: {
-          cpu_usage: { value: round(cpuUsage(), 1), unit: '%' },
-          cpu_temp: { value: round(cpuTemp(), 1), unit: '°C' },
-          ram_usage: { value: round(ramUsage(), 1), unit: '%' },
+          cpu_usage: { value: round(cpuUsage(), 1), unit: "%" },
+          cpu_temp: { value: round(cpuTemp(), 1), unit: "°C" },
+          ram_usage: { value: round(ramUsage(), 1), unit: "%" },
+          disk_usage: { value: round(diskUsage(), 1), unit: "%" },
         },
       },
       media: {

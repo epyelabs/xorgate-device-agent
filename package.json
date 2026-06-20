@@ -1,19 +1,35 @@
 {
   "name": "xorgate-device-agent",
-  "version": "0.1.0",
-  "description": "Xorgate device telemetry agent (simulator-first). Publishes 1 Hz schema-valid telemetry to AWS IoT Core over mTLS.",
+  "version": "0.2.0",
+  "description": "Xorgate device telemetry agent + CLI. Runs a 1 Hz mTLS telemetry agent as a managed background daemon (start/stop/status/restart) with an ink monitor UI. Simulator-first.",
   "type": "module",
   "bin": {
-    "xorgate-agent": "src/index.js"
-  },
-  "scripts": {
-    "start": "node src/index.js",
-    "sim": "MODE=sim node src/index.js"
+    "xorgate": "dist/cli.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.tsx",
+    "start": "tsx src/cli.tsx start",
+    "monitor": "tsx src/cli.tsx monitor",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "mqtt": "^5.1.0"
+    "execa": "^9.5.1",
+    "ink": "^5.1.0",
+    "ink-spinner": "^5.0.0",
+    "mqtt": "^5.1.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
   }
 }

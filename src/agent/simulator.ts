@@ -6,13 +6,14 @@
  * Each metric is a gentle bounded random walk, so live charts look realistic and
  * the GPS marker drifts smoothly. Values are clamped to plausible ranges.
  */
+import type { TelemetryReading } from "./telemetry.js";
 
-function clamp(v, min, max) {
+function clamp(v: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, v));
 }
 
 // A bounded random-walk channel: holds its own value across ticks.
-function channel(initial, step, min, max) {
+function channel(initial: number, step: number, min: number, max: number): () => number {
   let value = initial;
   return () => {
     value = clamp(value + (Math.random() * 2 - 1) * step, min, max);
@@ -20,7 +21,7 @@ function channel(initial, step, min, max) {
   };
 }
 
-export function createSimulator() {
+export function createSimulator(): () => TelemetryReading {
   // IMU around gravity (z ≈ 9.81 m/s^2), small jitter on x/y.
   const imuX = channel(0, 0.15, -2, 2);
   const imuY = channel(0, 0.15, -2, 2);
@@ -42,7 +43,7 @@ export function createSimulator() {
   const ramUsage = channel(47, 1.5, 10, 95); // %
   const diskUsage = channel(38, 0.3, 5, 95); // %
 
-  return function next() {
+  return function next(): TelemetryReading {
     const spd = speed();
     // Nudge position proportional to speed so the map track is coherent.
     const drift = (spd / 25) * 0.0004;
@@ -82,7 +83,7 @@ export function createSimulator() {
   };
 }
 
-function round(v, decimals) {
+function round(v: number, decimals: number): number {
   const f = 10 ** decimals;
   return Math.round(v * f) / f;
 }

@@ -95,10 +95,12 @@ describe("MonitorApp", () => {
     for (const title of ["IMU", "GPS", "LTE", "System", "Media", "Activity"]) {
       expect(frame).toContain(title); // sidebar lists every module
     }
-    expect(frame).toContain("linear acceleration"); // default selection = IMU detail
+    expect(frame).toContain("recent events"); // default selection = Activity detail
     expect(frame).toContain("stop"); // running → control hint
 
-    // Navigate down to GPS (index 1) → its detail (coordinates) shows on the right.
+    // Navigate down to GPS (index 3) → its detail (coordinates) shows on the right.
+    stdin.write("j");
+    stdin.write("j");
     stdin.write("j");
     await delay(80);
     frame = lastFrame() ?? "";

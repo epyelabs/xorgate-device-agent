@@ -265,4 +265,4 @@ const activity: Module = {
 };
 
 /** Sidebar order = navigation order. */
-export const MODULES: Module[] = [imu, gps, lte, system, media, activity];
+export const MODULES: Module[] = [activity, system, lte, gps, imu, media];

@@ -76,7 +76,7 @@ function snapshot(): StateSnapshot {
 }
 
 describe("MonitorApp", () => {
-  it("renders live telemetry from a running daemon", async () => {
+  it("renders header + sidebar and opens a module detail on navigation", async () => {
     const running: DaemonStatus = {
       kind: "running",
       record,
@@ -84,18 +84,27 @@ describe("MonitorApp", () => {
       state: snapshot(),
       stateFresh: true,
     };
-    const { lastFrame, unmount } = render(
+    const { lastFrame, stdin, unmount } = render(
       <MonitorApp agentArgs={["--offline"]} inspector={async () => running} />,
     );
     await delay(150); // let the first poll land
-    const frame = lastFrame() ?? "";
-    unmount();
 
+    let frame = lastFrame() ?? "";
     expect(frame).toContain("XORGATE Monitor");
-    expect(frame).toContain("connected");
-    expect(frame).toContain("37.774900"); // gps lat
-    expect(frame).toContain("rssi");
+    expect(frame).toContain("connected"); // connection moved to the header
+    for (const title of ["IMU", "GPS", "LTE", "System", "Media", "Activity"]) {
+      expect(frame).toContain(title); // sidebar lists every module
+    }
+    expect(frame).toContain("linear acceleration"); // default selection = IMU detail
     expect(frame).toContain("stop"); // running → control hint
+
+    // Navigate down to GPS (index 1) → its detail (coordinates) shows on the right.
+    stdin.write("j");
+    await delay(80);
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("37.774900");
+
+    unmount();
   });
 
   it("shows the not-running call-to-action when no daemon is present", async () => {

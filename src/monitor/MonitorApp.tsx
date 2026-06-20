@@ -1,30 +1,27 @@
 /**
- * Live monitor for the telemetry daemon (adapted from argus's DashboardScreen:
- * all panels mounted, responsive two-column collapse). Polls the daemon state
- * file via useDaemonState and drives start/stop/restart via useDaemonControls —
- * the SAME manager calls the CLI uses. Quitting the monitor never stops the
- * daemon (it's detached and independent).
+ * Live monitor for the telemetry daemon — argus-cli-style master/detail: a left
+ * sidebar lists the telemetry modules with live status; ↑/↓ select and ↵/→ open
+ * the selected module's detail on the right. Connection/Daemon stats live in the
+ * header. Daemon controls (start/stop/restart) are driven by the SAME manager
+ * the CLI uses, so the keybindings behave identically. Quitting never stops the
+ * detached daemon.
  */
 import { useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
-import { Header } from "../components/Header.js";
 import { KeyHints, type Hint } from "../components/KeyHints.js";
 import { LogView } from "../components/LogView.js";
+import { StatusBadge } from "../components/StatusBadge.js";
+import { PanelFrame } from "../dashboard/PanelFrame.js";
 import { useTerminalSize } from "../lib/useTerminalSize.js";
+import { MonitorHeader } from "./MonitorHeader.js";
+import { MODULES } from "./modules.js";
 import { useDaemonState, type Inspector } from "./useDaemonState.js";
 import { useDaemonControls } from "./useDaemonControls.js";
 import { useLogTail } from "./useLogTail.js";
-import { ConnectionPanel } from "./panels/ConnectionPanel.js";
-import { DaemonPanel } from "./panels/DaemonPanel.js";
-import { ImuPanel } from "./panels/ImuPanel.js";
-import { GpsPanel } from "./panels/GpsPanel.js";
-import { LtePanel } from "./panels/LtePanel.js";
-import { SystemPanel } from "./panels/SystemPanel.js";
-import { MediaPanel } from "./panels/MediaPanel.js";
-import { ActivityPanel } from "./panels/ActivityPanel.js";
 
-const WIDE_THRESHOLD = 100;
+const LIST_WIDTH = 22;
+const NARROW_THRESHOLD = 80;
 
 const BUSY_LABEL = {
   starting: "starting daemon…",
@@ -42,44 +39,95 @@ export function MonitorApp({
 }) {
   const { exit } = useApp();
   const { columns } = useTerminalSize();
-  const wide = columns >= WIDE_THRESHOLD;
+  const twoCol = columns >= NARROW_THRESHOLD;
+  const detailWidth = twoCol ? columns - LIST_WIDTH - 1 : undefined;
+
   const { status, now, refresh } = useDaemonState(1000, inspector);
   const controls = useDaemonControls(agentArgs, refresh);
+  const [selected, setSelected] = useState(0);
+  const [operating, setOperating] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const logLines = useLogTail(showLogs);
 
   const running = status.kind === "running";
+  const snapshot = running ? status.state : null;
 
-  useInput((input) => {
-    if (input === "q" || input === "Q") exit();
-    else if ((input === "s" || input === "S") && !running) controls.start();
-    else if ((input === "x" || input === "X") && running) controls.stop();
-    else if (input === "r" || input === "R") controls.restart();
-    else if (input === "l" || input === "L") setShowLogs((v) => !v);
+  useInput((input, key) => {
+    if (operating) {
+      if (input === "q" || input === "Q" || key.escape || key.leftArrow) setOperating(false);
+      return;
+    }
+    if (key.upArrow || input === "k") {
+      setSelected((i) => (i - 1 + MODULES.length) % MODULES.length);
+    } else if (key.downArrow || input === "j") {
+      setSelected((i) => (i + 1) % MODULES.length);
+    } else if ((key.return || key.rightArrow) && running) {
+      setOperating(true);
+    } else if ((input === "s" || input === "S") && !running) {
+      controls.start();
+    } else if ((input === "x" || input === "X") && running) {
+      controls.stop();
+    } else if (input === "r" || input === "R") {
+      controls.restart();
+    } else if (input === "l" || input === "L") {
+      setShowLogs((v) => !v);
+    } else if (input === "q" || input === "Q") {
+      exit();
+    }
   });
 
-  const hints: Hint[] = running
-    ? [
-        { keys: "x", label: "stop" },
-        { keys: "r", label: "restart" },
-        { keys: "l", label: showLogs ? "hide log" : "log" },
-        { keys: "q", label: "quit (daemon keeps running)" },
-      ]
-    : [
-        { keys: "s", label: "start" },
-        { keys: "r", label: "restart" },
-        { keys: "q", label: "quit" },
-      ];
+  const Detail = MODULES[selected].Detail;
 
-  const row = (children: React.ReactNode) => (
-    <Box flexDirection={wide ? "row" : "column"} gap={wide ? 1 : 0}>
-      {children}
+  const list = (
+    <Box flexDirection="column" width={twoCol ? LIST_WIDTH : undefined}>
+      {MODULES.map((m, i) => {
+        const st = m.status(snapshot);
+        return (
+          <PanelFrame key={m.id} title={m.title} isFocused={i === selected}>
+            <StatusBadge status={running ? st.status : "unknown"}>
+              {running ? st.label : "—"}
+            </StatusBadge>
+          </PanelFrame>
+        );
+      })}
     </Box>
   );
 
+  const detail = (
+    <Box
+      flexGrow={twoCol ? 0 : 1}
+      width={detailWidth}
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={operating ? "cyan" : "gray"}
+      paddingX={1}
+      marginLeft={twoCol ? 1 : 0}
+      marginTop={twoCol ? 0 : 1}
+    >
+      <Detail snapshot={snapshot} now={now} />
+    </Box>
+  );
+
+  const hints: Hint[] = !running
+    ? [
+        { keys: "s", label: "start" },
+        { keys: "r", label: "restart" },
+        { keys: "q", label: "quit" },
+      ]
+    : operating
+      ? [{ keys: "←/q", label: "back" }]
+      : [
+          { keys: "↑↓", label: "select" },
+          { keys: "↵", label: "open" },
+          { keys: "x", label: "stop" },
+          { keys: "r", label: "restart" },
+          { keys: "l", label: showLogs ? "hide log" : "log" },
+          { keys: "q", label: "quit (daemon keeps running)" },
+        ];
+
   return (
     <Box flexDirection="column">
-      <Header title="XORGATE Monitor" />
+      <MonitorHeader status={status} now={now} />
 
       {controls.busy ? (
         <Box marginBottom={1}>
@@ -90,9 +138,12 @@ export function MonitorApp({
       ) : null}
 
       {running ? (
-        <Body status={status} now={now} wide={wide} row={row} />
+        <Box flexDirection={twoCol ? "row" : "column"}>
+          {list}
+          {detail}
+        </Box>
       ) : (
-        <NotRunning status={status} />
+        <NotRunning stale={status.kind === "stale"} />
       )}
 
       {showLogs ? (
@@ -114,70 +165,7 @@ export function MonitorApp({
   );
 }
 
-function Body({
-  status,
-  now,
-  wide,
-  row,
-}: {
-  status: Extract<ReturnType<typeof useDaemonState>["status"], { kind: "running" }>;
-  now: number;
-  wide: boolean;
-  row: (children: React.ReactNode) => React.ReactNode;
-}) {
-  const { record, state: snapshot, stateFresh } = status;
-  const latest = snapshot?.latest ?? null;
-  const metrics = latest?.metrics;
-
-  return (
-    <Box flexDirection="column">
-      {row(
-        <>
-          <ConnectionPanel
-            connection={snapshot?.connection ?? "connecting"}
-            endpoint={snapshot?.endpoint ?? record.deviceId}
-            connectionSince={snapshot?.connectionSince ?? record.startedAt}
-            fresh={stateFresh}
-            now={now}
-          />
-          <DaemonPanel record={record} snapshot={snapshot} now={now} />
-        </>,
-      )}
-
-      {latest ? (
-        <>
-          {row(
-            <>
-              <ImuPanel imu={metrics?.imu} />
-              <GpsPanel gps={metrics?.gps} />
-              <LtePanel lte={metrics?.lte} />
-              <SystemPanel system={metrics?.system} />
-            </>,
-          )}
-          {row(
-            <>
-              <MediaPanel media={latest.media} />
-              <ActivityPanel events={snapshot?.recentEvents ?? []} />
-            </>,
-          )}
-        </>
-      ) : (
-        <Box marginTop={1}>
-          <Text color="cyan">
-            <Spinner type="dots" /> waiting for first telemetry tick…
-          </Text>
-        </Box>
-      )}
-    </Box>
-  );
-}
-
-function NotRunning({
-  status,
-}: {
-  status: ReturnType<typeof useDaemonState>["status"];
-}) {
-  const stale = status.kind === "stale";
+function NotRunning({ stale }: { stale: boolean }) {
   return (
     <Box
       flexDirection="column"
@@ -185,19 +173,13 @@ function NotRunning({
       borderColor={stale ? "yellow" : "gray"}
       paddingX={2}
       paddingY={1}
-      marginBottom={1}
     >
       <Text bold color={stale ? "yellow" : "white"}>
         {stale ? "◌ Daemon not running (stale pidfile)" : "○ Daemon not running"}
       </Text>
-      {stale && status.kind === "stale" ? (
-        <Text color="gray">
-          pidfile for pid {status.record.pid} —{" "}
-          {status.reason === "pid-reused" ? "pid was recycled" : "process is gone"}; start cleans it.
-        </Text>
-      ) : null}
       <Text color="gray">
-        Press <Text color="cyan">s</Text> to start the telemetry agent.
+        Press <Text color="cyan">s</Text> to start the telemetry agent
+        {stale ? " (the stale pidfile is cleaned automatically)" : ""}.
       </Text>
     </Box>
   );

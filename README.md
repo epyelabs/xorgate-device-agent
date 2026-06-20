@@ -20,7 +20,8 @@ xorgate <command> [agent flags]
   stop       Gracefully stop the daemon (publishes offline first)
   restart    Stop then start
   status     Is it running? pid, uptime, connection, last-telemetry age, counters
-  monitor    Live ink dashboard (start/stop/restart from inside)
+  monitor    Live ink dashboard — sidebar of telemetry modules (↑↓ select, ↵/→ open),
+             Connection/Daemon in the header; start/stop/restart from inside
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
 ```
 
@@ -152,8 +153,8 @@ src/
   commands/          # start, stop, restart, status, logs, monitor
   daemon/            # process manager (no React): runtime, pidfile, process, state, manager
   agent/             # telemetry core: config (+offline), mqtt (+stub), simulator, collectors
-  monitor/           # ink dashboard: MonitorApp, hooks, panels
-  components/ lib/ hardware/ dashboard/   # reusable UI + host-metrics (shared with argus-cli)
+  monitor/           # ink master/detail dashboard: MonitorHeader, modules, hooks
+  components/ lib/ hardware/ dashboard/   # reusable UI (shared with argus-cli)
 test/                # vitest: pidfile/state/process/manager logic + monitor UI smoke
 ```
 
@@ -162,9 +163,11 @@ metrics, I2C IMU) are intentionally inert stubs — the real firmware lands in
 **P5 (device firmware)**. The UI scaffolding (ink components, host-metrics
 readers) is adapted from `argus-test-bench/argus-cli`.
 
-The monitor header shows the **host** the monitor runs on (live CPU/temp/RAM/disk
-via the reused readers); the telemetry panels show what the **daemon publishes**
-(simulated values in `sim`/`--offline`). On real hardware the two converge.
+The monitor is a master/detail dashboard (argus-cli style): the header shows the
+daemon's **Connection** and **Daemon** stats, the left sidebar lists the telemetry
+modules (IMU/GPS/LTE/System/Media/Activity) with live status, and `↑↓`/`↵` open a
+module's detail on the right. The values shown are what the **daemon publishes**
+(simulated in `sim`/`--offline`; real reads land in P5).
 
 ## Build & test
 

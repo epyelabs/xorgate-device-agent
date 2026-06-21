@@ -17,7 +17,8 @@ import { createSimulator } from "./agent/simulator.js";
 import { createCollector } from "./agent/collectors/index.js";
 import type { StateSnapshot, TelemetryPayload, TelemetryReading } from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
-import { ensureHome } from "./daemon/runtime.js";
+import { ensureHome, workerPath } from "./daemon/runtime.js";
+import { removePidfile, writePidfile } from "./daemon/pidfile.js";
 
 const WRITTEN_BY = "xorgate-device-agent@0.2.0";
 
@@ -33,6 +34,26 @@ const source: { read: () => Promise<TelemetryReading> } =
       })();
 
 const now0 = Date.now();
+
+// When launched directly (e.g. by systemd's `node dist/worker.js`) rather than
+// by `xorgate start`, self-register a pidfile so `xorgate status`/`monitor` can
+// see this worker. The CLI manager sets XORGATE_MANAGED_BY=cli and writes the
+// pidfile itself, so we skip here to avoid two writers racing.
+const selfManaged = !process.env.XORGATE_MANAGED_BY;
+if (selfManaged) {
+  writePidfile({
+    pid: process.pid,
+    startedAt: now0,
+    deviceId: config.deviceId,
+    mode: config.mode,
+    rateHz: config.rateHz,
+    offline: config.offline,
+    worker: workerPath(),
+    argv: process.argv.slice(2),
+    nodeVersion: process.version,
+  });
+}
+
 const initial: StateSnapshot = {
   v: 1,
   writtenBy: WRITTEN_BY,
@@ -163,6 +184,9 @@ function shutdown(sig: string): void {
   console.log(`\n[agent] shutting down (${sig})…`);
   if (timer) clearInterval(timer);
   clearInterval(heartbeat);
+  // Only remove the pidfile if we wrote it (direct/systemd launch); when started
+  // by `xorgate stop` the manager owns pidfile removal.
+  if (selfManaged) removePidfile();
   store.setConnection("closed", now);
   store.event("info", `shutting down (${sig})`, now);
   store.flush(now, true);

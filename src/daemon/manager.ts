@@ -159,7 +159,14 @@ export async function start(argv: string[], now: number = Date.now()): Promise<S
     let child;
     try {
       const { command, args } = resolveWorkerSpawn(argv);
-      child = spawnDetached(command, args, fd, { ...process.env, XORGATE_HOME: runtimeHome() });
+      // XORGATE_MANAGED_BY tells the worker the CLI owns its pidfile, so it
+      // won't self-register and race this writer. (A worker launched directly,
+      // e.g. by systemd, has no such flag and registers itself.)
+      child = spawnDetached(command, args, fd, {
+        ...process.env,
+        XORGATE_HOME: runtimeHome(),
+        XORGATE_MANAGED_BY: "cli",
+      });
     } finally {
       closeSync(fd); // the child holds its own dup'd fd
     }

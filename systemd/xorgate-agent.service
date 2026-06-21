@@ -17,6 +17,11 @@
 # Runs as root for now (PoC). The agent only publishes telemetry over mTLS, so
 # this is low-risk; tighten to a dedicated system user once the agent no longer
 # needs privileged access.
+#
+# XORGATE_HOME points at the StateDirectory (/var/lib/xorgate) so the worker's
+# pidfile + state snapshot live in a stable, deterministic place. The `xorgate`
+# CLI wrapper installed by install.sh defaults to the same path, so
+# `sudo xorgate status` / `sudo xorgate monitor` reflect THIS running service.
 
 [Unit]
 Description=Xorgate device agent (IoT MQTT telemetry)
@@ -27,7 +32,11 @@ Wants=network-online.target
 Type=simple
 User=root
 EnvironmentFile=/etc/xorgate/agent.env
-RuntimeDirectory=xorgate
+# systemd creates/owns /var/lib/xorgate (persists across reboots); the worker
+# writes its pidfile + state.json there.
+StateDirectory=xorgate
+StateDirectoryMode=0700
+Environment=XORGATE_HOME=/var/lib/xorgate
 ExecStart=/usr/bin/env node /opt/xorgate/dist/worker.js
 
 # Restart on every exit (including a clean exit 0 after SIGTERM). Recovers from

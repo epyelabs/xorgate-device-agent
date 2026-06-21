@@ -13,6 +13,7 @@ import { stopCommand } from "./commands/stop.js";
 import { restartCommand } from "./commands/restart.js";
 import { statusCommand } from "./commands/status.js";
 import { logsCommand } from "./commands/logs.js";
+import { updateCommand } from "./commands/update.js";
 
 const VERSION = "0.2.0";
 /** Flags that take a value — skipped when locating the subcommand token. */
@@ -24,6 +25,8 @@ const VALUE_FLAGS = new Set([
   "--cert",
   "--key",
   "--ca",
+  "--tag",
+  "--from",
 ]);
 
 const argv = process.argv.slice(2);
@@ -69,6 +72,9 @@ async function main(): Promise<void> {
     case "logs":
       await logsCommand(rest);
       break;
+    case "update":
+      await updateCommand(rest);
+      break;
     case "monitor": {
       const { monitorCommand } = await import("./commands/monitor.js");
       await monitorCommand(rest);
@@ -97,6 +103,8 @@ Commands:
   status     Show whether the daemon is running (pid, uptime, connection, telemetry)
   monitor    Open the live ink dashboard (start/stop/restart from inside)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
+  update     Fetch the latest agent build, install it, and restart the service
+             (sudo; --tag <version> pins a build, --from <url> overrides the bucket)
 
 Agent flags (forwarded to start/restart/monitor):
   --offline              Run without AWS (stub mqtt + simulator) — no creds needed

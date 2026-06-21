@@ -143,14 +143,15 @@ Agent flags can be passed to `start`/`restart`/`monitor` (e.g.
 | `DEVICE_ID` | `--device-id` | — (required unless `--offline`) | Canonical `devices.id` (uuid). Also the MQTT clientId/thing name. |
 | `IOT_DATA_ENDPOINT` | `--endpoint` | — (required unless `--offline`) | `iot:Data-ATS` endpoint (`iot.dataEndpoint` from provisioning). |
 | `OFFLINE` | `--offline` | off | Network-free stub mqtt + simulator. No creds needed. |
-| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (P5 skeleton, inert). |
+| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU is live; GPS/LTE/system still P5 stubs). |
 | `RATE_HZ` | `--rate` | `1` | Publish rate. |
 | `CERT_PATH` | `--cert` | `./creds/cert.crt` | |
 | `KEY_PATH` | `--key` | `./creds/private.key` | |
 | `CA_PATH` | `--ca` | `./creds/ca.pem` | Amazon Root CA1. |
 
 Other env: `XORGATE_HOME` (runtime dir, default `~/.xorgate`),
-`XORGATE_STOP_TIMEOUT_MS` (graceful-stop timeout before SIGKILL, default 5000).
+`XORGATE_STOP_TIMEOUT_MS` (graceful-stop timeout before SIGKILL, default 5000),
+`XORGATE_PYTHON_DIR` (override the `python/` helper dir; defaults to the package root).
 
 ## Layout
 
@@ -166,10 +167,11 @@ src/
 test/                # vitest: pidfile/state/process/manager logic + monitor UI smoke
 ```
 
-`MODE=real` and the `agent/collectors/` reads (serial GPS/LTE, /proc + /sys system
-metrics, I2C IMU) are intentionally inert stubs — the real firmware lands in
-**P5 (device firmware)**. The UI scaffolding (ink components, host-metrics
-readers) is adapted from `argus-test-bench/argus-cli`.
+Under `MODE=real` the **IMU collector is live** (BNO085 over I2C — see below);
+the other `agent/collectors/` reads (serial GPS/LTE, /proc + /sys system metrics)
+are still inert stubs landing in **P5 (device firmware)**. The UI scaffolding
+(ink components, host-metrics readers) and the IMU read path are adapted from
+`argus-test-bench/argus-cli`.
 
 The monitor is a master/detail dashboard (argus-cli style): the header shows the
 daemon's **Connection** and **Daemon** stats, the left sidebar lists the telemetry
@@ -276,12 +278,41 @@ source is `DEVICE_DIST_BUCKET_URL` from `agent.env`; builds are published to S3 
 `.github/workflows/device-deploy-{dev,prod}.yml` (dev on push to `main`, prod on
 release).
 
+## IMU collector (BNO085, `MODE=real`)
+
+The IMU collector (`src/agent/collectors/imu.ts`) is a real read. It detects a
+BNO085 with `i2cdetect -y 1` (address `0x4a`/`0x4b`) and, when present, spawns
+`python/bno085_read.py` to stream the rotation vector + linear acceleration as
+line-delimited JSON (`src/hardware/imu.ts`). It publishes the raw quaternion
+(`imu.quat_{r,i,j,k}`), the derived Tait-Bryan euler angles
+(`imu.euler_{roll,pitch,yaw}`, degrees, via `src/lib/orientation.ts`), and the
+gravity-removed linear acceleration (`imu.accel_{x,y,z}`, m/s²). With no sensor
+on the bus the collector self-gates (emits nothing) and the daemon stays healthy.
+
+The SHTP protocol + the BNO085's clock-stretching quirks make a pure-Node reader
+impractical, so the read leans on the proven CircuitPython stack.
+
+**Provisioned devices get this for free** — the backend install script
+(`GET /get/:code` in `xorgate-core-service`) installs `i2c-tools` + the Adafruit
+Python libs, enables the I2C bus, and adds the agent user to the `i2c` group. For
+a manual / non-provisioned install, do it by hand:
+
+```sh
+sudo apt-get install -y i2c-tools python3-pip python3-dev   # i2cdetect + pip
+sudo python3 -m pip install --break-system-packages adafruit-circuitpython-bno08x adafruit-blinka
+sudo raspi-config nonint do_i2c 0                            # enable /dev/i2c-1
+sudo usermod -aG i2c "$USER"                                 # non-root bus access
+```
+
+Iterate off-hardware with `XORGATE_MOCK=1` (or any non-Linux host): detection
+reports a synthetic sensor and the stream emits a slowly-rotating mock signal.
+
 ## Notes for the collectors work (P5 / `MODE=real`)
 
-Collectors live in `src/agent/collectors/` and are currently inert stubs; `sim`
-(and `--offline`) emit synthetic telemetry. The worker's publish loop, state
-snapshot, and MQTT plumbing already work end-to-end — P5 is about feeding it real
-reads. When wiring them up:
+The remaining collectors in `src/agent/collectors/` (GPS/LTE/system) are inert
+stubs; `sim` (and `--offline`) emit synthetic telemetry. The worker's publish
+loop, state snapshot, and MQTT plumbing already work end-to-end — P5 is about
+feeding them real reads (the IMU above is the first). When wiring them up:
 
 - **The agent runs as the provisioning user (`pi`), not root** (see Permissions
   above). Hardware access must work for *that* user — add it to the relevant

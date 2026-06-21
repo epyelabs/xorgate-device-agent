@@ -31,6 +31,7 @@ const UNKNOWN: ModuleStatus = { label: "…", status: "unknown" };
 const val = (l?: MetricLeaf): number | undefined =>
   typeof l?.value === "number" ? l.value : undefined;
 const axis = (l?: MetricLeaf): string => (val(l) !== undefined ? signedFixed(l!.value, 3) : "—");
+const angle = (l?: MetricLeaf): string => (val(l) !== undefined ? `${signedFixed(l!.value, 1)}°` : "—");
 const coord = (l?: MetricLeaf): string => (val(l) !== undefined ? l!.value.toFixed(6) : "—");
 
 function DetailTitle({ children }: { children: React.ReactNode }) {
@@ -51,27 +52,27 @@ const imu: Module = {
   id: "imu",
   title: "IMU",
   status: (s) => {
-    const z = val(s?.latest?.metrics?.imu?.z);
-    return z === undefined ? UNKNOWN : { label: `z ${z.toFixed(1)}`, status: "ok" };
+    const yaw = val(s?.latest?.metrics?.imu?.euler_yaw);
+    return yaw === undefined ? UNKNOWN : { label: `yaw ${yaw.toFixed(0)}°`, status: "ok" };
   },
   Detail: ({ snapshot }) => {
     const m = snapshot?.latest?.metrics?.imu;
     return (
       <Box flexDirection="column">
-        <DetailTitle>IMU · linear acceleration</DetailTitle>
+        <DetailTitle>IMU · orientation + acceleration</DetailTitle>
         {m ? (
           <Box flexDirection="column">
             <Text>
-              <Text color="gray">x </Text>
-              {axis(m.x)} <Text color="gray">m/s²</Text>
+              <Text color="gray">quat </Text>r {axis(m.quat_r)} i {axis(m.quat_i)} j{" "}
+              {axis(m.quat_j)} k {axis(m.quat_k)}
             </Text>
             <Text>
-              <Text color="gray">y </Text>
-              {axis(m.y)} <Text color="gray">m/s²</Text>
+              <Text color="gray">euler </Text>roll {angle(m.euler_roll)} pitch{" "}
+              {angle(m.euler_pitch)} yaw {angle(m.euler_yaw)}
             </Text>
             <Text>
-              <Text color="gray">z </Text>
-              {axis(m.z)} <Text color="gray">m/s²</Text>
+              <Text color="gray">accel </Text>x {axis(m.accel_x)} y {axis(m.accel_y)} z{" "}
+              {axis(m.accel_z)} <Text color="gray">m/s²</Text>
             </Text>
           </Box>
         ) : (

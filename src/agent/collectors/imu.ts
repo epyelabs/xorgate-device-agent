@@ -1,16 +1,92 @@
 import type { Collector } from "./index.js";
+import { detectImu, streamImuData, type ImuSample } from "../../hardware/imu.js";
+import { quatToEuler } from "../../lib/orientation.js";
+import { toHexAddr } from "../../lib/format.js";
+import type { StreamHandle } from "../../lib/exec.js";
 
 /**
- * IMU collector (x / y / z acceleration).
+ * IMU collector — BNO085 over I2C (quaternion + euler + linear acceleration).
  *
- * P5 STUB. New for Xorgate (the PoC had no IMU). Real implementation reads an
- * I2C accelerometer (e.g. MPU-6050/LSM6DS3) at the model's declared rateHz.
+ * The sensor streams ~20 Hz via the bundled Python helper, while the worker
+ * pulls at ~1 Hz, so we keep the latest sample and map it on demand. Detection
+ * and stream start happen lazily on the first read and self-gate: if i2cdetect
+ * is missing, no BNO085 is on the bus, or no sample has landed yet, `read()`
+ * returns {} and the worker simply omits the `imu` group. Euler is derived from
+ * the quaternion here so consumers stay pure renderers.
  */
 export function createImuCollector(): Collector {
+  let started = false;
+  let stream: StreamHandle | null = null;
+  let latest: ImuSample | null = null;
+  let warned = false;
+
+  function reset(): void {
+    started = false;
+    stream = null;
+    latest = null;
+  }
+
+  // Detect once and, if a BNO085 is present, start the streaming helper. Failures
+  // stay inert (the worker omits the group). Detection runs once at startup; if a
+  // live stream later dies (cable yank, helper crash) we reset so the next tick
+  // re-detects and can recover.
+  async function start(): Promise<void> {
+    started = true; // set before the first await so reads don't double-start
+    const detect = await detectImu();
+    if (!detect.available) {
+      if (!warned) {
+        console.warn(`[imu] ${detect.reason}`);
+        warned = true;
+      }
+      return;
+    }
+    if (!detect.imuPresent || detect.imuAddress === null) {
+      if (!warned) {
+        console.warn("[imu] BNO085 not detected on I2C bus 1 (0x4a/0x4b)");
+        warned = true;
+      }
+      return;
+    }
+    console.log(`[imu] BNO085 detected at ${toHexAddr(detect.imuAddress)} — streaming`);
+    stream = streamImuData(detect.imuAddress, {
+      onSample: (s) => {
+        latest = s;
+      },
+      onError: (msg) => console.error(`[imu] ${msg}`),
+    });
+    void stream.done.then(() => reset());
+  }
+
   return {
     group: "imu",
     async read() {
-      return {}; // TODO(P5): { x:{value,unit:'m/s^2'}, y:{value,unit:'m/s^2'}, z:{value,unit:'m/s^2'} }
+      if (!started) {
+        // Kick off detection/streaming without blocking the tick; the first
+        // sample lands on a later read.
+        void start();
+        return {};
+      }
+      if (!latest) return {};
+
+      const { quat, linaccel } = latest;
+      const euler = quatToEuler(quat);
+      return {
+        quat_r: { value: round(quat.r, 4) },
+        quat_i: { value: round(quat.i, 4) },
+        quat_j: { value: round(quat.j, 4) },
+        quat_k: { value: round(quat.k, 4) },
+        euler_roll: { value: round(euler.roll, 1), unit: "°" },
+        euler_pitch: { value: round(euler.pitch, 1), unit: "°" },
+        euler_yaw: { value: round(euler.yaw, 1), unit: "°" },
+        accel_x: { value: round(linaccel.x, 3), unit: "m/s^2" },
+        accel_y: { value: round(linaccel.y, 3), unit: "m/s^2" },
+        accel_z: { value: round(linaccel.z, 3), unit: "m/s^2" },
+      };
     },
   };
+}
+
+function round(v: number, decimals: number): number {
+  const f = 10 ** decimals;
+  return Math.round(v * f) / f;
 }

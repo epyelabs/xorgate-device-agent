@@ -14,7 +14,24 @@ export interface MetricLeaf {
 }
 
 export interface TelemetryMetrics {
-  imu: { x: MetricLeaf; y: MetricLeaf; z: MetricLeaf };
+  /**
+   * BNO085 IMU: rotation quaternion (r/i/j/k, unitless), Tait-Bryan euler angles
+   * derived from it (roll/pitch/yaw, degrees), and gravity-removed linear
+   * acceleration (x/y/z, m/s²). Flattens to `imu.quat_*` / `imu.euler_*` /
+   * `imu.accel_*` metric keys.
+   */
+  imu: {
+    quat_r: MetricLeaf;
+    quat_i: MetricLeaf;
+    quat_j: MetricLeaf;
+    quat_k: MetricLeaf;
+    euler_roll: MetricLeaf;
+    euler_pitch: MetricLeaf;
+    euler_yaw: MetricLeaf;
+    accel_x: MetricLeaf;
+    accel_y: MetricLeaf;
+    accel_z: MetricLeaf;
+  };
   gps: { lat: MetricLeaf; lon: MetricLeaf; alt: MetricLeaf; speed: MetricLeaf };
   lte: { rssi: MetricLeaf; quality: MetricLeaf };
   system: {

@@ -14,14 +14,17 @@
 #     KEY_PATH, CA_PATH (and optionally MODE=sim|real).
 #   - The cert/key files readable by root (chmod 0600).
 #
-# Runs as root for now (PoC). The agent only publishes telemetry over mTLS, so
-# this is low-risk; tighten to a dedicated system user once the agent no longer
-# needs privileged access.
+# User=root here is the fallback. install.sh drops in
+# `xorgate-agent.service.d/10-user.conf` that overrides it to run the agent as
+# the provisioning user (captured from $SUDO_USER), so that operator can inspect
+# it without sudo. The agent only needs an outbound mTLS connection, so it does
+# not require root.
 #
-# XORGATE_HOME points at the StateDirectory (/var/lib/xorgate) so the worker's
-# pidfile + state snapshot live in a stable, deterministic place. The `xorgate`
-# CLI wrapper installed by install.sh defaults to the same path, so
-# `sudo xorgate status` / `sudo xorgate monitor` reflect THIS running service.
+# XORGATE_HOME points at the StateDirectory (/var/lib/xorgate); systemd creates
+# and chowns it to the (drop-in) service user, so the worker's pidfile + state
+# snapshot are readable by that user. The `xorgate` CLI wrapper installed by
+# install.sh defaults to the same path, so `xorgate status`/`monitor` reflect
+# THIS running service.
 
 [Unit]
 Description=Xorgate device agent (IoT MQTT telemetry)

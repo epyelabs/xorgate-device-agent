@@ -2,8 +2,9 @@
  * `xorgate status` — rich, scriptable status. Exits non-zero when the daemon is
  * not running so callers can branch on `$?`.
  */
+import { accessSync, constants } from "node:fs";
 import { inspect, type DaemonStatus } from "../daemon/manager.js";
-import { logPath } from "../daemon/runtime.js";
+import { logPath, runtimeHome } from "../daemon/runtime.js";
 import { ageLabel, uptimeLabel } from "../lib/format.js";
 
 const useColor = process.stdout.isTTY && process.env.NO_COLOR === undefined;
@@ -12,6 +13,16 @@ const green = (s: string) => c("32", s);
 const yellow = (s: string) => c("33", s);
 const gray = (s: string) => c("90", s);
 const dim = (s: string) => c("2", s);
+
+/** True when XORGATE_HOME exists but isn't readable by us (EACCES), not absent. */
+function homePermissionDenied(): boolean {
+  try {
+    accessSync(runtimeHome(), constants.R_OK | constants.X_OK);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EACCES";
+  }
+}
 
 export async function statusCommand(): Promise<void> {
   const now = Date.now();
@@ -22,6 +33,17 @@ export async function statusCommand(): Promise<void> {
 
 function print(st: DaemonStatus, now: number): void {
   if (st.kind === "stopped") {
+    // Distinguish "genuinely not running" from "running but its state dir is
+    // owned by another user we can't read" (e.g. a root-managed systemd agent
+    // inspected by a non-root user). The latter must NOT advise `xorgate start`
+    // — that would spawn a second worker fighting the running one.
+    if (homePermissionDenied()) {
+      console.log(
+        `${yellow("○")} unreadable ${dim(`— ${runtimeHome()} is owned by another user`)}`,
+      );
+      console.log(dim(`  the agent likely runs under systemd as root — try: sudo xorgate status`));
+      return;
+    }
     console.log(`${gray("○")} stopped ${dim("— daemon not running")}`);
     console.log(dim(`  start it with: xorgate start`));
     return;

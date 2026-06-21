@@ -23,11 +23,19 @@ xorgate <command> [agent flags]
   monitor    Live ink dashboard — sidebar of telemetry modules (↑↓ select, ↵/→ open),
              Connection/Daemon in the header; start/stop/restart from inside
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
+  update     Fetch the latest build, install it, and restart the service (sudo;
+             on-device only — --tag <version> pins a build, --from <url> the bucket)
 ```
 
-The daemon is self-contained (no PM2/systemd). `start` forks the agent as a
-detached process and tracks it via files under `~/.xorgate/` (override with
-`XORGATE_HOME`):
+The agent runs in one of **two supervision models** (see
+[Two ways it runs](#two-ways-it-runs)): a self-managed detached daemon for
+local/dev use, or under **systemd** on a provisioned device. The CLI lifecycle
+verbs (`start`/`stop`/`restart`) drive the self-managed daemon; on a device you
+use `systemctl` instead and the CLI is mainly for inspection (`status`/`monitor`)
+and `update`.
+
+In the self-managed model, `start` forks the agent as a detached process and
+tracks it via files under `~/.xorgate/` (override with `XORGATE_HOME`):
 
 | File | Purpose |
 |------|---------|
@@ -169,9 +177,134 @@ modules (IMU/GPS/LTE/System/Media/Activity) with live status, and `↑↓`/`↵`
 module's detail on the right. The values shown are what the **daemon publishes**
 (simulated in `sim`/`--offline`; real reads land in P5).
 
+## Two ways it runs
+
+The same binary supports two supervision models. Most of the sections above
+(`xorgate start`, `~/.xorgate`, `--offline`) describe the **dev/local** model.
+On a real device it runs under **systemd**, set up by the provisioning flow.
+
+| | Dev / local (`xorgate start`) | Device (provisioned) |
+|---|---|---|
+| Supervisor | self-managed detached process | systemd (`xorgate-agent.service`) |
+| Runs as | you | the provisioning user (e.g. `pi`) |
+| Runtime dir | `~/.xorgate` | `/var/lib/xorgate` |
+| Who writes the pidfile | `xorgate start` (the manager) | the worker self-registers on boot |
+| Lifecycle | `xorgate start/stop/restart` | `sudo systemctl … xorgate-agent` (never `xorgate start`) |
+| Logs | `xorgate logs` (`agent.log`) | `journalctl -u xorgate-agent` |
+
+The worker writes its own pidfile when launched directly (so `status`/`monitor`
+can see a systemd-run agent). It skips that when the CLI manager started it — the
+manager sets `XORGATE_MANAGED_BY=cli` and owns the pidfile itself. Don't drop
+that guard or you'll get two writers racing.
+
+## Deploying to a device (provisioning)
+
+You don't run `xorgate start` by hand on a device. The agent is installed and
+supervised by systemd via a one-command flow driven from the web app:
+
+1. Web app → **Devices → Provision device** mints a short-lived code and shows a
+   copy-paste command.
+2. On the device, paste it:
+
+   ```sh
+   curl -s https://<api>/get/<code> -o install.sh
+   sudo bash install.sh
+   ```
+
+`install.sh` (rendered per-request by the backend — see
+`xorgate/backend/xorgate-core-service/src/assets/install-script.ts`) installs
+Node + deps, **claims the code** (the server creates the `devices` row and mints
+the device's IoT X.509 cert), drops the cert bundle, downloads this agent's build
+tarball from S3, installs the systemd unit + a `User=` drop-in, and starts it.
+The device then appears in the web app and starts streaming.
+
+The installer needs root (apt, `/etc`, `/opt`, systemd), but it captures
+`$SUDO_USER` and runs the **service as that user**. So provision as the operator
+account you want to own the agent (e.g. `pi`) **via `sudo`** — not from a root
+login (which falls back to running as root).
+
+## Permissions model (sudo vs no sudo)
+
+Important and easy to trip over — read this before touching collectors.
+
+- The agent **runs as the provisioning user** (from `$SUDO_USER`, e.g. `pi`), not
+  root, via `/etc/systemd/system/xorgate-agent.service.d/10-user.conf`. It only
+  opens an outbound mTLS connection, so it doesn't need root.
+- Its files are owned by that user: certs + `agent.env` in `/etc/xorgate`
+  (`0600`); pidfile + `state.json` in `/var/lib/xorgate` (`0700`, a systemd
+  `StateDirectory`). `XORGATE_HOME=/var/lib/xorgate` is set in the unit, and the
+  `/usr/local/bin/xorgate` wrapper defaults to the same path.
+- So **as that user, inspection needs no sudo**: `xorgate status`, `xorgate monitor`.
+- **`sudo` is required only for**: lifecycle (`sudo systemctl restart xorgate-agent`)
+  and `sudo xorgate update` (writes `/opt`, `/usr/local/bin`, `/etc/systemd`).
+- A different user (or a root-fallback install inspected by `pi`) can't read the
+  state dir; `xorgate status` then prints "unreadable — try sudo" instead of the
+  misleading "stopped / xorgate start". Never run `xorgate start` on a systemd
+  device — it spawns a second worker that fights the first for the IoT clientId.
+- **Logs:** under systemd the worker's stdout goes to the journal
+  (`journalctl -u xorgate-agent -f`). `xorgate logs` reads `agent.log`, which only
+  the dev/self-managed daemon writes.
+
+## On-device layout
+
+| Path | Owner | What |
+|------|-------|------|
+| `/opt/xorgate` | root | the build: `dist/`, `node_modules`, `systemd/`, `package.json` (root-owned but world-readable, so the svc user can execute it) |
+| `/usr/local/bin/xorgate` | root | wrapper → `node /opt/xorgate/dist/cli.js`, defaults `XORGATE_HOME=/var/lib/xorgate` |
+| `/etc/xorgate` | svc user | `device.cert.pem`, `device.key.pem`, `root-ca.pem`, `agent.env` (all `0600`) |
+| `/var/lib/xorgate` | svc user | `agent.pid`, `state.json` (`0700`) |
+| `…/xorgate-agent.service` (+ `.d/10-user.conf`) | root | systemd unit + the `User=`/`Group=` drop-in |
+
+`agent.env` holds `DEVICE_ID`, `IOT_DATA_ENDPOINT`, `CERT_PATH`/`KEY_PATH`/`CA_PATH`,
+`MODE`, plus `DEVICE_DIST_BUCKET_URL`/`DEVICE_DIST_VERSION` (where `xorgate update`
+pulls builds from). systemd reads `agent.env` as root before dropping to the svc
+user, so it doesn't need to be world-readable.
+
+## Updating the agent
+
+```sh
+sudo xorgate update                 # pull `latest` from the dist bucket + restart
+sudo xorgate update --tag v1.2.3    # pin a specific build
+sudo xorgate update --from https://<bucket>   # override the source
+```
+
+`update` stages the new tarball on the `/opt` filesystem, validates it, runs
+`npm ci`, **atomically swaps** `/opt/xorgate` (rolling back on failure),
+reinstalls the unit + wrapper (your `User=` drop-in and certs are left intact),
+and restarts. The CLI ships in the tarball, so this upgrades the CLI too. The
+source is `DEVICE_DIST_BUCKET_URL` from `agent.env`; builds are published to S3 by
+`.github/workflows/device-deploy-{dev,prod}.yml` (dev on push to `main`, prod on
+release).
+
+## Notes for the collectors work (P5 / `MODE=real`)
+
+Collectors live in `src/agent/collectors/` and are currently inert stubs; `sim`
+(and `--offline`) emit synthetic telemetry. The worker's publish loop, state
+snapshot, and MQTT plumbing already work end-to-end — P5 is about feeding it real
+reads. When wiring them up:
+
+- **The agent runs as the provisioning user (`pi`), not root** (see Permissions
+  above). Hardware access must work for *that* user — add it to the relevant
+  groups (`gpio`, `video`, `i2c`, `spi`, `dialout` for 4G/LTE serial) and use udev
+  rules rather than bumping the service back to root. On Raspberry Pi OS `pi`
+  already has most of these. If a collector genuinely needs a privileged op,
+  prefer a narrowly-scoped helper over running the whole agent as root.
+- Reads shell out via `src/lib/exec.ts` (`run`/`runStream` — never throw; inspect
+  `.failed`/`.notFound`). Keep tools optional: `commandExists()` drives the
+  "not installed" UI states in the monitor.
+- Which collectors run is driven by the device model's
+  `device_models.io_capabilities` (declared server-side). `worker.ts` currently
+  hard-codes the sim source; the P5 TODO there is to fetch capabilities for the
+  device and build the matching collector set (`agent/collectors/index.ts`).
+- A collector read must never crash the daemon — the worker already guards the
+  loop and `unhandledRejection`; keep new reads inside that contract.
+- Iterate against `--offline` (no AWS, no hardware) for the daemon/monitor paths,
+  then a real device for the hardware reads.
+
 ## Build & test
 
 ```sh
 npm run build     # tsc → dist/   (also the typecheck)
+npm run typecheck # tsc --noEmit (CI also runs this)
 npm test          # vitest
 ```

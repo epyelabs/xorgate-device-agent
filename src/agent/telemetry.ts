@@ -32,7 +32,16 @@ export interface TelemetryMetrics {
     accel_y: MetricLeaf;
     accel_z: MetricLeaf;
   };
-  gps: { lat: MetricLeaf; lon: MetricLeaf; alt: MetricLeaf; speed: MetricLeaf };
+  gps: {
+    lat: MetricLeaf;
+    lon: MetricLeaf;
+    alt: MetricLeaf;
+    speed: MetricLeaf;
+    /** Satellites used in the fix (GGA). */
+    satellites: MetricLeaf;
+    /** GGA fix quality: 0 = none, 1 = GPS, 2 = DGPS. */
+    fix_quality: MetricLeaf;
+  };
   lte: { rssi: MetricLeaf; quality: MetricLeaf };
   system: {
     cpu_usage: MetricLeaf;

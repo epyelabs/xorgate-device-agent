@@ -47,6 +47,7 @@ export function createSimulator(): () => TelemetryReading {
   let lon = -122.4194;
   const alt = channel(20, 0.5, 0, 120);
   const speed = channel(0, 1.5, 0, 25); // km/h
+  const satellites = channel(9, 0.6, 4, 14); // count used in the fix
 
   // LTE signal.
   const rssi = channel(-67, 1.5, -110, -50); // dBm
@@ -93,6 +94,8 @@ export function createSimulator(): () => TelemetryReading {
           lon: { value: round(lon, 6) },
           alt: { value: round(alt(), 1), unit: "m" },
           speed: { value: round(spd, 1), unit: "km/h" },
+          satellites: { value: Math.round(satellites()) },
+          fix_quality: { value: 1 }, // 1 = GPS fix
         },
         lte: {
           rssi: { value: round(rssi(), 0), unit: "dBm" },

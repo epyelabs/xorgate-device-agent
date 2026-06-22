@@ -25,14 +25,17 @@ const WRITTEN_BY = "xorgate-device-agent@0.2.0";
 const config = loadConfig();
 ensureHome();
 
-// Real mode enables the self-detecting IMU collector (runs i2cdetect itself and
-// emits nothing when no BNO085 is on the bus, so the worker stays healthy with or
-// without hardware) and the system collector (pure /proc + /sys + `df` reads,
-// always available on Linux). GPS/LTE remain P5 stubs; wiring per-device
-// io_capabilities from the API is a later P5 step.
+// Real mode enables every self-detecting collector; each one stays inert when
+// its hardware is absent, so the worker is healthy with or without it:
+//   - IMU    — runs i2cdetect, emits nothing when no BNO085 is on the bus.
+//   - system — pure /proc + /sys + `df` reads, always available on Linux.
+//   - gps    — reads NMEA off the SIM7600 GNSS port, {} until a fix lands.
+//   - lte    — reads the connection-manager daemon's telemetry JSON, {} if absent.
+// Wiring the exact set from per-device io_capabilities (instead of enabling all)
+// is a later step; enabling all is safe because each collector self-gates.
 const source: { read: () => Promise<TelemetryReading> } =
   config.mode === "real"
-    ? createCollector({ sensors: { imu: true }, system: true })
+    ? createCollector({ sensors: { imu: true }, system: true, comm: { gps: true, signal: true } })
     : (() => {
         const next = createSimulator();
         return { read: async () => next() };

@@ -46,6 +46,26 @@ describe("createGpsCollector", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("reports an acquiring state (fix_quality, no position) when NMEA streams without a lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xorgate-gps-"));
+    const file = join(dir, "nmea.txt");
+    // GGA with empty lat/lon, fix quality 0, 0 satellites — the indoor case.
+    await writeFile(file, "$GPGGA,083745.000,,,,,0,00,,,M,,M,,\n");
+
+    vi.stubEnv("GPS_NMEA_PORT", file);
+    vi.resetModules();
+    const { createGpsCollector } = await import("../src/agent/collectors/gps.js");
+    const collector = createGpsCollector();
+
+    const fields = await readUntilFix(collector);
+    expect(fields.fix_quality).toEqual({ value: 0 });
+    expect(fields.satellites).toEqual({ value: 0 });
+    expect(fields.lat).toBeUndefined();
+    expect(fields.lon).toBeUndefined();
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("returns {} when the NMEA port is absent", async () => {
     vi.stubEnv("GPS_NMEA_PORT", join(tmpdir(), "xorgate-no-such-nmea-port"));
     vi.resetModules();

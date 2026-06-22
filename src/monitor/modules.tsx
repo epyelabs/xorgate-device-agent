@@ -33,6 +33,11 @@ const val = (l?: MetricLeaf): number | undefined =>
 const axis = (l?: MetricLeaf): string => (val(l) !== undefined ? signedFixed(l!.value, 3) : "—");
 const angle = (l?: MetricLeaf): string => (val(l) !== undefined ? `${signedFixed(l!.value, 1)}°` : "—");
 const coord = (l?: MetricLeaf): string => (val(l) !== undefined ? l!.value.toFixed(6) : "—");
+const FIX_QUALITY: Record<number, string> = { 0: "none", 1: "GPS", 2: "DGPS" };
+const fixLabel = (l?: MetricLeaf): string => {
+  const v = val(l);
+  return v === undefined ? "—" : (FIX_QUALITY[v] ?? String(v));
+};
 
 function DetailTitle({ children }: { children: React.ReactNode }) {
   return (
@@ -87,18 +92,25 @@ const gps: Module = {
   id: "gps",
   title: "GPS",
   status: (s) => {
-    const lat = val(s?.latest?.metrics?.gps?.lat);
-    const lon = val(s?.latest?.metrics?.gps?.lon);
-    return lat === undefined || lon === undefined
-      ? UNKNOWN
-      : { label: `${lat.toFixed(2)},${lon.toFixed(2)}`, status: "ok" };
+    const g = s?.latest?.metrics?.gps;
+    const lat = val(g?.lat);
+    const lon = val(g?.lon);
+    if (lat !== undefined && lon !== undefined) {
+      return { label: `${lat.toFixed(2)},${lon.toFixed(2)}`, status: "ok" };
+    }
+    // Group present without a position = NMEA streaming but no lock yet.
+    if (g) return { label: "acquiring", status: "warn" };
+    return UNKNOWN;
   },
   Detail: ({ snapshot }) => {
     const m = snapshot?.latest?.metrics?.gps;
+    const hasFix = val(m?.lat) !== undefined && val(m?.lon) !== undefined;
     return (
       <Box flexDirection="column">
         <DetailTitle>GPS · position</DetailTitle>
-        {m ? (
+        {!m ? (
+          <NoData />
+        ) : hasFix ? (
           <Box flexDirection="column">
             <Text>
               <Text color="gray">lat </Text>
@@ -111,9 +123,19 @@ const gps: Module = {
             <Text color="gray">
               alt {leaf(m.alt, 1)} · speed {leaf(m.speed, 1)}
             </Text>
+            <Text color="gray">
+              sats {leaf(m.satellites, 0)} · fix {fixLabel(m.fix_quality)}
+            </Text>
           </Box>
         ) : (
-          <NoData />
+          // NMEA is flowing (fix_quality is being parsed) but no position lock —
+          // e.g. indoors. Distinct from the "no data yet" no-NMEA case above.
+          <Box flexDirection="column">
+            <Text color="yellow">acquiring fix · NMEA streaming</Text>
+            <Text color="gray">
+              sats {leaf(m.satellites, 0)} · fix {fixLabel(m.fix_quality)}
+            </Text>
+          </Box>
         )}
       </Box>
     );

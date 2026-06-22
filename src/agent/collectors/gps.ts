@@ -3,18 +3,32 @@ import { streamGps, GPS_NMEA_PORT } from "../../hardware/gps.js";
 import { hasPosition, type GpsFix } from "../../lib/nmea.js";
 
 /**
+ * If no NMEA sentence has been parsed within this window we treat GNSS as not
+ * streaming (link down / GNSS disabled), so the group disappears rather than
+ * showing a stale "acquiring"/position. NMEA is ~1 Hz, so this is generous.
+ */
+const NMEA_STALE_MS = 10_000;
+
+/**
  * GPS collector — NMEA from the SIM7600 GNSS port (/dev/ttyUSB1).
  *
  * The connection-manager enables GNSS (AT+CGPS) so sentences stream on the
  * port; we open it lazily on the first read, keep the latest aggregated fix,
- * and map it on each ~1 Hz tick. Self-gates like the IMU collector: until a
- * position fix lands (or if the port is missing / unreadable) `read()` returns
- * {} and the worker omits the `gps` group. If the stream ends (tty vanished /
- * EOF) we flag a re-open on the next tick while keeping the last known fix.
+ * and map it on each ~1 Hz tick. Self-gates like the IMU collector.
+ *
+ * `read()` reports three distinguishable states so the UI can tell "no GPS at
+ * all" apart from "GPS streaming, just no fix yet" (e.g. indoors):
+ *   - no fresh NMEA            → {}                       (group omitted)
+ *   - NMEA streaming, no lock  → { fix_quality[, satellites] }   ("acquiring")
+ *   - position lock            → { lat, lon, alt, speed, satellites, fix_quality }
+ * `fix_quality` is always present while NMEA flows (GGA carries it even with no
+ * lock), so its presence is the "GNSS is live" signal; the absence of lat/lon
+ * is what marks the acquiring state.
  */
 export function createGpsCollector(): Collector {
   let started = false;
   let latest: GpsFix | null = null;
+  let lastFixAt = 0;
   let warned = false;
 
   function start(): void {
@@ -22,6 +36,8 @@ export function createGpsCollector(): Collector {
     streamGps(GPS_NMEA_PORT, {
       onFix: (fix) => {
         latest = fix;
+        lastFixAt = Date.now();
+        warned = false; // streaming again — allow a fresh warning if it drops
       },
       onError: (msg) => {
         if (!warned) {
@@ -30,8 +46,8 @@ export function createGpsCollector(): Collector {
         }
       },
       onEnd: () => {
-        // Allow a re-open next tick (recovers when the modem re-enumerates), but
-        // keep `latest` so we keep reporting the last known position meanwhile.
+        // Allow a re-open next tick (recovers when the modem re-enumerates). The
+        // staleness check below handles the "stream died" case on its own.
         started = false;
       },
     });
@@ -41,17 +57,22 @@ export function createGpsCollector(): Collector {
     group: "gps",
     async read() {
       if (!started) start();
-      if (!latest || !hasPosition(latest)) return {};
+      // Require *fresh* NMEA: a stale stream means GNSS isn't actually emitting.
+      if (!latest || Date.now() - lastFixAt > NMEA_STALE_MS) return {};
 
       const fix = latest;
       const out: Record<string, unknown> = {
-        lat: { value: round(fix.latitude!, 6) },
-        lon: { value: round(fix.longitude!, 6) },
+        fix_quality: { value: typeof fix.fixQuality === "number" ? fix.fixQuality : 0 },
       };
-      if (typeof fix.altitude === "number") out.alt = { value: round(fix.altitude, 1), unit: "m" };
-      if (typeof fix.speedKmh === "number") out.speed = { value: round(fix.speedKmh, 1), unit: "km/h" };
       if (typeof fix.satellites === "number") out.satellites = { value: fix.satellites };
-      if (typeof fix.fixQuality === "number") out.fix_quality = { value: fix.fixQuality };
+      if (hasPosition(fix)) {
+        out.lat = { value: round(fix.latitude!, 6) };
+        out.lon = { value: round(fix.longitude!, 6) };
+        if (typeof fix.altitude === "number") out.alt = { value: round(fix.altitude, 1), unit: "m" };
+        if (typeof fix.speedKmh === "number") {
+          out.speed = { value: round(fix.speedKmh, 1), unit: "km/h" };
+        }
+      }
       return out;
     },
   };

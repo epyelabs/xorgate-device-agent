@@ -63,11 +63,32 @@ def main():
 
     emit({"type": "ready", "address": hex(addr)})
 
+    # The BNO085 over I2C throws transient RuntimeErrors (clock stretching,
+    # "unprocessable batch" SHTP frames), and i2cdetect probes on the same bus
+    # can bump a read. A single bad read must NOT end the stream: the agent would
+    # null its cached sample, re-detect, and respawn us (~2s), so the monitor
+    # flashes "no samples yet" each time. Skip the bad sample and keep going;
+    # only give up after a sustained run of failures, which means the sensor is
+    # actually gone (unplugged / wedged bus) rather than a one-off glitch.
+    max_consecutive_errors = int(2.0 / args.interval) if args.interval > 0 else 40
+    consecutive_errors = 0
+
     try:
         while True:
-            # Adafruit returns the quaternion as (i, j, k, real).
-            qi, qj, qk, qr = bno.quaternion
-            ax, ay, az = bno.linear_acceleration
+            try:
+                # Adafruit returns the quaternion as (i, j, k, real).
+                qi, qj, qk, qr = bno.quaternion
+                ax, ay, az = bno.linear_acceleration
+            except Exception as exc:  # noqa: BLE001
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    emit({"type": "error",
+                          "error": f"read failed {consecutive_errors}x: {exc}"})
+                    return 4
+                time.sleep(args.interval)
+                continue
+
+            consecutive_errors = 0
             emit({
                 "type": "sample",
                 "quat": {"r": qr, "i": qi, "j": qj, "k": qk},
@@ -76,9 +97,6 @@ def main():
             time.sleep(args.interval)
     except KeyboardInterrupt:
         return 0
-    except Exception as exc:  # noqa: BLE001
-        emit({"type": "error", "error": f"read failed: {exc}"})
-        return 4
 
 
 if __name__ == "__main__":

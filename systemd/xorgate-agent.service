@@ -40,6 +40,11 @@ EnvironmentFile=/etc/xorgate/agent.env
 StateDirectory=xorgate
 StateDirectoryMode=0700
 Environment=XORGATE_HOME=/var/lib/xorgate
+# Run from the writable StateDirectory. The IMU reader's GPIO backend (lgpio,
+# used by Adafruit Blinka on Pi 5) creates `.lgd-nfy*` notify files in the CWD;
+# the default service CWD "/" isn't writable by the service user, which makes
+# `import board` fail. /var/lib/xorgate is created + owned by the service user.
+WorkingDirectory=/var/lib/xorgate
 ExecStart=/usr/bin/env node /opt/xorgate/dist/worker.js
 
 # Restart on every exit (including a clean exit 0 after SIGTERM). Recovers from

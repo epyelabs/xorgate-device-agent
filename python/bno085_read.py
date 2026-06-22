@@ -8,7 +8,9 @@ test script). Requires `adafruit-circuitpython-bno08x` + `adafruit-blinka`.
 """
 import argparse
 import json
+import os
 import sys
+import tempfile
 import time
 
 
@@ -26,6 +28,16 @@ def main():
     ap.add_argument("--interval", type=float, default=0.05, help="seconds between samples")
     args = ap.parse_args()
     addr = parse_address(args.address)
+
+    # Adafruit Blinka's GPIO backend (lgpio on Pi 5) creates `.lgd-nfy*` notify
+    # files in the current working directory during `import board`. When launched
+    # from a non-writable CWD (e.g. a systemd service's default "/"), that import
+    # fails. chdir to a writable temp dir first so the reader works regardless of
+    # how it was started.
+    try:
+        os.chdir(tempfile.gettempdir())
+    except OSError:
+        pass
 
     try:
         import board

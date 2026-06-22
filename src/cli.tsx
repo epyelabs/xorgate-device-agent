@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * `xorgate` CLI dispatcher. Routes a subcommand to commands/*. Only `monitor`
- * pulls in ink/React (dynamic import) so status/start/stop stay fast and
+ * `xorgate` CLI dispatcher. Routes a subcommand to commands/*. Only `manage`
+ * pulls in ink/React (dynamic import) so status/start/stop/set stay fast and
  * scriptable.
  *
  * The subcommand may appear before or after agent flags, so `xorgate --offline
@@ -14,6 +14,7 @@ import { restartCommand } from "./commands/restart.js";
 import { statusCommand } from "./commands/status.js";
 import { logsCommand } from "./commands/logs.js";
 import { updateCommand } from "./commands/update.js";
+import { setCommand } from "./commands/set.js";
 
 const VERSION = "0.2.0";
 /** Flags that take a value — skipped when locating the subcommand token. */
@@ -75,9 +76,14 @@ async function main(): Promise<void> {
     case "update":
       await updateCommand(rest);
       break;
-    case "monitor": {
-      const { monitorCommand } = await import("./commands/monitor.js");
-      await monitorCommand(rest);
+    case "set":
+      await setCommand(rest);
+      break;
+    case "monitor": // deprecated alias for `manage`, kept working for one release
+    case "manage": {
+      if (cmd === "monitor") console.error("[xorgate] 'monitor' is deprecated; use 'manage'");
+      const { manageCommand } = await import("./commands/manage.js");
+      await manageCommand(rest);
       break;
     }
     case undefined:
@@ -101,12 +107,13 @@ Commands:
   stop       Gracefully stop the daemon
   restart    Stop then start
   status     Show whether the daemon is running (pid, uptime, connection, telemetry)
-  monitor    Open the live ink dashboard (start/stop/restart from inside)
+  manage     Open the live ink dashboard (start/stop/restart + Settings from inside)
+  set        Persist a setting and apply it, e.g. 'set mode <sim|real>' (--no-restart to defer)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)
 
-Agent flags (forwarded to start/restart/monitor):
+Agent flags (forwarded to start/restart/manage):
   --offline              Run without AWS (stub mqtt + simulator) — no creds needed
   --device-id <uuid>     DEVICE_ID
   --endpoint <host>      IOT_DATA_ENDPOINT
@@ -117,7 +124,8 @@ Env: XORGATE_HOME (runtime dir, default ~/.xorgate), DEVICE_ID, IOT_DATA_ENDPOIN
      MODE, RATE_HZ, CERT_PATH, KEY_PATH, CA_PATH, OFFLINE.
 
 Examples:
-  xorgate --offline start && xorgate monitor
+  xorgate --offline start && xorgate manage
+  xorgate set mode real
   DEVICE_ID=<uuid> IOT_DATA_ENDPOINT=<host> xorgate start
 `);
 }

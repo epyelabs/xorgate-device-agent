@@ -8,7 +8,7 @@ export async function startCommand(argv: string[]): Promise<void> {
   if (res.ok) {
     console.log(`✓ ${res.message}`);
     console.log(`  status:  xorgate status`);
-    console.log(`  monitor: xorgate monitor`);
+    console.log(`  manage:  xorgate manage`);
     return;
   }
 

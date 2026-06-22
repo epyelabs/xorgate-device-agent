@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { render } from "ink-testing-library";
 import { MonitorApp } from "../src/monitor/MonitorApp.js";
+import { MODULES } from "../src/monitor/modules.js";
 import type { DaemonStatus } from "../src/daemon/manager.js";
 import type { PidRecord } from "../src/daemon/pidfile.js";
 import type { StateSnapshot } from "../src/agent/telemetry.js";
@@ -51,9 +52,16 @@ function snapshot(): StateSnapshot {
       seq: 12,
       metrics: {
         imu: {
-          x: { value: 0.01, unit: "m/s^2" },
-          y: { value: -0.02, unit: "m/s^2" },
-          z: { value: 9.81, unit: "m/s^2" },
+          quat_r: { value: 0.92 },
+          quat_i: { value: 0.33 },
+          quat_j: { value: 0.07 },
+          quat_k: { value: 0.19 },
+          euler_roll: { value: 40.1, unit: "°" },
+          euler_pitch: { value: -0.3, unit: "°" },
+          euler_yaw: { value: 23.6, unit: "°" },
+          accel_x: { value: 0.01, unit: "m/s^2" },
+          accel_y: { value: -0.02, unit: "m/s^2" },
+          accel_z: { value: 0.03, unit: "m/s^2" },
         },
         gps: {
           lat: { value: 37.7749 },
@@ -90,9 +98,9 @@ describe("MonitorApp", () => {
     await delay(150); // let the first poll land
 
     let frame = lastFrame() ?? "";
-    expect(frame).toContain("XORGATE Monitor");
+    expect(frame).toContain("XORGATE Manager");
     expect(frame).toContain("connected"); // connection moved to the header
-    for (const title of ["IMU", "GPS", "LTE", "System", "Media", "Activity"]) {
+    for (const title of ["IMU", "GPS", "LTE", "System", "Media", "Activity", "Settings"]) {
       expect(frame).toContain(title); // sidebar lists every module
     }
     expect(frame).toContain("recent events"); // default selection = Activity detail
@@ -105,6 +113,37 @@ describe("MonitorApp", () => {
     await delay(80);
     frame = lastFrame() ?? "";
     expect(frame).toContain("37.774900");
+
+    unmount();
+  });
+
+  it("opens Settings and toggles the run-mode choice", async () => {
+    const running: DaemonStatus = {
+      kind: "running",
+      record,
+      identity: "verified",
+      state: snapshot(), // mode: "sim"
+      stateFresh: true,
+    };
+    const { lastFrame, stdin, unmount } = render(
+      <MonitorApp agentArgs={["--offline"]} inspector={async () => running} />,
+    );
+    await delay(150);
+
+    // Settings is the last nav item — jump to it.
+    const settingsIdx = MODULES.findIndex((m) => m.id === "settings");
+    for (let i = 0; i < settingsIdx; i++) stdin.write("j");
+    await delay(80);
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("run mode"); // Settings detail renders
+    expect(frame).toContain("▶ sim"); // active mode highlighted
+
+    stdin.write("\r"); // open (enter operating)
+    await delay(60);
+    stdin.write("j"); // toggle the choice
+    await delay(60);
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("▶ real"); // choice moved off the active mode
 
     unmount();
   });

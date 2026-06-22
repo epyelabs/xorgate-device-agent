@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { RunMode } from "./telemetry.js";
+import { loadSettings } from "../daemon/settings.js";
 
 /**
  * Agent configuration from env vars, overridable by `--flag value` CLI args.
@@ -88,7 +89,12 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
 
   const offline = truthy(args.offline) || truthy(process.env.OFFLINE);
 
-  const mode = (get("mode", "MODE", "sim") as RunMode) ?? "sim";
+  // Mode precedence: explicit --mode flag > persisted settings.json (operator's
+  // UI/`set` choice) > MODE env (provisioning default) > "sim". settings.json
+  // intentionally overrides env so the `manage`/`set` toggle takes effect on
+  // provisioned devices, while an explicit flag still wins.
+  const flagMode = typeof args.mode === "string" ? (args.mode as string) : undefined;
+  const mode = (flagMode ?? loadSettings().mode ?? process.env.MODE ?? "sim") as RunMode;
   const rateHz = Number(get("rate", "RATE_HZ", "1"));
 
   // Offline mode needs no real device identity / endpoint; give it placeholders

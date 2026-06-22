@@ -23,7 +23,7 @@ export function MonitorHeader({ status, now }: { status: DaemonStatus; now: numb
     >
       <Box justifyContent="space-between">
         <Text bold color="cyan">
-          XORGATE Monitor
+          XORGATE Manager
         </Text>
         <Box>
           <Text color={isMock() ? "yellow" : "gray"}>{hostLabel()}</Text>

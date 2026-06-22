@@ -8,7 +8,7 @@ import { LevelMeter } from "../components/LevelMeter.js";
 import { type Status } from "../components/StatusBadge.js";
 import { signedFixed } from "../lib/format.js";
 import { gauge, leaf } from "./format.js";
-import type { ActivityEvent, MetricLeaf, StateSnapshot } from "../agent/telemetry.js";
+import type { ActivityEvent, MetricLeaf, RunMode, StateSnapshot } from "../agent/telemetry.js";
 
 export interface ModuleStatus {
   label: string;
@@ -220,6 +220,52 @@ const media: Module = {
   },
 };
 
+/**
+ * Settings detail — the one interactive pane. It renders the run-mode chooser;
+ * key handling (toggle + apply) lives in MonitorApp, which passes the in-progress
+ * `choice` and `operating` flag down. Extra props are optional so this still
+ * satisfies the generic `Module.Detail` (React.FC<DetailProps>) signature.
+ */
+interface SettingsDetailProps extends DetailProps {
+  choice?: RunMode;
+  operating?: boolean;
+}
+
+export function SettingsDetail({ snapshot, choice, operating }: SettingsDetailProps) {
+  const current = snapshot?.mode ?? null;
+  const highlight = operating ? (choice ?? current) : current;
+  return (
+    <Box flexDirection="column">
+      <DetailTitle>Settings · run mode</DetailTitle>
+      <Text color="gray">Synthetic telemetry (sim) vs. real hardware collectors (real).</Text>
+      <Box marginTop={1} flexDirection="column">
+        {(["sim", "real"] as const).map((m) => {
+          const on = m === highlight;
+          return (
+            <Text key={m} color={on ? "cyan" : "white"}>
+              {on ? "▶ " : "  "}
+              {m}
+              {m === current ? <Text color="green"> ● active</Text> : null}
+            </Text>
+          );
+        })}
+      </Box>
+      <Box marginTop={1}>
+        <Text color="gray" dimColor>
+          {operating ? "↑↓ choose · ↵ apply & restart · ←/q back" : "↵ to change the run mode"}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+const settings: Module = {
+  id: "settings",
+  title: "Settings",
+  status: (s) => (s?.mode ? { label: s.mode, status: "ok" } : UNKNOWN),
+  Detail: SettingsDetail,
+};
+
 const LEVEL_COLOR: Record<ActivityEvent["level"], string> = {
   info: "gray",
   warn: "yellow",
@@ -266,4 +312,4 @@ const activity: Module = {
 };
 
 /** Sidebar order = navigation order. */
-export const MODULES: Module[] = [activity, system, lte, gps, imu, media];
+export const MODULES: Module[] = [activity, system, lte, gps, imu, media, settings];

@@ -15,10 +15,12 @@ import { StatusBadge } from "../components/StatusBadge.js";
 import { PanelFrame } from "../dashboard/PanelFrame.js";
 import { useTerminalSize } from "../lib/useTerminalSize.js";
 import { MonitorHeader } from "./MonitorHeader.js";
-import { MODULES } from "./modules.js";
+import { MODULES, SettingsDetail } from "./modules.js";
 import { useDaemonState, type Inspector } from "./useDaemonState.js";
 import { useDaemonControls } from "./useDaemonControls.js";
 import { useLogTail } from "./useLogTail.js";
+import { loadSettings, saveSettings } from "../daemon/settings.js";
+import type { RunMode } from "../agent/telemetry.js";
 
 const LIST_WIDTH = 22;
 const NARROW_THRESHOLD = 80;
@@ -47,14 +49,30 @@ export function MonitorApp({
   const [selected, setSelected] = useState(0);
   const [operating, setOperating] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [modeChoice, setModeChoice] = useState<RunMode | null>(null);
   const logLines = useLogTail(showLogs);
 
   const running = status.kind === "running";
   const snapshot = running ? status.state : null;
+  const selectedModule = MODULES[selected];
+  const onSettings = selectedModule.id === "settings";
 
   useInput((input, key) => {
     if (operating) {
-      if (input === "q" || input === "Q" || key.escape || key.leftArrow) setOperating(false);
+      if (input === "q" || input === "Q" || key.escape || key.leftArrow) {
+        setOperating(false);
+        return;
+      }
+      if (onSettings) {
+        if (key.upArrow || key.downArrow || input === "j" || input === "k") {
+          setModeChoice((c) => ((c ?? snapshot?.mode ?? "sim") === "sim" ? "real" : "sim"));
+        } else if (key.return || input === "a" || input === "A") {
+          // Persist the choice, then restart so loadConfig picks it up from settings.json.
+          saveSettings({ mode: modeChoice ?? snapshot?.mode ?? "sim" });
+          controls.restart();
+          setOperating(false);
+        }
+      }
       return;
     }
     if (key.upArrow || input === "k") {
@@ -62,6 +80,7 @@ export function MonitorApp({
     } else if (key.downArrow || input === "j") {
       setSelected((i) => (i + 1) % MODULES.length);
     } else if ((key.return || key.rightArrow) && running) {
+      if (onSettings) setModeChoice(snapshot?.mode ?? loadSettings().mode ?? "sim");
       setOperating(true);
     } else if ((input === "s" || input === "S") && !running) {
       controls.start();
@@ -76,7 +95,7 @@ export function MonitorApp({
     }
   });
 
-  const Detail = MODULES[selected].Detail;
+  const Detail = selectedModule.Detail;
 
   const list = (
     <Box flexDirection="column" width={twoCol ? LIST_WIDTH : undefined}>
@@ -104,7 +123,16 @@ export function MonitorApp({
       marginLeft={twoCol ? 1 : 0}
       marginTop={twoCol ? 0 : 1}
     >
-      <Detail snapshot={snapshot} now={now} />
+      {onSettings ? (
+        <SettingsDetail
+          snapshot={snapshot}
+          now={now}
+          choice={modeChoice ?? undefined}
+          operating={operating}
+        />
+      ) : (
+        <Detail snapshot={snapshot} now={now} />
+      )}
     </Box>
   );
 
@@ -115,7 +143,13 @@ export function MonitorApp({
         { keys: "q", label: "quit" },
       ]
     : operating
-      ? [{ keys: "←/q", label: "back" }]
+      ? onSettings
+        ? [
+            { keys: "↑↓", label: "choose" },
+            { keys: "↵", label: "apply & restart" },
+            { keys: "←/q", label: "back" },
+          ]
+        : [{ keys: "←/q", label: "back" }]
       : [
           { keys: "↑↓", label: "select" },
           { keys: "↵", label: "open" },

@@ -3,7 +3,7 @@
 Productionized device telemetry agent for Xorgate (replaces the PoC
 `prototyping/alc-hw-tracker-pro`), packaged as the **`xorgate`** CLI. It runs the
 telemetry agent as a managed **background daemon** (start/stop/status/restart)
-and ships a live terminal **monitor** UI ([ink](https://github.com/vadimdemedes/ink)).
+and ships a live terminal **manage** UI ([ink](https://github.com/vadimdemedes/ink)).
 
 **Simulator-first:** it ships a working synthetic-telemetry mode so the cloud
 pipeline (IoT Rule → ingestion Lambda → Postgres → live web view) can be exercised
@@ -20,18 +20,28 @@ xorgate <command> [agent flags]
   stop       Gracefully stop the daemon (publishes offline first)
   restart    Stop then start
   status     Is it running? pid, uptime, connection, last-telemetry age, counters
-  monitor    Live ink dashboard — sidebar of telemetry modules (↑↓ select, ↵/→ open),
-             Connection/Daemon in the header; start/stop/restart from inside
+  manage     Live ink dashboard — sidebar of telemetry modules + Settings (↑↓ select,
+             ↵/→ open); Connection/Daemon in the header; start/stop/restart from inside
+  set        Persist a setting and apply it — e.g. `set mode <sim|real>`
+             (--no-restart to persist without restarting the daemon)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest build, install it, and restart the service (sudo;
              on-device only — --tag <version> pins a build, --from <url> the bucket)
 ```
 
+`monitor` is a deprecated alias for `manage` (still works, prints a hint).
+
+**Run mode** (`sim` = synthetic telemetry, `real` = hardware collectors) is a
+persisted setting. Change it from the `manage` UI's **Settings** pane or with
+`xorgate set mode <sim|real>`; the choice is written to `settings.json` under
+`XORGATE_HOME` and applied on the next (re)start. Precedence: an explicit
+`--mode` flag wins, then `settings.json`, then the `MODE` env var, then `sim`.
+
 The agent runs in one of **two supervision models** (see
 [Two ways it runs](#two-ways-it-runs)): a self-managed detached daemon for
 local/dev use, or under **systemd** on a provisioned device. The CLI lifecycle
 verbs (`start`/`stop`/`restart`) drive the self-managed daemon; on a device you
-use `systemctl` instead and the CLI is mainly for inspection (`status`/`monitor`)
+use `systemctl` instead and the CLI is mainly for inspection (`status`/`manage`)
 and `update`.
 
 In the self-managed model, `start` forks the agent as a detached process and
@@ -41,24 +51,25 @@ tracks it via files under `~/.xorgate/` (override with `XORGATE_HOME`):
 |------|---------|
 | `agent.pid` | JSON pid record (pid, startedAt, deviceId, mode…) — also used to detect a recycled pid via process start-time |
 | `agent.log` | append-only stdout/stderr of the worker (`xorgate logs`) |
-| `state.json` | atomic live snapshot the monitor/status read (connection, latest telemetry, counters) |
+| `state.json` | atomic live snapshot the manage/status read (connection, latest telemetry, counters) |
+| `settings.json` | persisted operator settings (currently `mode`) read by loadConfig |
 
-`status` / `monitor` report **running** (pid alive + identity verified + state
+`status` / `manage` report **running** (pid alive + identity verified + state
 fresh), **stale** (pidfile left by a crashed/recycled process — auto-cleaned on
-next start/stop), or **stopped**. Quitting the monitor with `q` never stops the
+next start/stop), or **stopped**. Quitting `manage` with `q` never stops the
 daemon — it's detached and independent.
 
 ## Quick try (no AWS, no hardware)
 
 `--offline` swaps in a network-free stub for AWS IoT, so the whole daemon +
-monitor stack runs on a bare checkout with no creds:
+manage stack runs on a bare checkout with no creds:
 
 ```sh
 npm install
 npm run build
 node dist/cli.js --offline start     # or, installed: xorgate --offline start
 node dist/cli.js status              # ● running … connected … (fresh)
-node dist/cli.js monitor             # live dashboard; press q to leave (daemon keeps running)
+node dist/cli.js manage              # live dashboard; press q to leave (daemon keeps running)
 node dist/cli.js stop
 ```
 
@@ -66,7 +77,7 @@ During development you can skip the build and run the TypeScript directly:
 
 ```sh
 npm run dev -- --offline start       # spawns the worker via tsx
-npm run dev -- monitor
+npm run dev -- manage
 ```
 
 Install it as the `xorgate` command with `npm link` (or `npm i -g .`).
@@ -84,7 +95,7 @@ npm install && npm run build
 ID_TOKEN="<idToken>" node scripts/provision-test-device.mjs
 # → start the daemon with the printed DEVICE_ID + IOT_DATA_ENDPOINT:
 DEVICE_ID=<uuid> IOT_DATA_ENDPOINT=<...-ats.iot...> xorgate start
-xorgate monitor
+xorgate manage
 ```
 
 Open `/devices/<uuid>/live` in the web app while it runs. `xorgate stop` flips the
@@ -135,7 +146,7 @@ It's now on your clipboard (`copy()` is a devtools helper). Tokens expire after
 
 ## Configuration
 
-Agent flags can be passed to `start`/`restart`/`monitor` (e.g.
+Agent flags can be passed to `start`/`restart`/`manage` (e.g.
 `xorgate start --rate 2`) or set as env vars:
 
 | Env | Flag | Default | Notes |
@@ -143,7 +154,7 @@ Agent flags can be passed to `start`/`restart`/`monitor` (e.g.
 | `DEVICE_ID` | `--device-id` | — (required unless `--offline`) | Canonical `devices.id` (uuid). Also the MQTT clientId/thing name. |
 | `IOT_DATA_ENDPOINT` | `--endpoint` | — (required unless `--offline`) | `iot:Data-ATS` endpoint (`iot.dataEndpoint` from provisioning). |
 | `OFFLINE` | `--offline` | off | Network-free stub mqtt + simulator. No creds needed. |
-| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU is live; GPS/LTE/system still P5 stubs). |
+| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU is live; GPS/LTE/system still P5 stubs). Overridden by a persisted `settings.json` (set via `manage`/`xorgate set mode`); the `--mode` flag still wins. |
 | `RATE_HZ` | `--rate` | `1` | Publish rate. |
 | `CERT_PATH` | `--cert` | `./creds/cert.crt` | |
 | `KEY_PATH` | `--key` | `./creds/private.key` | |
@@ -157,10 +168,10 @@ Other env: `XORGATE_HOME` (runtime dir, default `~/.xorgate`),
 
 ```
 src/
-  cli.tsx            # `xorgate` dispatcher → commands/* (only `monitor` loads ink)
+  cli.tsx            # `xorgate` dispatcher → commands/* (only `manage` loads ink)
   worker.ts          # detached daemon entry: 1 Hz publish loop + state-file writer
-  commands/          # start, stop, restart, status, logs, monitor
-  daemon/            # process manager (no React): runtime, pidfile, process, state, manager
+  commands/          # start, stop, restart, status, logs, manage, set, update
+  daemon/            # process manager (no React): runtime, pidfile, process, state, manager, settings
   agent/             # telemetry core: config (+offline), mqtt (+stub), simulator, collectors
   monitor/           # ink master/detail dashboard: MonitorHeader, modules, hooks
   components/ lib/ hardware/ dashboard/   # reusable UI (shared with argus-cli)
@@ -194,7 +205,7 @@ On a real device it runs under **systemd**, set up by the provisioning flow.
 | Lifecycle | `xorgate start/stop/restart` | `sudo systemctl … xorgate-agent` (never `xorgate start`) |
 | Logs | `xorgate logs` (`agent.log`) | `journalctl -u xorgate-agent` |
 
-The worker writes its own pidfile when launched directly (so `status`/`monitor`
+The worker writes its own pidfile when launched directly (so `status`/`manage`
 can see a systemd-run agent). It skips that when the CLI manager started it — the
 manager sets `XORGATE_MANAGED_BY=cli` and owns the pidfile itself. Don't drop
 that guard or you'll get two writers racing.
@@ -236,7 +247,7 @@ Important and easy to trip over — read this before touching collectors.
   (`0600`); pidfile + `state.json` in `/var/lib/xorgate` (`0700`, a systemd
   `StateDirectory`). `XORGATE_HOME=/var/lib/xorgate` is set in the unit, and the
   `/usr/local/bin/xorgate` wrapper defaults to the same path.
-- So **as that user, inspection needs no sudo**: `xorgate status`, `xorgate monitor`.
+- So **as that user, inspection needs no sudo**: `xorgate status`, `xorgate manage`.
 - **`sudo` is required only for**: lifecycle (`sudo systemctl restart xorgate-agent`)
   and `sudo xorgate update` (writes `/opt`, `/usr/local/bin`, `/etc/systemd`).
 - A different user (or a root-fallback install inspected by `pi`) can't read the

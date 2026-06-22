@@ -14,7 +14,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/cli.tsx",
     "start": "tsx src/cli.tsx start",
-    "monitor": "tsx src/cli.tsx monitor",
+    "manage": "tsx src/cli.tsx manage",
     "test": "vitest run",
     "test:watch": "vitest"
   },

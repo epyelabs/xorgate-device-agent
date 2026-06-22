@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readModemTelemetry } from "../src/hardware/modem.js";
+import { findModemLine, readModemTelemetry } from "../src/hardware/modem.js";
 
 const SAMPLE = {
   timestamp: "2026-06-13T08:21:45Z",
@@ -20,6 +20,24 @@ async function withTelemetryFile(body: unknown): Promise<string> {
   await writeFile(file, typeof body === "string" ? body : JSON.stringify(body));
   return file;
 }
+
+describe("findModemLine", () => {
+  const LSUSB = [
+    "Bus 003 Device 002: ID 1e0e:9011 Qualcomm / Option SimTech, Incorporated",
+    "Bus 004 Device 003: ID 32e4:2210 USB Cam Manufacturer HD USB Camera",
+    "Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub",
+  ].join("\n");
+
+  it("finds the SIM7600 by vendor/product id", () => {
+    const m = findModemLine(LSUSB);
+    expect(m?.usbId).toBe("1e0e:9011");
+    expect(m?.description).toContain("SimTech");
+  });
+
+  it("returns null when no modem line matches", () => {
+    expect(findModemLine("Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub")).toBeNull();
+  });
+});
 
 describe("readModemTelemetry", () => {
   it("parses the daemon's telemetry JSON", async () => {

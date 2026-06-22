@@ -3,11 +3,20 @@
  * a compact one-line status for the left sidebar and a full detail view for the
  * right pane. All are pure renderers of the daemon's state snapshot.
  */
+import { useEffect, useState } from "react";
 import { Box, Text } from "ink";
+import Spinner from "ink-spinner";
 import { LevelMeter } from "../components/LevelMeter.js";
 import { type Status } from "../components/StatusBadge.js";
 import { signedFixed } from "../lib/format.js";
 import { gauge, leaf } from "./format.js";
+import {
+  detectModem,
+  readModemTelemetry,
+  type ModemPresence,
+  type ModemTelemetry,
+} from "../hardware/modem.js";
+import { GPS_NMEA_PORT } from "../hardware/gps.js";
 import type { ActivityEvent, MetricLeaf, RunMode, StateSnapshot } from "../agent/telemetry.js";
 
 export interface ModuleStatus {
@@ -37,6 +46,13 @@ const FIX_QUALITY: Record<number, string> = { 0: "none", 1: "GPS", 2: "DGPS" };
 const fixLabel = (l?: MetricLeaf): string => {
   const v = val(l);
   return v === undefined ? "—" : (FIX_QUALITY[v] ?? String(v));
+};
+/** Daemon link status → text color. */
+const LINK_COLOR: Record<string, string> = {
+  connected: "green",
+  connecting: "yellow",
+  disconnected: "yellow",
+  dead_zone: "red",
 };
 
 function DetailTitle({ children }: { children: React.ReactNode }) {
@@ -108,39 +124,132 @@ const gps: Module = {
     return (
       <Box flexDirection="column">
         <DetailTitle>GPS · position</DetailTitle>
-        {!m ? (
-          <NoData />
-        ) : hasFix ? (
+        <Text color="gray">NMEA on {GPS_NMEA_PORT}</Text>
+        {hasFix ? (
           <Box flexDirection="column">
             <Text>
               <Text color="gray">lat </Text>
-              {coord(m.lat)}
+              {coord(m?.lat)}
             </Text>
             <Text>
               <Text color="gray">lon </Text>
-              {coord(m.lon)}
+              {coord(m?.lon)}
             </Text>
             <Text color="gray">
-              alt {leaf(m.alt, 1)} · speed {leaf(m.speed, 1)}
+              alt {leaf(m?.alt, 1)} · speed {leaf(m?.speed, 1)}
             </Text>
             <Text color="gray">
-              sats {leaf(m.satellites, 0)} · fix {fixLabel(m.fix_quality)}
+              sats {leaf(m?.satellites, 0)} · fix {fixLabel(m?.fix_quality)}
             </Text>
+          </Box>
+        ) : m ? (
+          // metrics.gps present (fix_quality emitted) but no lock — NMEA is
+          // streaming, just no satellites yet (e.g. indoors).
+          <Box flexDirection="column">
+            <Text color="yellow">○ Receiving NMEA but no position fix yet.</Text>
+            <Text color="gray">sats {leaf(m?.satellites, 0)} · waiting for satellite lock.</Text>
           </Box>
         ) : (
-          // NMEA is flowing (fix_quality is being parsed) but no position lock —
-          // e.g. indoors. Distinct from the "no data yet" no-NMEA case above.
-          <Box flexDirection="column">
-            <Text color="yellow">acquiring fix · NMEA streaming</Text>
-            <Text color="gray">
-              sats {leaf(m.satellites, 0)} · fix {fixLabel(m.fix_quality)}
-            </Text>
-          </Box>
+          <Text color="gray">○ no NMEA — waiting for GNSS stream.</Text>
         )}
       </Box>
     );
   },
 };
+
+/**
+ * LTE detail — the one pane that probes hardware on-demand (argus-cli style):
+ * detection runs only while this pane is mounted (i.e. selected in `manage`),
+ * never on the worker's telemetry path. lsusb fires once on open; the daemon's
+ * link JSON is polled lightly while the pane stays open. rssi/quality come from
+ * the live snapshot metrics. Sim mode skips probing and just shows the bar.
+ */
+function LteDetail({ snapshot }: DetailProps) {
+  const m = snapshot?.latest?.metrics?.lte;
+  const real = snapshot?.mode === "real";
+  const [modem, setModem] = useState<ModemPresence | null>(null);
+  const [link, setLink] = useState<ModemTelemetry | null>(null);
+
+  useEffect(() => {
+    if (!real) return;
+    let alive = true;
+    void detectModem().then((d) => alive && setModem(d)); // lsusb once on open
+    const poll = (): void => {
+      void readModemTelemetry().then((t) => alive && setLink(t));
+    };
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [real]);
+
+  return (
+    <Box flexDirection="column">
+      <DetailTitle>LTE · cellular signal</DetailTitle>
+
+      {real ? (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text bold>Modem</Text>
+          {!modem ? (
+            <Text>
+              <Spinner type="dots" /> detecting (lsusb)…
+            </Text>
+          ) : modem.present ? (
+            <Box flexDirection="column">
+              <Text>
+                <Text color="green">● </Text>
+                Present{modem.usbId ? ` — ${modem.usbId}` : ""}
+                {modem.description ? <Text color="gray"> {modem.description}</Text> : null}
+              </Text>
+              <Text color="gray">
+                ports: {modem.ttyPorts.length ? modem.ttyPorts.join(" ") : "none"}
+              </Text>
+            </Box>
+          ) : (
+            <Box flexDirection="column">
+              <Text color="red">● not detected on USB</Text>
+              {modem.ttyPorts.length ? (
+                <Text color="gray">ports: {modem.ttyPorts.join(" ")}</Text>
+              ) : null}
+            </Box>
+          )}
+        </Box>
+      ) : null}
+
+      <Text bold>
+        Signal &amp; link
+        {link ? <Text color="gray"> (live from daemon)</Text> : null}
+      </Text>
+      {link ? <Text color={LINK_COLOR[link.status] ?? "white"}>● {link.status}</Text> : null}
+      {m ? (
+        <Box flexDirection="column">
+          <Text>
+            <Text color="gray">rssi </Text>
+            {leaf(m.rssi, 0)}
+            <Text color="gray"> · quality </Text>
+            {leaf(m.quality, 0)}
+          </Text>
+          <Box marginTop={1}>
+            <LevelMeter level={gauge(m.quality.value, 0, 31)} width={24} label="signal" />
+          </Box>
+        </Box>
+      ) : link ? (
+        <Text color="gray">waiting for signal…</Text>
+      ) : real ? (
+        <Text color="gray">no telemetry yet</Text>
+      ) : (
+        <NoData />
+      )}
+      {link ? (
+        <Text color="gray">
+          {link.iface} · ip {link.ip ?? "—"} · {link.timestamp}
+        </Text>
+      ) : null}
+    </Box>
+  );
+}
 
 const lte: Module = {
   id: "lte",
@@ -152,31 +261,7 @@ const lte: Module = {
     const status: Status = q === undefined ? "unknown" : q >= 15 ? "ok" : q >= 10 ? "warn" : "error";
     return { label: `rssi ${rssi}`, status };
   },
-  Detail: ({ snapshot }) => {
-    const m = snapshot?.latest?.metrics?.lte;
-    return (
-      <Box flexDirection="column">
-        <DetailTitle>LTE · cellular signal</DetailTitle>
-        {m ? (
-          <Box flexDirection="column">
-            <Text>
-              <Text color="gray">rssi </Text>
-              {leaf(m.rssi, 0)}
-            </Text>
-            <Text>
-              <Text color="gray">quality </Text>
-              {leaf(m.quality, 0)}
-            </Text>
-            <Box marginTop={1}>
-              <LevelMeter level={gauge(m.quality.value, 0, 31)} width={24} label="signal" />
-            </Box>
-          </Box>
-        ) : (
-          <NoData />
-        )}
-      </Box>
-    );
-  },
+  Detail: LteDetail,
 };
 
 const system: Module = {

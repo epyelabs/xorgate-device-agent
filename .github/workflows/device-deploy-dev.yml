@@ -70,7 +70,8 @@ jobs:
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           TARBALL="xorgate-agent-${SHORT_SHA}.tar.gz"
-          tar -czf "$TARBALL" dist package.json package-lock.json systemd
+          # `python/` ships the BNO085 IMU helper the real-mode collector spawns.
+          tar -czf "$TARBALL" dist package.json package-lock.json systemd python
           echo "Contents:"
           tar -tzf "$TARBALL" | head -30
           # install.sh extracts to /opt/xorgate and expects these entries.
@@ -78,6 +79,7 @@ jobs:
           tar -tzf "$TARBALL" | grep -q "^package.json$" || { echo "missing package.json"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^package-lock.json$" || { echo "missing package-lock.json"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^systemd/xorgate-agent.service$" || { echo "missing systemd unit"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^python/bno085_read.py$" || { echo "missing python/bno085_read.py"; exit 1; }
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
           echo "version=$SHORT_SHA" >> "$GITHUB_OUTPUT"
 

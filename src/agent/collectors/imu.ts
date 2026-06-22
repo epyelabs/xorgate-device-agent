@@ -18,12 +18,14 @@ export function createImuCollector(): Collector {
   let started = false;
   let stream: StreamHandle | null = null;
   let latest: ImuSample | null = null;
+  let everSampled = false;
   let warned = false;
 
   function reset(): void {
     started = false;
     stream = null;
     latest = null;
+    everSampled = false;
   }
 
   // Detect once and, if a BNO085 is present, start the streaming helper. Failures
@@ -51,10 +53,26 @@ export function createImuCollector(): Collector {
     stream = streamImuData(detect.imuAddress, {
       onSample: (s) => {
         latest = s;
+        everSampled = true;
       },
       onError: (msg) => console.error(`[imu] ${msg}`),
     });
-    void stream.done.then(() => reset());
+    // If the reader exits after it had been producing samples, treat it as a
+    // transient drop (cable/helper hiccup) and re-detect on the next tick. If it
+    // never produced a sample, it's a setup problem (missing helper, no python3,
+    // missing adafruit libs) — log it once and stay inert rather than respawn in
+    // a tight loop. Fix the cause + restart the daemon to retry.
+    void stream.done.then((res) => {
+      if (everSampled) {
+        console.warn("[imu] reader stream ended; will re-detect");
+        reset();
+      } else {
+        console.error(
+          `[imu] reader exited before any sample (exit ${res.exitCode ?? "?"}); IMU disabled. ` +
+            "Check: i2cdetect -y 1, python3 + adafruit-circuitpython-bno08x, and python/bno085_read.py.",
+        );
+      }
+    });
   }
 
   return {

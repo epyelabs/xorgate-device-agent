@@ -158,6 +158,12 @@ export function streamImuData(address: number, handlers: ImuStreamHandlers): Str
       else if (msg.type === "ready") handlers.onReady?.();
       else if (msg.type === "error") handlers.onError?.(msg.error);
     },
+    // Surface Python's own stderr (missing helper file, tracebacks, import errors)
+    // so a broken setup is visible in the daemon log instead of a silent no-op.
+    onStderr: (line) => {
+      const t = line.trim();
+      if (t) handlers.onError?.(t);
+    },
   });
 
   // Surface a missing interpreter as a clean error rather than a silent exit.

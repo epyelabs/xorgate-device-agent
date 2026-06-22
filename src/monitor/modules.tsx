@@ -8,7 +8,7 @@ import { Box, Text } from "ink";
 import Spinner from "ink-spinner";
 import { LevelMeter } from "../components/LevelMeter.js";
 import { type Status } from "../components/StatusBadge.js";
-import { signedFixed } from "../lib/format.js";
+import { signedFixed, toHexAddr } from "../lib/format.js";
 import { gauge, leaf } from "./format.js";
 import {
   detectModem,
@@ -16,6 +16,7 @@ import {
   type ModemPresence,
   type ModemTelemetry,
 } from "../hardware/modem.js";
+import { detectImu, IMU, type ImuDetect } from "../hardware/imu.js";
 import { GPS_NMEA_PORT } from "../hardware/gps.js";
 import type { ActivityEvent, MetricLeaf, RunMode, StateSnapshot } from "../agent/telemetry.js";
 
@@ -69,6 +70,78 @@ function NoData() {
   return <Text color="gray">no data yet</Text>;
 }
 
+/**
+ * IMU detail — probes the I2C bus on-demand (argus-cli style): i2cdetect runs
+ * once when this pane opens (real mode only), never on the worker's hot path.
+ * i2c probing is read-only and safe to run alongside the worker's reader.
+ * Motion data below comes from the live snapshot metrics.
+ */
+function ImuDetail({ snapshot }: DetailProps) {
+  const m = snapshot?.latest?.metrics?.imu;
+  const real = snapshot?.mode === "real";
+  const [detect, setDetect] = useState<ImuDetect | null>(null);
+
+  useEffect(() => {
+    if (!real) return;
+    let alive = true;
+    void detectImu().then((d) => alive && setDetect(d)); // i2cdetect once on open
+    return () => {
+      alive = false;
+    };
+  }, [real]);
+
+  const addrList = IMU.addresses.map((a) => toHexAddr(a)).join(" / ");
+
+  return (
+    <Box flexDirection="column">
+      <DetailTitle>IMU · orientation + acceleration</DetailTitle>
+
+      {real ? (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text bold>Sensor</Text>
+          {!detect ? (
+            <Text>
+              <Spinner type="dots" /> detecting (i2cdetect)…
+            </Text>
+          ) : !detect.available ? (
+            <Text color="red">⚠ {detect.reason}</Text>
+          ) : detect.imuPresent && detect.imuAddress !== null ? (
+            <Text>
+              <Text color="green">● </Text>
+              BNO085 @ {addrList} — present (found at {toHexAddr(detect.imuAddress)})
+            </Text>
+          ) : (
+            <Text color="red">
+              ● BNO085 @ {addrList} — not detected on I2C bus {IMU.i2cBus}
+            </Text>
+          )}
+        </Box>
+      ) : null}
+
+      {m ? (
+        <Box flexDirection="column">
+          <Text>
+            <Text color="gray">quat </Text>r {axis(m.quat_r)} i {axis(m.quat_i)} j{" "}
+            {axis(m.quat_j)} k {axis(m.quat_k)}
+          </Text>
+          <Text>
+            <Text color="gray">euler </Text>roll {angle(m.euler_roll)} pitch{" "}
+            {angle(m.euler_pitch)} yaw {angle(m.euler_yaw)}
+          </Text>
+          <Text>
+            <Text color="gray">accel </Text>x {axis(m.accel_x)} y {axis(m.accel_y)} z{" "}
+            {axis(m.accel_z)} <Text color="gray">m/s²</Text>
+          </Text>
+        </Box>
+      ) : real ? (
+        <Text color="gray">no samples yet</Text>
+      ) : (
+        <NoData />
+      )}
+    </Box>
+  );
+}
+
 const imu: Module = {
   id: "imu",
   title: "IMU",
@@ -76,32 +149,7 @@ const imu: Module = {
     const yaw = val(s?.latest?.metrics?.imu?.euler_yaw);
     return yaw === undefined ? UNKNOWN : { label: `yaw ${yaw.toFixed(0)}°`, status: "ok" };
   },
-  Detail: ({ snapshot }) => {
-    const m = snapshot?.latest?.metrics?.imu;
-    return (
-      <Box flexDirection="column">
-        <DetailTitle>IMU · orientation + acceleration</DetailTitle>
-        {m ? (
-          <Box flexDirection="column">
-            <Text>
-              <Text color="gray">quat </Text>r {axis(m.quat_r)} i {axis(m.quat_i)} j{" "}
-              {axis(m.quat_j)} k {axis(m.quat_k)}
-            </Text>
-            <Text>
-              <Text color="gray">euler </Text>roll {angle(m.euler_roll)} pitch{" "}
-              {angle(m.euler_pitch)} yaw {angle(m.euler_yaw)}
-            </Text>
-            <Text>
-              <Text color="gray">accel </Text>x {axis(m.accel_x)} y {axis(m.accel_y)} z{" "}
-              {axis(m.accel_z)} <Text color="gray">m/s²</Text>
-            </Text>
-          </Box>
-        ) : (
-          <NoData />
-        )}
-      </Box>
-    );
-  },
+  Detail: ImuDetail,
 };
 
 const gps: Module = {

@@ -25,13 +25,14 @@ const WRITTEN_BY = "xorgate-device-agent@0.2.0";
 const config = loadConfig();
 ensureHome();
 
-// Real mode enables the self-detecting IMU collector: it runs i2cdetect itself
-// and emits nothing when no BNO085 is on the bus, so the worker stays healthy
-// with or without hardware. The other collectors remain P5 stubs; wiring
-// per-device io_capabilities from the API is a later P5 step.
+// Real mode enables the self-detecting IMU collector (runs i2cdetect itself and
+// emits nothing when no BNO085 is on the bus, so the worker stays healthy with or
+// without hardware) and the system collector (pure /proc + /sys + `df` reads,
+// always available on Linux). GPS/LTE remain P5 stubs; wiring per-device
+// io_capabilities from the API is a later P5 step.
 const source: { read: () => Promise<TelemetryReading> } =
   config.mode === "real"
-    ? createCollector({ sensors: { imu: true } })
+    ? createCollector({ sensors: { imu: true }, system: true })
     : (() => {
         const next = createSimulator();
         return { read: async () => next() };

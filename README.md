@@ -154,7 +154,7 @@ Agent flags can be passed to `start`/`restart`/`manage` (e.g.
 | `DEVICE_ID` | `--device-id` | — (required unless `--offline`) | Canonical `devices.id` (uuid). Also the MQTT clientId/thing name. |
 | `IOT_DATA_ENDPOINT` | `--endpoint` | — (required unless `--offline`) | `iot:Data-ATS` endpoint (`iot.dataEndpoint` from provisioning). |
 | `OFFLINE` | `--offline` | off | Network-free stub mqtt + simulator. No creds needed. |
-| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU is live; GPS/LTE/system still P5 stubs). Overridden by a persisted `settings.json` (set via `manage`/`xorgate set mode`); the `--mode` flag still wins. |
+| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU + system are live; GPS/LTE still P5 stubs). Overridden by a persisted `settings.json` (set via `manage`/`xorgate set mode`); the `--mode` flag still wins. |
 | `RATE_HZ` | `--rate` | `1` | Publish rate. |
 | `CERT_PATH` | `--cert` | `./creds/cert.crt` | |
 | `KEY_PATH` | `--key` | `./creds/private.key` | |
@@ -178,10 +178,12 @@ src/
 test/                # vitest: pidfile/state/process/manager logic + monitor UI smoke
 ```
 
-Under `MODE=real` the **IMU collector is live** (BNO085 over I2C — see below);
-the other `agent/collectors/` reads (serial GPS/LTE, /proc + /sys system metrics)
-are still inert stubs landing in **P5 (device firmware)**. The UI scaffolding
-(ink components, host-metrics readers) and the IMU read path are adapted from
+Under `MODE=real` the **IMU and system collectors are live** — IMU (BNO085 over
+I2C — see below) and system (CPU usage/temp, RAM, disk via pure `/proc` + `/sys`
++ `df` reads, no privileges needed; `cpu_temp`/`disk_usage` are omitted off-Pi
+hosts that lack a thermal zone). The remaining serial GPS/LTE reads are still
+inert stubs landing in **P5 (device firmware)**. The UI scaffolding (ink
+components, host-metrics readers) and the IMU read path are adapted from
 `argus-test-bench/argus-cli`.
 
 The monitor is a master/detail dashboard (argus-cli style): the header shows the

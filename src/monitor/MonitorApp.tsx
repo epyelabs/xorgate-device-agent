@@ -58,9 +58,10 @@ export function MonitorApp({
   const snapshot = running ? status.state : null;
   const selectedModule = MODULES[selected];
   const onSettings = selectedModule.id === "settings";
-  // The snapshot doesn't carry the media toggle, so read the persisted value for
-  // the Settings form (only when that pane is active to avoid a per-tick file read).
-  const mediaEnabled = onSettings ? (loadSettings().mediaEnabled ?? false) : false;
+  // Show the EFFECTIVE media state from the live daemon snapshot (like the run-mode
+  // row), so the pane is correct regardless of how it was enabled (settings.json or
+  // the MEDIA_ENABLED env). The toggle still edits settings.json on apply.
+  const mediaEnabled = snapshot?.mediaEnabled ?? false;
 
   useInput((input, key) => {
     if (operating) {
@@ -97,9 +98,8 @@ export function MonitorApp({
       setSelected((i) => (i + 1) % MODULES.length);
     } else if ((key.return || key.rightArrow) && running) {
       if (onSettings) {
-        const persisted = loadSettings();
-        setModeChoice(snapshot?.mode ?? persisted.mode ?? "sim");
-        setMediaChoice(persisted.mediaEnabled ?? false);
+        setModeChoice(snapshot?.mode ?? loadSettings().mode ?? "sim");
+        setMediaChoice(snapshot?.mediaEnabled ?? false);
         setSettingsRow(0);
       }
       setOperating(true);

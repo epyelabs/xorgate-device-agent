@@ -70,6 +70,7 @@ const initial: StateSnapshot = {
   writtenBy: WRITTEN_BY,
   deviceId: config.deviceId,
   mode: config.mode,
+  mediaEnabled: config.media.enabled,
   rateHz: config.rateHz,
   endpoint: config.endpoint,
   offline: config.offline,

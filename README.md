@@ -154,7 +154,7 @@ Agent flags can be passed to `start`/`restart`/`manage` (e.g.
 | `DEVICE_ID` | `--device-id` | — (required unless `--offline`) | Canonical `devices.id` (uuid). Also the MQTT clientId/thing name. |
 | `IOT_DATA_ENDPOINT` | `--endpoint` | — (required unless `--offline`) | `iot:Data-ATS` endpoint (`iot.dataEndpoint` from provisioning). |
 | `OFFLINE` | `--offline` | off | Network-free stub mqtt + simulator. No creds needed. |
-| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU + system are live; GPS/LTE still P5 stubs). Overridden by a persisted `settings.json` (set via `manage`/`xorgate set mode`); the `--mode` flag still wins. |
+| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU, system, GPS, LTE) **and** the KVS WebRTC media runtime. Overridden by a persisted `settings.json` (set via `manage`/`xorgate set mode`); the `--mode` flag still wins. |
 | `RATE_HZ` | `--rate` | `1` | Publish rate. |
 | `CERT_PATH` | `--cert` | `./creds/cert.crt` | |
 | `KEY_PATH` | `--key` | `./creds/private.key` | |
@@ -163,6 +163,12 @@ Agent flags can be passed to `start`/`restart`/`manage` (e.g.
 Other env: `XORGATE_HOME` (runtime dir, default `~/.xorgate`),
 `XORGATE_STOP_TIMEOUT_MS` (graceful-stop timeout before SIGKILL, default 5000),
 `XORGATE_PYTHON_DIR` (override the `python/` helper dir; defaults to the package root).
+
+Media-runtime env (see the **Media runtime (KVS WebRTC)** section below):
+`MEDIA_ENABLED` (or `xorgate set media on`), `KVS_MANIFEST` (default `./creds/kvs.json`,
+`/etc/xorgate/kvs.json` on a device), `KVS_PIPELINE_DIR` (default `/etc/xorgate/pipelines`),
+`KVS_CACERT_PATH` (default `<binary-dir>/cert.pem`), `KVS_RUNTIME_BIN`, `KVS_RUNTIME_LIB_DIR`,
+`MEDIA_SOURCE` (default `testsrc`), `KVS_GST_PIPELINE`, `AWS_KVS_LOG_LEVEL` (default `3`).
 
 ## Layout
 
@@ -335,11 +341,29 @@ just supervised in-process with restart-on-crash. A device with multiple cameras
   `xorgate set media <on|off>`. Either persists `mediaEnabled` to `settings.json`
   and applies on the next (re)start; precedence is `--media` flag >
   `settings.json` > `MEDIA_ENABLED` env > off, and it is forced off when `--offline`.
-- **Credentials reuse the device's IoT cert.** The runtime authenticates via the
-  IoT credential-provider (`AWS_IOT_CORE_*`) using the same `/etc/xorgate`
-  cert/key/CA as the telemetry agent — no static AWS keys. The region, credential
-  endpoint, role alias, and channel list come from the on-device manifest
-  `kvs.json` (`src/media/manifest.ts`), written by the install script.
+- **Credentials reuse the device's IoT cert.** The runtime authenticates with the
+  IoT credential-provider (`AWS_IOT_CORE_*`) using the device's existing
+  `/etc/xorgate` cert + key — no static AWS keys. The region, credential endpoint,
+  role alias (`XorgateDeviceCreds`/`…Dev`), and channel list come from the on-device
+  manifest `kvs.json` (`src/media/manifest.ts`), written by the install script from
+  the claim response. Shape:
+  ```json
+  { "deviceId": "...", "region": "us-east-1",
+    "credentialEndpoint": "xxxx.credentials.iot.us-east-1.amazonaws.com",
+    "roleAlias": "XorgateDeviceCredsDev",
+    "channels": [ { "streamKey": "cam0", "channelName": "<deviceId>-cam0" } ] }
+  ```
+- **CA bundle (gotcha).** The runtime verifies TLS to the IoT credential provider
+  AND the KVS endpoints against the SDK's `cert.pem` (Starfield Services Root CA G2),
+  shipped at `media/cert.pem` and used via `KVS_CACERT_PATH` (default
+  `<binary-dir>/cert.pem`). The device's `root-ca.pem` (Amazon Root CA 1) validates
+  MQTT but NOT the KVS plane, so it is **not** reused here.
+- **Binary must be the IoT-capable build.** The shipped binary must be built from
+  `xorgate-kvs-webrtc` at/after the "flexible switch on static vs IoT core mode"
+  change (credential mode chosen at runtime from `AWS_IOT_CORE_CREDENTIAL_ENDPOINT`).
+  An older build with the credential code behind `#ifdef IOT_CORE_ENABLE_CREDENTIALS`
+  (CMake not defining it) compiles to static-keys-only and fails with
+  `AWS_ACCESS_KEY_ID must be set`.
 - **Binary + libs.** The aarch64 binary ships in `media/` (in the agent tarball).
   Its KVS SDK `.so` libraries (plus the SDK's vendored OpenSSL 1.1 and
   libwebsockets) are **supplied separately** into `media/lib/` (`LD_LIBRARY_PATH`)

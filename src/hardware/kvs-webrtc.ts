@@ -32,7 +32,8 @@ export interface KvsRuntimeEnv {
   thingName: string;
   certPath: string;
   keyPath: string;
-  caPath: string;
+  /** CA bundle for TLS to the IoT credential provider + KVS plane (AWS_KVS_CACERT_PATH). */
+  caCertPath: string;
   /** Directory holding the user-supplied KVS SDK `.so` libs (LD_LIBRARY_PATH). */
   libDir: string;
   /** Optional KVS_GST_PIPELINE file (custom camera pipeline). */
@@ -86,7 +87,7 @@ export function streamChannel(
     AWS_IOT_CORE_PRIVATE_KEY: env.keyPath,
     AWS_IOT_CORE_ROLE_ALIAS: env.roleAlias,
     AWS_IOT_CORE_THING_NAME: env.thingName,
-    AWS_KVS_CACERT_PATH: env.caPath,
+    AWS_KVS_CACERT_PATH: env.caCertPath,
     AWS_KVS_LOG_LEVEL: env.logLevel ?? "3",
     LD_LIBRARY_PATH: ldPath,
   };

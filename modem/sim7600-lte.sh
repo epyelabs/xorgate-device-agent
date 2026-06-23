@@ -84,7 +84,10 @@ write_telemetry() {
 
     local ip="null"
     local raw_ip
-    raw_ip=$(ip addr show "$IFACE" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    # Take only the first inet address: an interface can carry several (the modem
+    # may hand out more than one), and embedding a multi-line value would produce
+    # invalid JSON (a raw newline inside a JSON string). head -n1 keeps it valid.
+    raw_ip=$(ip addr show "$IFACE" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -n1)
     if [[ -n "$raw_ip" ]]; then
         ip="\"$raw_ip\""
     fi

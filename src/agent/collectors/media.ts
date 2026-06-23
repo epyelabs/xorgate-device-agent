@@ -138,7 +138,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
         thingName: manifest.deviceId,
         certPath: cfg.certPath,
         keyPath: cfg.keyPath,
-        caPath: cfg.caPath,
+        caCertPath: cfg.caCertPath,
         libDir: cfg.libDir,
         pipelinePath,
         logLevel: cfg.logLevel,

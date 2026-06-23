@@ -110,6 +110,8 @@ export interface StateSnapshot {
   writtenBy: string;
   deviceId: string;
   mode: RunMode;
+  /** Effective media-runtime enabled state for this run (config.media.enabled). */
+  mediaEnabled?: boolean;
   rateHz: number;
   endpoint: string;
   offline: boolean;

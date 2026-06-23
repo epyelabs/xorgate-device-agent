@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { RunMode } from "./telemetry.js";
 import { loadSettings } from "../daemon/settings.js";
 
@@ -44,10 +44,17 @@ export interface MediaConfig {
   pipelinePath?: string;
   /** AWS_KVS_LOG_LEVEL for the runtime (default "3" = INFO). */
   logLevel: string;
-  /** IoT cert / key / CA the runtime authenticates with (same files as the agent). */
+  /** The device IoT cert + key the runtime authenticates with (AWS_IOT_CORE_CERT/PRIVATE_KEY). */
   certPath: string;
   keyPath: string;
-  caPath: string;
+  /**
+   * CA bundle for the runtime's TLS to the IoT credential provider AND the KVS
+   * control/signaling plane (AWS_KVS_CACERT_PATH). This is NOT the device's
+   * root-ca.pem: that single Amazon root validates MQTT but not the KVS endpoints
+   * (which chain to a different root). We ship the SDK's `cert.pem` bundle next to
+   * the binary (media/cert.pem) and point here by default.
+   */
+  caCertPath: string;
 }
 
 export interface AgentConfig {
@@ -165,17 +172,19 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
   }
 
   // Media-runtime enabled precedence: --media flag > settings.json > MEDIA_ENABLED
-  // env > off. Forced off when offline (the KVS runtime needs real AWS). Like the
-  // collectors, it then self-gates on arch/binary/manifest, so "on" is safe even
-  // when the runtime can't actually start.
+  // env > off. settings.json wins over the env when explicitly set (true OR false),
+  // mirroring `mode`; the `--media` flag can only force-on. Forced off when offline
+  // (the KVS runtime needs real AWS). Like the collectors, it then self-gates on
+  // arch/binary/manifest, so "on" is safe even when the runtime can't actually start.
   const mediaEnabled =
     !offline &&
-    (truthy(args.media) || settings.mediaEnabled || truthy(process.env.MEDIA_ENABLED));
+    (truthy(args.media) || (settings.mediaEnabled ?? truthy(process.env.MEDIA_ENABLED)));
+  const mediaBin = resolve(
+    get("media-bin", "KVS_RUNTIME_BIN", "/opt/xorgate/media/xorgate-kvs-webrtc")!,
+  );
   const media: MediaConfig = {
     enabled: mediaEnabled,
-    binaryPath: resolve(
-      get("media-bin", "KVS_RUNTIME_BIN", "/opt/xorgate/media/xorgate-kvs-webrtc")!,
-    ),
+    binaryPath: mediaBin,
     libDir: resolve(get("media-lib", "KVS_RUNTIME_LIB_DIR", "/opt/xorgate/media/lib")!),
     manifestPath: resolve(get("media-manifest", "KVS_MANIFEST", "./creds/kvs.json")!),
     source: get("media-source", "MEDIA_SOURCE", "testsrc")!,
@@ -187,7 +196,8 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     logLevel: get("media-log", "AWS_KVS_LOG_LEVEL", "3")!,
     certPath,
     keyPath,
-    caPath,
+    // KVS CA bundle ships next to the binary (media/cert.pem); override with KVS_CACERT_PATH.
+    caCertPath: resolve(get("media-cacert", "KVS_CACERT_PATH", join(dirname(mediaBin), "cert.pem"))!),
   };
 
   return {

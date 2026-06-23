@@ -1,8 +1,10 @@
 import type { TelemetryReading } from "../telemetry.js";
+import type { MediaConfig } from "../config.js";
 import { createImuCollector } from "./imu.js";
 import { createGpsCollector } from "./gps.js";
 import { createLteCollector } from "./lte.js";
 import { createSystemCollector } from "./system.js";
+import { createMediaCollector, type MediaSupervisor } from "./media.js";
 
 /** A capability-driven metric source for one telemetry group (P5 skeleton). */
 export interface Collector {
@@ -28,14 +30,25 @@ export interface IoCapabilities {
  * For now this is wired but inert (every collector returns {}); the real serial
  * / /proc / I2C reads land in P5 (device firmware).
  */
-export function createCollector(ioCapabilities: IoCapabilities = {}): {
+export function createCollector(
+  ioCapabilities: IoCapabilities = {},
+  mediaConfig?: MediaConfig,
+): {
   read(): Promise<TelemetryReading>;
+  /** Stop any supervised subprocesses (the media runtime). No-op otherwise. */
+  stop(): void;
 } {
   const collectors: Collector[] = [];
   if (ioCapabilities.sensors?.imu) collectors.push(createImuCollector());
   if (ioCapabilities.comm?.gps) collectors.push(createGpsCollector());
   if (ioCapabilities.comm?.signal) collectors.push(createLteCollector());
   if (ioCapabilities.system) collectors.push(createSystemCollector());
+
+  // The media collector supervises the KVS WebRTC runtime; it produces the
+  // `media` field (and self-gates when off/unavailable). When disabled, media
+  // stays inert/idle just like the old hardcoded value.
+  const media: MediaSupervisor | null =
+    mediaConfig?.enabled ? createMediaCollector(mediaConfig) : null;
 
   return {
     async read(): Promise<TelemetryReading> {
@@ -46,8 +59,13 @@ export function createCollector(ioCapabilities: IoCapabilities = {}): {
       }
       return {
         metrics: metrics as TelemetryReading["metrics"],
-        media: { kvs: { value: false }, recording: { value: false }, streams: [] },
+        media: media
+          ? media.read()
+          : { kvs: { value: false }, recording: { value: false }, streams: [] },
       };
+    },
+    stop(): void {
+      media?.stop();
     },
   };
 }

@@ -20,6 +20,36 @@ export interface CredBundle {
   ca: Buffer;
 }
 
+/**
+ * KVS WebRTC media-runtime config. `enabled` follows the same precedence as
+ * `mode` (flag > settings.json > env > default-off) and is forced off when
+ * offline (the runtime needs real AWS). The channels + IoT endpoints come from
+ * the on-device manifest (kvs.json), not from here.
+ */
+export interface MediaConfig {
+  enabled: boolean;
+  /** Compiled `xorgate-kvs-webrtc` binary (shipped in the agent tarball under media/). */
+  binaryPath: string;
+  /** Directory holding the user-supplied KVS SDK `.so` libs (LD_LIBRARY_PATH). */
+  libDir: string;
+  /** kvs.json manifest path (region, IoT cred endpoint, role alias, channels). */
+  manifestPath: string;
+  /** GStreamer source kind passed as argv[3]: testsrc (default) | devicesrc | rtspsrc. */
+  source: string;
+  /** Media type argv[2]: video-only (default) | audio-video. */
+  mediaType: string;
+  /** Directory of per-stream pipeline files (`<streamKey>.gst`); see media/pipeline.ts. */
+  pipelineDir: string;
+  /** Optional global KVS_GST_PIPELINE file (fallback when no per-stream file exists). */
+  pipelinePath?: string;
+  /** AWS_KVS_LOG_LEVEL for the runtime (default "3" = INFO). */
+  logLevel: string;
+  /** IoT cert / key / CA the runtime authenticates with (same files as the agent). */
+  certPath: string;
+  keyPath: string;
+  caPath: string;
+}
+
 export interface AgentConfig {
   deviceId: string;
   endpoint: string;
@@ -34,10 +64,12 @@ export interface AgentConfig {
   caPath: string;
   /** Loaded cert material, or null in offline mode. */
   creds: CredBundle | null;
+  /** KVS WebRTC media-runtime config. */
+  media: MediaConfig;
 }
 
 /** Flags that take no value. Everything else consumes the following token. */
-export const BOOLEAN_FLAGS = new Set(["offline"]);
+export const BOOLEAN_FLAGS = new Set(["offline", "media"]);
 
 /**
  * Parse `--flag value` and boolean `--flag` out of an argv slice. Boolean flags
@@ -88,13 +120,14 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     fallback;
 
   const offline = truthy(args.offline) || truthy(process.env.OFFLINE);
+  const settings = loadSettings();
 
   // Mode precedence: explicit --mode flag > persisted settings.json (operator's
   // UI/`set` choice) > MODE env (provisioning default) > "sim". settings.json
   // intentionally overrides env so the `manage`/`set` toggle takes effect on
   // provisioned devices, while an explicit flag still wins.
   const flagMode = typeof args.mode === "string" ? (args.mode as string) : undefined;
-  const mode = (flagMode ?? loadSettings().mode ?? process.env.MODE ?? "sim") as RunMode;
+  const mode = (flagMode ?? settings.mode ?? process.env.MODE ?? "sim") as RunMode;
   const rateHz = Number(get("rate", "RATE_HZ", "1"));
 
   // Offline mode needs no real device identity / endpoint; give it placeholders
@@ -131,6 +164,32 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     }
   }
 
+  // Media-runtime enabled precedence: --media flag > settings.json > MEDIA_ENABLED
+  // env > off. Forced off when offline (the KVS runtime needs real AWS). Like the
+  // collectors, it then self-gates on arch/binary/manifest, so "on" is safe even
+  // when the runtime can't actually start.
+  const mediaEnabled =
+    !offline &&
+    (truthy(args.media) || settings.mediaEnabled || truthy(process.env.MEDIA_ENABLED));
+  const media: MediaConfig = {
+    enabled: mediaEnabled,
+    binaryPath: resolve(
+      get("media-bin", "KVS_RUNTIME_BIN", "/opt/xorgate/media/xorgate-kvs-webrtc")!,
+    ),
+    libDir: resolve(get("media-lib", "KVS_RUNTIME_LIB_DIR", "/opt/xorgate/media/lib")!),
+    manifestPath: resolve(get("media-manifest", "KVS_MANIFEST", "./creds/kvs.json")!),
+    source: get("media-source", "MEDIA_SOURCE", "testsrc")!,
+    mediaType: get("media-type", "MEDIA_TYPE", "video-only")!,
+    pipelineDir: resolve(get("media-pipeline-dir", "KVS_PIPELINE_DIR", "/etc/xorgate/pipelines")!),
+    pipelinePath: process.env.KVS_GST_PIPELINE
+      ? resolve(process.env.KVS_GST_PIPELINE)
+      : undefined,
+    logLevel: get("media-log", "AWS_KVS_LOG_LEVEL", "3")!,
+    certPath,
+    keyPath,
+    caPath,
+  };
+
   return {
     deviceId,
     endpoint,
@@ -144,5 +203,6 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     keyPath,
     caPath,
     creds,
+    media,
   };
 }

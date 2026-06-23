@@ -15,6 +15,7 @@ import { statusCommand } from "./commands/status.js";
 import { logsCommand } from "./commands/logs.js";
 import { updateCommand } from "./commands/update.js";
 import { setCommand } from "./commands/set.js";
+import { pipelineCommand } from "./commands/pipeline.js";
 
 const VERSION = "0.2.0";
 /** Flags that take a value — skipped when locating the subcommand token. */
@@ -79,6 +80,9 @@ async function main(): Promise<void> {
     case "set":
       await setCommand(rest);
       break;
+    case "pipeline":
+      await pipelineCommand(rest);
+      break;
     case "monitor": // deprecated alias for `manage`, kept working for one release
     case "manage": {
       if (cmd === "monitor") console.error("[xorgate] 'monitor' is deprecated; use 'manage'");
@@ -108,7 +112,8 @@ Commands:
   restart    Stop then start
   status     Show whether the daemon is running (pid, uptime, connection, telemetry)
   manage     Open the live ink dashboard (start/stop/restart + Settings from inside)
-  set        Persist a setting and apply it, e.g. 'set mode <sim|real>' (--no-restart to defer)
+  set        Persist a setting and apply it, e.g. 'set mode <sim|real>' or 'set media <on|off>'
+  pipeline   Manage per-stream KVS pipelines: 'pipeline list|show|set|clear <streamKey> [file]'
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)

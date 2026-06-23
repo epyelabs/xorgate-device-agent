@@ -18,7 +18,13 @@ import {
 } from "../hardware/modem.js";
 import { detectImu, IMU, type ImuDetect } from "../hardware/imu.js";
 import { GPS_NMEA_PORT } from "../hardware/gps.js";
-import type { ActivityEvent, MetricLeaf, RunMode, StateSnapshot } from "../agent/telemetry.js";
+import type {
+  ActivityEvent,
+  MediaStream,
+  MetricLeaf,
+  RunMode,
+  StateSnapshot,
+} from "../agent/telemetry.js";
 
 export interface ModuleStatus {
   label: string;
@@ -341,31 +347,58 @@ const system: Module = {
   },
 };
 
+/** KVS master per-channel lifecycle state → text color. */
+const STREAM_STATE_COLOR: Record<MediaStream["state"], string> = {
+  starting: "yellow",
+  running: "green",
+  retrying: "yellow",
+  failed: "red",
+  stopped: "gray",
+};
+
 const media: Module = {
   id: "media",
   title: "Media",
   status: (s) => {
     const md = s?.latest?.media;
     if (!md) return UNKNOWN;
-    const live = md.kvs.value || md.recording.value || md.streams.length > 0;
-    return { label: live ? "live" : "idle", status: live ? "ok" : "unknown" };
+    if (md.streams.length === 0) {
+      const live = md.kvs.value || md.recording.value;
+      return { label: live ? "live" : "idle", status: live ? "ok" : "unknown" };
+    }
+    const running = md.streams.filter((x) => x.state === "running").length;
+    const failed = md.streams.some((x) => x.state === "failed");
+    if (running > 0) return { label: `${running}/${md.streams.length} live`, status: "ok" };
+    if (failed) return { label: "failed", status: "error" };
+    return { label: "starting", status: "warn" };
   },
   Detail: ({ snapshot }) => {
     const md = snapshot?.latest?.media;
     return (
       <Box flexDirection="column">
-        <DetailTitle>Media · streaming</DetailTitle>
+        <DetailTitle>Media · KVS WebRTC</DetailTitle>
         {md ? (
           <Box flexDirection="column">
             <Text>
               <Text color="gray">KVS </Text>
               {md.kvs.value ? <Text color="green">on</Text> : <Text color="gray">off</Text>}
-            </Text>
-            <Text>
-              <Text color="gray">recording </Text>
+              <Text color="gray"> · recording </Text>
               {md.recording.value ? <Text color="green">on</Text> : <Text color="gray">off</Text>}
             </Text>
-            <Text color="gray">streams {md.streams.length}</Text>
+            {md.streams.length === 0 ? (
+              <Text color="gray" dimColor>
+                no channels (run `xorgate set media on`, then check kvs.json)
+              </Text>
+            ) : (
+              md.streams.map((stream) => (
+                <Text key={stream.channelName} wrap="truncate-end">
+                  <Text color={STREAM_STATE_COLOR[stream.state]}>● </Text>
+                  <Text color="white">{stream.streamKey}</Text>
+                  <Text color="gray"> {stream.channelName} </Text>
+                  <Text color={STREAM_STATE_COLOR[stream.state]}>{stream.state}</Text>
+                </Text>
+              ))
+            )}
           </Box>
         ) : (
           <NoData />
@@ -376,38 +409,67 @@ const media: Module = {
 };
 
 /**
- * Settings detail — the one interactive pane. It renders the run-mode chooser;
- * key handling (toggle + apply) lives in MonitorApp, which passes the in-progress
- * `choice` and `operating` flag down. Extra props are optional so this still
+ * Settings detail — the one interactive pane. A small two-row form: run mode
+ * (sim/real) and the KVS WebRTC media runtime (on/off). Key handling (move row,
+ * toggle value, apply + restart) lives in MonitorApp, which passes the in-progress
+ * choices, the focused `row`, and the `operating` flag down. The current media
+ * value comes via `mediaEnabled` (the persisted settings.json value) since the
+ * state snapshot doesn't carry it. Extra props are optional so this still
  * satisfies the generic `Module.Detail` (React.FC<DetailProps>) signature.
  */
 interface SettingsDetailProps extends DetailProps {
-  choice?: RunMode;
+  modeChoice?: RunMode;
+  mediaChoice?: boolean;
+  /** Current persisted media toggle (settings.json); snapshot doesn't carry it. */
+  mediaEnabled?: boolean;
+  /** Focused row while operating: 0 = run mode, 1 = media. */
+  row?: number;
   operating?: boolean;
 }
 
-export function SettingsDetail({ snapshot, choice, operating }: SettingsDetailProps) {
-  const current = snapshot?.mode ?? null;
-  const highlight = operating ? (choice ?? current) : current;
+export function SettingsDetail({
+  snapshot,
+  modeChoice,
+  mediaChoice,
+  mediaEnabled,
+  row = 0,
+  operating,
+}: SettingsDetailProps) {
+  const curMode = snapshot?.mode ?? "sim";
+  const curMedia = mediaEnabled ?? false;
+  const valMode = operating ? (modeChoice ?? curMode) : curMode;
+  const valMedia = operating ? (mediaChoice ?? curMedia) : curMedia;
+
+  const rows = [
+    { label: "run mode", value: valMode, changed: valMode !== curMode },
+    { label: "media", value: valMedia ? "on" : "off", changed: valMedia !== curMedia },
+  ];
+
   return (
     <Box flexDirection="column">
-      <DetailTitle>Settings · run mode</DetailTitle>
-      <Text color="gray">Synthetic telemetry (sim) vs. real hardware collectors (real).</Text>
+      <DetailTitle>Settings</DetailTitle>
+      <Text color="gray">Run mode (sim/real) and the KVS WebRTC media runtime.</Text>
       <Box marginTop={1} flexDirection="column">
-        {(["sim", "real"] as const).map((m) => {
-          const on = m === highlight;
+        {rows.map((r, i) => {
+          const focused = !!operating && row === i;
           return (
-            <Text key={m} color={on ? "cyan" : "white"}>
-              {on ? "▶ " : "  "}
-              {m}
-              {m === current ? <Text color="green"> ● active</Text> : null}
+            <Text key={r.label} color={focused ? "cyan" : "white"}>
+              {focused ? "▶ " : "  "}
+              <Text color="gray">{r.label.padEnd(9)}</Text> {r.value}
+              {r.changed ? (
+                <Text color="yellow" dimColor>
+                  {" *"}
+                </Text>
+              ) : null}
             </Text>
           );
         })}
       </Box>
       <Box marginTop={1}>
         <Text color="gray" dimColor>
-          {operating ? "↑↓ choose · ↵ apply & restart · ←/q back" : "↵ to change the run mode"}
+          {operating
+            ? "↑↓ field · space toggle · ↵ apply & restart · ←/q back"
+            : "↵ to edit settings"}
         </Text>
       </Box>
     </Box>

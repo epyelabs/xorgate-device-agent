@@ -15,6 +15,8 @@ import type { RunMode } from "../agent/telemetry.js";
 
 export interface AgentSettings {
   mode?: RunMode;
+  /** Operator toggle for the KVS WebRTC media runtime (off unless explicitly enabled). */
+  mediaEnabled?: boolean;
 }
 
 export function settingsPath(): string {
@@ -26,8 +28,12 @@ export function loadSettings(path: string = settingsPath()): AgentSettings {
   try {
     const obj = JSON.parse(readFileSync(path, "utf8")) as unknown;
     if (obj && typeof obj === "object") {
+      const out: AgentSettings = {};
       const mode = (obj as { mode?: unknown }).mode;
-      if (mode === "sim" || mode === "real") return { mode };
+      if (mode === "sim" || mode === "real") out.mode = mode;
+      const mediaEnabled = (obj as { mediaEnabled?: unknown }).mediaEnabled;
+      if (typeof mediaEnabled === "boolean") out.mediaEnabled = mediaEnabled;
+      return out;
     }
   } catch {
     /* missing / corrupt — fall through to no overrides */

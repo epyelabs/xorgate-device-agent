@@ -33,9 +33,12 @@ ensureHome();
 //   - lte    — reads the connection-manager daemon's telemetry JSON, {} if absent.
 // Wiring the exact set from per-device io_capabilities (instead of enabling all)
 // is a later step; enabling all is safe because each collector self-gates.
-const source: { read: () => Promise<TelemetryReading> } =
+const source: { read: () => Promise<TelemetryReading>; stop?: () => void } =
   config.mode === "real"
-    ? createCollector({ sensors: { imu: true }, system: true, comm: { gps: true, signal: true } })
+    ? createCollector(
+        { sensors: { imu: true }, system: true, comm: { gps: true, signal: true } },
+        config.media,
+      )
     : (() => {
         const next = createSimulator();
         return { read: async () => next() };
@@ -192,6 +195,9 @@ function shutdown(sig: string): void {
   console.log(`\n[agent] shutting down (${sig})…`);
   if (timer) clearInterval(timer);
   clearInterval(heartbeat);
+  // SIGINT any KVS master subprocesses so they deregister from their channels
+  // cleanly instead of being orphaned/force-killed.
+  source.stop?.();
   // Only remove the pidfile if we wrote it (direct/systemd launch); when started
   // by `xorgate stop` the manager owns pidfile removal.
   if (selfManaged) removePidfile();

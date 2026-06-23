@@ -51,10 +51,20 @@ export interface TelemetryMetrics {
   };
 }
 
+/** One KVS WebRTC master the media runtime supervises (one per signaling channel). */
+export interface MediaStream {
+  /** Stream key from the device model's media capabilities (e.g. "cam0"). */
+  streamKey: string;
+  /** Signaling channel the master connects to as MASTER (`${deviceId}-${streamKey}`). */
+  channelName: string;
+  /** Supervisor lifecycle state for this channel's master process. */
+  state: "starting" | "running" | "retrying" | "failed" | "stopped";
+}
+
 export interface TelemetryMedia {
   kvs: { value: boolean };
   recording: { value: boolean };
-  streams: unknown[];
+  streams: MediaStream[];
 }
 
 /** The §1.3 payload published to `xorgate/devices/{deviceId}/telemetry`. */

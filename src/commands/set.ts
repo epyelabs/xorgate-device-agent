@@ -1,13 +1,16 @@
 /**
  * `xorgate set <key> <value>` — persist an agent setting and apply it.
  *
- * Currently the only key is `mode` (<sim|real>). The value is written to
- * settings.json (read by loadConfig with precedence flag > settings > env), then
- * the daemon is restarted to apply — reusing its recorded launch flags so creds
- * / --offline are preserved. `--no-restart` persists without restarting.
+ * Supported keys: `mode` (<sim|real>) and `media` (<on|off>, the KVS WebRTC
+ * runtime toggle). The value is merged into settings.json (read by loadConfig
+ * with precedence flag > settings > env), then the daemon is restarted to apply
+ * — reusing its recorded launch flags so creds / --offline are preserved.
+ * `--no-restart` persists without restarting.
  */
-import { saveSettings } from "../daemon/settings.js";
+import { loadSettings, saveSettings, type AgentSettings } from "../daemon/settings.js";
 import { inspect, restart } from "../daemon/manager.js";
+
+const USAGE = "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>)";
 
 export async function setCommand(rest: string[]): Promise<void> {
   const noRestart = rest.includes("--no-restart");
@@ -16,23 +19,39 @@ export async function setCommand(rest: string[]): Promise<void> {
   const value = positionals[1];
 
   if (!key) {
-    console.error("usage: xorgate set <key> <value>   (supported: mode <sim|real>)");
-    process.exitCode = 1;
-    return;
-  }
-  if (key !== "mode") {
-    console.error(`unknown setting '${key}' (supported: mode)`);
-    process.exitCode = 1;
-    return;
-  }
-  if (value !== "sim" && value !== "real") {
-    console.error(`mode must be 'sim' or 'real', got '${value ?? ""}'`);
+    console.error(USAGE);
     process.exitCode = 1;
     return;
   }
 
-  saveSettings({ mode: value });
-  console.log(`✓ mode set to ${value} (persisted to settings.json)`);
+  // Merge onto existing settings so toggling one key never clobbers the other.
+  const next: AgentSettings = { ...loadSettings() };
+  let applied: string;
+
+  if (key === "mode") {
+    if (value !== "sim" && value !== "real") {
+      console.error(`mode must be 'sim' or 'real', got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    next.mode = value;
+    applied = `mode set to ${value}`;
+  } else if (key === "media") {
+    if (value !== "on" && value !== "off") {
+      console.error(`media must be 'on' or 'off', got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    next.mediaEnabled = value === "on";
+    applied = `media ${value} (KVS WebRTC runtime)`;
+  } else {
+    console.error(`unknown setting '${key}' (supported: mode, media)`);
+    process.exitCode = 1;
+    return;
+  }
+
+  saveSettings(next);
+  console.log(`✓ ${applied} (persisted to settings.json)`);
 
   if (noRestart) {
     console.log("  --no-restart: applies on the next daemon start");

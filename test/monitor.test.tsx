@@ -117,7 +117,7 @@ describe("MonitorApp", () => {
     unmount();
   });
 
-  it("opens Settings and toggles the run-mode choice", async () => {
+  it("opens Settings and edits the run mode + media rows", async () => {
     const running: DaemonStatus = {
       kind: "running",
       record,
@@ -135,15 +135,23 @@ describe("MonitorApp", () => {
     for (let i = 0; i < settingsIdx; i++) stdin.write("j");
     await delay(80);
     let frame = lastFrame() ?? "";
-    expect(frame).toContain("run mode"); // Settings detail renders
-    expect(frame).toContain("▶ sim"); // active mode highlighted
+    expect(frame).toContain("run mode"); // both setting rows render
+    expect(frame).toContain("media");
 
-    stdin.write("\r"); // open (enter operating)
-    await delay(60);
-    stdin.write("j"); // toggle the choice
+    stdin.write("\r"); // open (enter operating); row 0 = run mode focused
     await delay(60);
     frame = lastFrame() ?? "";
-    expect(frame).toContain("▶ real"); // choice moved off the active mode
+    expect(frame).toContain("▶ run mode");
+
+    stdin.write(" "); // space toggles the focused row (sim -> real)
+    await delay(60);
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("real");
+
+    stdin.write("j"); // move focus to the media row
+    await delay(60);
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("▶ media");
 
     unmount();
   });

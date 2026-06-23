@@ -22,8 +22,8 @@ xorgate <command> [agent flags]
   status     Is it running? pid, uptime, connection, last-telemetry age, counters
   manage     Live ink dashboard — sidebar of telemetry modules + Settings (↑↓ select,
              ↵/→ open); Connection/Daemon in the header; start/stop/restart from inside
-  set        Persist a setting and apply it — e.g. `set mode <sim|real>`
-             (--no-restart to persist without restarting the daemon)
+  set        Persist a setting and apply it — `set mode <sim|real>` or
+             `set media <on|off>` (--no-restart to persist without restarting)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest build, install it, and restart the service (sudo;
              on-device only — --tag <version> pins a build, --from <url> the bucket)
@@ -52,7 +52,7 @@ tracks it via files under `~/.xorgate/` (override with `XORGATE_HOME`):
 | `agent.pid` | JSON pid record (pid, startedAt, deviceId, mode…) — also used to detect a recycled pid via process start-time |
 | `agent.log` | append-only stdout/stderr of the worker (`xorgate logs`) |
 | `state.json` | atomic live snapshot the manage/status read (connection, latest telemetry, counters) |
-| `settings.json` | persisted operator settings (currently `mode`) read by loadConfig |
+| `settings.json` | persisted operator settings (`mode`, `mediaEnabled`) read by loadConfig |
 
 `status` / `manage` report **running** (pid alive + identity verified + state
 fresh), **stale** (pidfile left by a crashed/recycled process — auto-cleaned on
@@ -319,6 +319,50 @@ sudo usermod -aG i2c "$USER"                                 # non-root bus acce
 
 Iterate off-hardware with `XORGATE_MOCK=1` (or any non-Linux host): detection
 reports a synthetic sensor and the stream emits a slowly-rotating mock signal.
+
+## Media runtime (KVS WebRTC, `MODE=real`)
+
+The media collector (`src/agent/collectors/media.ts`) supervises the compiled
+`xorgate-kvs-webrtc` master runtime — **one process per KVS signaling channel** —
+so the device streams live video to the web app's **Streams tab** viewer. It is the
+agent-managed replacement for the standalone `xorgate-synthetic-master` rig: same
+contract (connect as MASTER to `${deviceId}-${streamKey}`, IoT-cert creds, H.264),
+just supervised in-process with restart-on-crash. A device with multiple cameras
+(`cam0`, `cam1`, …) gets one master per channel automatically.
+
+- **Control is local and off by default.** Toggle it from the `manage` UI's
+  **Settings** pane (the `media` row, alongside run mode) or with
+  `xorgate set media <on|off>`. Either persists `mediaEnabled` to `settings.json`
+  and applies on the next (re)start; precedence is `--media` flag >
+  `settings.json` > `MEDIA_ENABLED` env > off, and it is forced off when `--offline`.
+- **Credentials reuse the device's IoT cert.** The runtime authenticates via the
+  IoT credential-provider (`AWS_IOT_CORE_*`) using the same `/etc/xorgate`
+  cert/key/CA as the telemetry agent — no static AWS keys. The region, credential
+  endpoint, role alias, and channel list come from the on-device manifest
+  `kvs.json` (`src/media/manifest.ts`), written by the install script.
+- **Binary + libs.** The aarch64 binary ships in `media/` (in the agent tarball).
+  Its KVS SDK `.so` libraries (plus the SDK's vendored OpenSSL 1.1 and
+  libwebsockets) are **supplied separately** into `media/lib/` (`LD_LIBRARY_PATH`)
+  — pull them off the build Pi with `media/fetch-kvs-libs.sh`; see
+  [`media/README.md`](media/README.md). GStreamer + glib come from apt via the
+  install script.
+- **Per-camera pipelines.** Each channel resolves its GStreamer pipeline from
+  `<KVS_PIPELINE_DIR>/<streamKey>.gst` (default dir `/etc/xorgate/pipelines`), so
+  `cam0.gst` and `cam1.gst` drive the `cam0`/`cam1` masters with their own
+  `libcamerasrc camera-name=...`. Falls back to a global `KVS_GST_PIPELINE` file,
+  then the runtime's built-in default (`testsrc`). Manage them with the CLI:
+  `xorgate pipeline list`, `xorgate pipeline set cam0 ./cam0.gst`,
+  `xorgate pipeline show cam0`, `xorgate pipeline clear cam0` (restart to apply).
+  A pipeline should end in `appsink ... name=appsink-video`; see
+  [`xorgate-kvs-webrtc/pipeline.example`](../xorgate-kvs-webrtc/pipeline.example).
+- **Self-gating.** Off a 64-bit Linux device, or with the binary/manifest/libs
+  missing, the collector stays inert and reports `media` idle — the daemon stays
+  healthy. A runtime that keeps exiting before it stabilizes (typically missing
+  `.so` libs) is parked as `failed` after a few quick crashes rather than
+  tight-looped; fix the cause and restart the daemon.
+
+Status shows in the monitor's **Media** pane (per-channel state) and in the
+telemetry payload's `media.kvs` / `media.streams`.
 
 ## Notes for the collectors work (P5 / `MODE=real`)
 

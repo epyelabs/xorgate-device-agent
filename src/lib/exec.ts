@@ -60,6 +60,10 @@ export interface StreamHandle {
 /**
  * Launch a long-running process, forwarding output through callbacks.
  * `onStdoutChunk` receives raw Buffers (used by the mic visualizer for PCM).
+ *
+ * `opts.env` is MERGED onto the inherited environment (execa's default), so pass
+ * only the extra vars; `opts.cwd` sets the working directory. The media runtime
+ * uses both to inject AWS IoT creds + LD_LIBRARY_PATH for the KVS binary.
  */
 export function runStream(
   cmd: string,
@@ -69,10 +73,11 @@ export function runStream(
     onStderr?: (line: string) => void;
     onStdoutChunk?: (chunk: Buffer) => void;
   } = {},
+  opts: { env?: Record<string, string>; cwd?: string } = {},
 ): StreamHandle {
   let child: ResultPromise;
   try {
-    child = execa(cmd, args, { reject: false, buffer: false });
+    child = execa(cmd, args, { reject: false, buffer: false, env: opts.env, cwd: opts.cwd });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     return {

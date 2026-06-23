@@ -17,6 +17,18 @@ describe("settings persistence", () => {
     expect(loadSettings()).toEqual({ mode: "sim" });
   });
 
+  it("round-trips the media toggle alongside the mode", () => {
+    saveSettings({ mode: "real", mediaEnabled: true });
+    expect(loadSettings()).toEqual({ mode: "real", mediaEnabled: true });
+    saveSettings({ mode: "real", mediaEnabled: false });
+    expect(loadSettings()).toEqual({ mode: "real", mediaEnabled: false });
+  });
+
+  it("ignores a non-boolean mediaEnabled", () => {
+    writeFileSync(settingsPath(), JSON.stringify({ mode: "real", mediaEnabled: "yes" }));
+    expect(loadSettings()).toEqual({ mode: "real" });
+  });
+
   it("returns {} when the file is missing", () => {
     expect(loadSettings()).toEqual({});
   });

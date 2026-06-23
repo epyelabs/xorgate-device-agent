@@ -73,8 +73,10 @@ jobs:
           TARBALL="xorgate-agent-${SHORT_SHA}.tar.gz"
           # `python/` ships the BNO085 IMU helper the real-mode collector spawns;
           # `modem/` ships the SIM7600 connection-manager (daemon + systemd + udev)
-          # the install script provisions for LTE uplink + GPS.
-          tar -czf "$TARBALL" dist package.json package-lock.json systemd python modem
+          # the install script provisions for LTE uplink + GPS;
+          # `media/` ships the KVS WebRTC runtime binary (+ user-supplied .so libs
+          # under media/lib) the media collector supervises.
+          tar -czf "$TARBALL" dist package.json package-lock.json systemd python modem media
           echo "Contents:"
           tar -tzf "$TARBALL" | head -30
           # install.sh extracts to /opt/xorgate and expects these entries.

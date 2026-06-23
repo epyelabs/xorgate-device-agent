@@ -50,12 +50,17 @@ export function MonitorApp({
   const [operating, setOperating] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [modeChoice, setModeChoice] = useState<RunMode | null>(null);
+  const [mediaChoice, setMediaChoice] = useState<boolean | null>(null);
+  const [settingsRow, setSettingsRow] = useState(0);
   const logLines = useLogTail(showLogs);
 
   const running = status.kind === "running";
   const snapshot = running ? status.state : null;
   const selectedModule = MODULES[selected];
   const onSettings = selectedModule.id === "settings";
+  // The snapshot doesn't carry the media toggle, so read the persisted value for
+  // the Settings form (only when that pane is active to avoid a per-tick file read).
+  const mediaEnabled = onSettings ? (loadSettings().mediaEnabled ?? false) : false;
 
   useInput((input, key) => {
     if (operating) {
@@ -65,10 +70,21 @@ export function MonitorApp({
       }
       if (onSettings) {
         if (key.upArrow || key.downArrow || input === "j" || input === "k") {
-          setModeChoice((c) => ((c ?? snapshot?.mode ?? "sim") === "sim" ? "real" : "sim"));
+          setSettingsRow((r) => (r === 0 ? 1 : 0)); // move between run mode / media
+        } else if (input === " ") {
+          // Toggle the focused row's pending value.
+          if (settingsRow === 0) {
+            setModeChoice((c) => ((c ?? snapshot?.mode ?? "sim") === "sim" ? "real" : "sim"));
+          } else {
+            setMediaChoice((c) => !(c ?? mediaEnabled));
+          }
         } else if (key.return || input === "a" || input === "A") {
-          // Persist the choice, then restart so loadConfig picks it up from settings.json.
-          saveSettings({ mode: modeChoice ?? snapshot?.mode ?? "sim" });
+          // Persist both choices, then restart so loadConfig picks them up.
+          saveSettings({
+            ...loadSettings(),
+            mode: modeChoice ?? snapshot?.mode ?? "sim",
+            mediaEnabled: mediaChoice ?? mediaEnabled,
+          });
           controls.restart();
           setOperating(false);
         }
@@ -80,7 +96,12 @@ export function MonitorApp({
     } else if (key.downArrow || input === "j") {
       setSelected((i) => (i + 1) % MODULES.length);
     } else if ((key.return || key.rightArrow) && running) {
-      if (onSettings) setModeChoice(snapshot?.mode ?? loadSettings().mode ?? "sim");
+      if (onSettings) {
+        const persisted = loadSettings();
+        setModeChoice(snapshot?.mode ?? persisted.mode ?? "sim");
+        setMediaChoice(persisted.mediaEnabled ?? false);
+        setSettingsRow(0);
+      }
       setOperating(true);
     } else if ((input === "s" || input === "S") && !running) {
       controls.start();
@@ -127,7 +148,10 @@ export function MonitorApp({
         <SettingsDetail
           snapshot={snapshot}
           now={now}
-          choice={modeChoice ?? undefined}
+          modeChoice={modeChoice ?? undefined}
+          mediaChoice={mediaChoice ?? undefined}
+          mediaEnabled={mediaEnabled}
+          row={settingsRow}
           operating={operating}
         />
       ) : (
@@ -145,7 +169,8 @@ export function MonitorApp({
     : operating
       ? onSettings
         ? [
-            { keys: "↑↓", label: "choose" },
+            { keys: "↑↓", label: "field" },
+            { keys: "space", label: "toggle" },
             { keys: "↵", label: "apply & restart" },
             { keys: "←/q", label: "back" },
           ]

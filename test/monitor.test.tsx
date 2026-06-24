@@ -99,7 +99,9 @@ describe("MonitorApp", () => {
 
     let frame = lastFrame() ?? "";
     expect(frame).toContain("XORGATE Manager");
-    expect(frame).toContain("connected"); // connection moved to the header
+    expect(frame).toContain("Connectivity"); // per-interface + mqtt status row
+    expect(frame).toContain("mqtt"); // cloud/MQTT indicator restored
+    expect(frame).toContain("pid"); // daemon stats live on the header status line
     for (const title of ["IMU", "GPS", "LTE", "System", "Media", "Activity", "Settings"]) {
       expect(frame).toContain(title); // sidebar lists every module
     }
@@ -135,8 +137,9 @@ describe("MonitorApp", () => {
     for (let i = 0; i < settingsIdx; i++) stdin.write("j");
     await delay(80);
     let frame = lastFrame() ?? "";
-    expect(frame).toContain("run mode"); // both setting rows render
+    expect(frame).toContain("run mode"); // setting rows render
     expect(frame).toContain("media");
+    expect(frame).toContain("wifi"); // wifi row present (on/off or "not present")
 
     stdin.write("\r"); // open (enter operating); row 0 = run mode focused
     await delay(60);

@@ -47,12 +47,12 @@ and `update`.
 In the self-managed model, `start` forks the agent as a detached process and
 tracks it via files under `~/.xorgate/` (override with `XORGATE_HOME`):
 
-| File | Purpose |
-|------|---------|
-| `agent.pid` | JSON pid record (pid, startedAt, deviceId, mode…) — also used to detect a recycled pid via process start-time |
-| `agent.log` | append-only stdout/stderr of the worker (`xorgate logs`) |
-| `state.json` | atomic live snapshot the manage/status read (connection, latest telemetry, counters) |
-| `settings.json` | persisted operator settings (`mode`, `mediaEnabled`) read by loadConfig |
+| File            | Purpose                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------- |
+| `agent.pid`     | JSON pid record (pid, startedAt, deviceId, mode…) — also used to detect a recycled pid via process start-time |
+| `agent.log`     | append-only stdout/stderr of the worker (`xorgate logs`)                                                      |
+| `state.json`    | atomic live snapshot the manage/status read (connection, latest telemetry, counters)                          |
+| `settings.json` | persisted operator settings (`mode`, `mediaEnabled`) read by loadConfig                                       |
 
 `status` / `manage` report **running** (pid alive + identity verified + state
 fresh), **stale** (pidfile left by a crashed/recycled process — auto-cleaned on
@@ -103,12 +103,17 @@ device to `offline` immediately; an ungraceful kill is covered by the MQTT
 Last-Will and the cloud sweeper (~60 s).
 
 ### Getting an idToken
+
 In the web app's browser devtools console (while logged in):
 
 ```js
-const cid = "7v9p61d6286ap4gbfj0psfu9h6" // VITE_COGNITO_CLIENT_ID
-const u = localStorage.getItem(`CognitoIdentityServiceProvider.${cid}.LastAuthUser`)
-copy(localStorage.getItem(`CognitoIdentityServiceProvider.${cid}.${u}.idToken`))
+const cid = "7v9p61d6286ap4gbfj0psfu9h6"; // VITE_COGNITO_CLIENT_ID
+const u = localStorage.getItem(
+  `CognitoIdentityServiceProvider.${cid}.LastAuthUser`,
+);
+copy(
+  localStorage.getItem(`CognitoIdentityServiceProvider.${cid}.${u}.idToken`),
+);
 ```
 
 It's now on your clipboard (`copy()` is a devtools helper). Tokens expire after
@@ -124,11 +129,11 @@ It's now on your clipboard (`copy()` is a devtools helper). Tokens expire after
 
    From the JSON response, populate `./creds`:
 
-   | Response field        | File                |
-   |-----------------------|---------------------|
-   | `iot.certificatePem`  | `./creds/cert.crt`  |
-   | `iot.privateKey`      | `./creds/private.key` |
-   | (download `iot.caUrl`)| `./creds/ca.pem`    |
+   | Response field         | File                  |
+   | ---------------------- | --------------------- |
+   | `iot.certificatePem`   | `./creds/cert.crt`    |
+   | `iot.privateKey`       | `./creds/private.key` |
+   | (download `iot.caUrl`) | `./creds/ca.pem`      |
 
    ```sh
    mkdir -p creds
@@ -149,16 +154,16 @@ It's now on your clipboard (`copy()` is a devtools helper). Tokens expire after
 Agent flags can be passed to `start`/`restart`/`manage` (e.g.
 `xorgate start --rate 2`) or set as env vars:
 
-| Env | Flag | Default | Notes |
-|-----|------|---------|-------|
-| `DEVICE_ID` | `--device-id` | — (required unless `--offline`) | Canonical `devices.id` (uuid). Also the MQTT clientId/thing name. |
-| `IOT_DATA_ENDPOINT` | `--endpoint` | — (required unless `--offline`) | `iot:Data-ATS` endpoint (`iot.dataEndpoint` from provisioning). |
-| `OFFLINE` | `--offline` | off | Network-free stub mqtt + simulator. No creds needed. |
-| `MODE` | `--mode` | `sim` | `sim` = synthetic telemetry; `real` = hardware collectors (IMU, system, GPS, LTE) **and** the KVS WebRTC media runtime. Overridden by a persisted `settings.json` (set via `manage`/`xorgate set mode`); the `--mode` flag still wins. |
-| `RATE_HZ` | `--rate` | `1` | Publish rate. |
-| `CERT_PATH` | `--cert` | `./creds/cert.crt` | |
-| `KEY_PATH` | `--key` | `./creds/private.key` | |
-| `CA_PATH` | `--ca` | `./creds/ca.pem` | Amazon Root CA1. |
+| Env                 | Flag          | Default                         | Notes                                                                                                                                                                                                                                  |
+| ------------------- | ------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DEVICE_ID`         | `--device-id` | — (required unless `--offline`) | Canonical `devices.id` (uuid). Also the MQTT clientId/thing name.                                                                                                                                                                      |
+| `IOT_DATA_ENDPOINT` | `--endpoint`  | — (required unless `--offline`) | `iot:Data-ATS` endpoint (`iot.dataEndpoint` from provisioning).                                                                                                                                                                        |
+| `OFFLINE`           | `--offline`   | off                             | Network-free stub mqtt + simulator. No creds needed.                                                                                                                                                                                   |
+| `MODE`              | `--mode`      | `sim`                           | `sim` = synthetic telemetry; `real` = hardware collectors (IMU, system, GPS, LTE) **and** the KVS WebRTC media runtime. Overridden by a persisted `settings.json` (set via `manage`/`xorgate set mode`); the `--mode` flag still wins. |
+| `RATE_HZ`           | `--rate`      | `1`                             | Publish rate.                                                                                                                                                                                                                          |
+| `CERT_PATH`         | `--cert`      | `./creds/cert.crt`              |                                                                                                                                                                                                                                        |
+| `KEY_PATH`          | `--key`       | `./creds/private.key`           |                                                                                                                                                                                                                                        |
+| `CA_PATH`           | `--ca`        | `./creds/ca.pem`                | Amazon Root CA1.                                                                                                                                                                                                                       |
 
 Other env: `XORGATE_HOME` (runtime dir, default `~/.xorgate`),
 `XORGATE_STOP_TIMEOUT_MS` (graceful-stop timeout before SIGKILL, default 5000),
@@ -186,11 +191,12 @@ test/                # vitest: pidfile/state/process/manager logic + monitor UI 
 
 Under `MODE=real` the **IMU and system collectors are live** — IMU (BNO085 over
 I2C — see below) and system (CPU usage/temp, RAM, disk via pure `/proc` + `/sys`
-+ `df` reads, no privileges needed; `cpu_temp`/`disk_usage` are omitted off-Pi
-hosts that lack a thermal zone). The remaining serial GPS/LTE reads are still
-inert stubs landing in **P5 (device firmware)**. The UI scaffolding (ink
-components, host-metrics readers) and the IMU read path are adapted from
-`argus-test-bench/argus-cli`.
+
+- `df` reads, no privileges needed; `cpu_temp`/`disk_usage` are omitted off-Pi
+  hosts that lack a thermal zone). The remaining serial GPS/LTE reads are still
+  inert stubs landing in **P5 (device firmware)**. The UI scaffolding (ink
+  components, host-metrics readers) and the IMU read path are adapted from
+  `argus-test-bench/argus-cli`.
 
 The monitor is a master/detail dashboard (argus-cli style): the header shows the
 daemon's **Connection** and **Daemon** stats, the left sidebar lists the telemetry
@@ -204,14 +210,14 @@ The same binary supports two supervision models. Most of the sections above
 (`xorgate start`, `~/.xorgate`, `--offline`) describe the **dev/local** model.
 On a real device it runs under **systemd**, set up by the provisioning flow.
 
-| | Dev / local (`xorgate start`) | Device (provisioned) |
-|---|---|---|
-| Supervisor | self-managed detached process | systemd (`xorgate-agent.service`) |
-| Runs as | you | the provisioning user (e.g. `pi`) |
-| Runtime dir | `~/.xorgate` | `/var/lib/xorgate` |
-| Who writes the pidfile | `xorgate start` (the manager) | the worker self-registers on boot |
-| Lifecycle | `xorgate start/stop/restart` | `sudo systemctl … xorgate-agent` (never `xorgate start`) |
-| Logs | `xorgate logs` (`agent.log`) | `journalctl -u xorgate-agent` |
+|                        | Dev / local (`xorgate start`) | Device (provisioned)                                     |
+| ---------------------- | ----------------------------- | -------------------------------------------------------- |
+| Supervisor             | self-managed detached process | systemd (`xorgate-agent.service`)                        |
+| Runs as                | you                           | the provisioning user (e.g. `pi`)                        |
+| Runtime dir            | `~/.xorgate`                  | `/var/lib/xorgate`                                       |
+| Who writes the pidfile | `xorgate start` (the manager) | the worker self-registers on boot                        |
+| Lifecycle              | `xorgate start/stop/restart`  | `sudo systemctl … xorgate-agent` (never `xorgate start`) |
+| Logs                   | `xorgate logs` (`agent.log`)  | `journalctl -u xorgate-agent`                            |
 
 The worker writes its own pidfile when launched directly (so `status`/`manage`
 can see a systemd-run agent). It skips that when the CLI manager started it — the
@@ -268,13 +274,13 @@ Important and easy to trip over — read this before touching collectors.
 
 ## On-device layout
 
-| Path | Owner | What |
-|------|-------|------|
-| `/opt/xorgate` | root | the build: `dist/`, `node_modules`, `systemd/`, `package.json` (root-owned but world-readable, so the svc user can execute it) |
-| `/usr/local/bin/xorgate` | root | wrapper → `node /opt/xorgate/dist/cli.js`, defaults `XORGATE_HOME=/var/lib/xorgate` |
-| `/etc/xorgate` | svc user | `device.cert.pem`, `device.key.pem`, `root-ca.pem`, `agent.env` (all `0600`) |
-| `/var/lib/xorgate` | svc user | `agent.pid`, `state.json` (`0700`) |
-| `…/xorgate-agent.service` (+ `.d/10-user.conf`) | root | systemd unit + the `User=`/`Group=` drop-in |
+| Path                                            | Owner    | What                                                                                                                           |
+| ----------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `/opt/xorgate`                                  | root     | the build: `dist/`, `node_modules`, `systemd/`, `package.json` (root-owned but world-readable, so the svc user can execute it) |
+| `/usr/local/bin/xorgate`                        | root     | wrapper → `node /opt/xorgate/dist/cli.js`, defaults `XORGATE_HOME=/var/lib/xorgate`                                            |
+| `/etc/xorgate`                                  | svc user | `device.cert.pem`, `device.key.pem`, `root-ca.pem`, `agent.env` (all `0600`)                                                   |
+| `/var/lib/xorgate`                              | svc user | `agent.pid`, `state.json` (`0700`)                                                                                             |
+| `…/xorgate-agent.service` (+ `.d/10-user.conf`) | root     | systemd unit + the `User=`/`Group=` drop-in                                                                                    |
 
 `agent.env` holds `DEVICE_ID`, `IOT_DATA_ENDPOINT`, `CERT_PATH`/`KEY_PATH`/`CA_PATH`,
 `MODE`, plus `DEVICE_DIST_BUCKET_URL`/`DEVICE_DIST_VERSION` (where `xorgate update`
@@ -348,10 +354,13 @@ just supervised in-process with restart-on-crash. A device with multiple cameras
   manifest `kvs.json` (`src/media/manifest.ts`), written by the install script from
   the claim response. Shape:
   ```json
-  { "deviceId": "...", "region": "us-east-1",
+  {
+    "deviceId": "...",
+    "region": "us-east-1",
     "credentialEndpoint": "xxxx.credentials.iot.us-east-1.amazonaws.com",
     "roleAlias": "XorgateDeviceCredsDev",
-    "channels": [ { "streamKey": "cam0", "channelName": "<deviceId>-cam0" } ] }
+    "channels": [{ "streamKey": "cam0", "channelName": "<deviceId>-cam0" }]
+  }
   ```
 - **CA bundle (gotcha).** The runtime verifies TLS to the IoT credential provider
   AND the KVS endpoints against the SDK's `cert.pem` (Starfield Services Root CA G2),
@@ -387,31 +396,6 @@ just supervised in-process with restart-on-crash. A device with multiple cameras
 
 Status shows in the monitor's **Media** pane (per-channel state) and in the
 telemetry payload's `media.kvs` / `media.streams`.
-
-## Notes for the collectors work (P5 / `MODE=real`)
-
-The remaining collectors in `src/agent/collectors/` (GPS/LTE/system) are inert
-stubs; `sim` (and `--offline`) emit synthetic telemetry. The worker's publish
-loop, state snapshot, and MQTT plumbing already work end-to-end — P5 is about
-feeding them real reads (the IMU above is the first). When wiring them up:
-
-- **The agent runs as the provisioning user (`pi`), not root** (see Permissions
-  above). Hardware access must work for *that* user — add it to the relevant
-  groups (`gpio`, `video`, `i2c`, `spi`, `dialout` for 4G/LTE serial) and use udev
-  rules rather than bumping the service back to root. On Raspberry Pi OS `pi`
-  already has most of these. If a collector genuinely needs a privileged op,
-  prefer a narrowly-scoped helper over running the whole agent as root.
-- Reads shell out via `src/lib/exec.ts` (`run`/`runStream` — never throw; inspect
-  `.failed`/`.notFound`). Keep tools optional: `commandExists()` drives the
-  "not installed" UI states in the monitor.
-- Which collectors run is driven by the device model's
-  `device_models.io_capabilities` (declared server-side). `worker.ts` currently
-  hard-codes the sim source; the P5 TODO there is to fetch capabilities for the
-  device and build the matching collector set (`agent/collectors/index.ts`).
-- A collector read must never crash the daemon — the worker already guards the
-  loop and `unhandledRejection`; keep new reads inside that contract.
-- Iterate against `--offline` (no AWS, no hardware) for the daemon/monitor paths,
-  then a real device for the hardware reads.
 
 ## Build & test
 

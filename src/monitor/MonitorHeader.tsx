@@ -1,17 +1,50 @@
 /**
- * Monitor title bar: app identity + host, plus the daemon's Connection (left)
- * and Daemon stats (right). Replaces the old live host-metrics header — device
- * CPU/RAM/etc. live in the "System" module, so they're not duplicated here.
+ * Monitor title bar: app identity + host, plus a single status line —
+ * connectivity (left) and daemon stats (right). Connectivity shows a colored
+ * circle for each network interface's ACTUAL internet reachability (per NIC,
+ * daemon-independent) plus an `mqtt` circle for the cloud/MQTT connection.
+ * Device CPU/RAM/etc. live in the "System" module, so they're not duplicated here.
  */
 import { Box, Text } from "ink";
-import { StatusBadge } from "../components/StatusBadge.js";
 import { osInfo } from "../hardware/system.js";
 import { hostLabel, isMock } from "../lib/platform.js";
-import { ageLabel, uptimeLabel } from "../lib/format.js";
-import { connectionStatus } from "./format.js";
+import { uptimeLabel } from "../lib/format.js";
 import type { DaemonStatus } from "../daemon/manager.js";
+import type { IfaceStatus, IfaceState } from "../hardware/network.js";
+import type { ConnectionState } from "../agent/telemetry.js";
 
-export function MonitorHeader({ status, now }: { status: DaemonStatus; now: number }) {
+/** Internet-status circle color per interface state. */
+const IFACE_COLOR: Record<IfaceState, string> = {
+  online: "green",
+  offline: "red",
+  down: "gray",
+};
+
+/** MQTT/cloud circle color per connection state. */
+const MQTT_COLOR: Record<ConnectionState, string> = {
+  connected: "green",
+  connecting: "yellow",
+  reconnecting: "yellow",
+  closed: "gray",
+  error: "red",
+};
+
+/** Color for the mqtt circle: gray when the daemon is down, yellow when stale. */
+function mqttColor(status: DaemonStatus): string {
+  if (status.kind !== "running") return "gray";
+  if (!status.stateFresh) return "yellow";
+  return MQTT_COLOR[status.state?.connection ?? "connecting"];
+}
+
+export function MonitorHeader({
+  status,
+  now,
+  interfaces = [],
+}: {
+  status: DaemonStatus;
+  now: number;
+  interfaces?: IfaceStatus[];
+}) {
   const os = osInfo();
   return (
     <Box
@@ -39,16 +72,50 @@ export function MonitorHeader({ status, now }: { status: DaemonStatus; now: numb
         borderRight={false}
       />
 
-      {status.kind === "running" ? (
-        <RunningRow status={status} now={now} />
-      ) : (
-        <NotRunningRow stale={status.kind === "stale"} />
-      )}
+      {/* One line when the terminal is wide; if narrow, the stats wrap below
+          while the connectivity row stays intact (never split mid-indicators). */}
+      <Box flexWrap="wrap" justifyContent="space-between">
+        <ConnectivityRow interfaces={interfaces} mqtt={mqttColor(status)} />
+        {status.kind === "running" ? (
+          <DaemonStats status={status} now={now} />
+        ) : (
+          <NotRunningStat stale={status.kind === "stale"} />
+        )}
+      </Box>
     </Box>
   );
 }
 
-function RunningRow({
+/**
+ * Compact connectivity line: a colored circle per interface + an `mqtt` circle
+ * for the cloud link, each with a light label. flexShrink=0 keeps the whole group
+ * intact on one line (the parent wraps the stats below instead of splitting this).
+ */
+function ConnectivityRow({ interfaces, mqtt }: { interfaces: IfaceStatus[]; mqtt: string }) {
+  return (
+    <Box flexShrink={0}>
+      <Text color="gray">Connectivity </Text>
+      {interfaces.length === 0 ? (
+        <Text color="gray" dimColor>
+          {"checking…  "}
+        </Text>
+      ) : (
+        interfaces.map((i) => (
+          <Text key={i.name}>
+            <Text color={IFACE_COLOR[i.state]}>●</Text>
+            <Text color="white">{` ${i.name}  `}</Text>
+          </Text>
+        ))
+      )}
+      <Text>
+        <Text color={mqtt}>●</Text>
+        <Text color="white">{" mqtt  "}</Text>
+      </Text>
+    </Box>
+  );
+}
+
+function DaemonStats({
   status,
   now,
 }: {
@@ -56,35 +123,26 @@ function RunningRow({
   now: number;
 }) {
   const { record, state, stateFresh } = status;
-  const conn = state?.connection ?? "connecting";
-  const since = state?.connectionSince ?? record.startedAt;
   return (
-    <Box justifyContent="space-between">
-      <Box>
-        <StatusBadge status={stateFresh ? connectionStatus(conn) : "warn"}>{conn}</StatusBadge>
-        {record.offline ? <Text color="gray"> · offline</Text> : null}
-        <Text color="gray"> · {ageLabel(since, now)}</Text>
-        {!stateFresh ? <Text color="yellow"> · stale</Text> : null}
-      </Box>
-      <Box>
-        <Text color="gray">pid </Text>
-        <Text>{record.pid}</Text>
-        <Text color="gray">{` · up ${uptimeLabel(now - record.startedAt)} · ${record.mode} ${record.rateHz}Hz`}</Text>
-        {state ? (
-          <Text color="gray">
-            {` · seq ${state.seq} pub ${state.published}`}
-            {state.publishErrors > 0 ? <Text color="red">{` err ${state.publishErrors}`}</Text> : ""}
-          </Text>
-        ) : null}
-      </Box>
+    <Box flexShrink={0}>
+      {record.offline ? <Text color="gray">offline · </Text> : null}
+      <Text color="gray">pid </Text>
+      <Text>{record.pid}</Text>
+      <Text color="gray">{` · up ${uptimeLabel(now - record.startedAt)} · ${record.mode} ${record.rateHz}Hz`}</Text>
+      {state && state.publishErrors > 0 ? (
+        <Text color="red">{` · err ${state.publishErrors}`}</Text>
+      ) : null}
+      {!stateFresh ? <Text color="yellow">{" · stale"}</Text> : null}
     </Box>
   );
 }
 
-function NotRunningRow({ stale }: { stale: boolean }) {
+function NotRunningStat({ stale }: { stale: boolean }) {
   return (
-    <Text color={stale ? "yellow" : "gray"}>
-      {stale ? "◌ daemon not running (stale pidfile)" : "○ daemon not running"}
-    </Text>
+    <Box flexShrink={0}>
+      <Text color={stale ? "yellow" : "gray"}>
+        {stale ? "◌ daemon stopped (stale pidfile)" : "○ daemon stopped"}
+      </Text>
+    </Box>
   );
 }

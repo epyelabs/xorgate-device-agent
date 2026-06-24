@@ -6,7 +6,7 @@
  * the CLI uses, so the keybindings behave identically. Quitting never stops the
  * detached daemon.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
 import { KeyHints, type Hint } from "../components/KeyHints.js";
@@ -19,7 +19,15 @@ import { MODULES, SettingsDetail } from "./modules.js";
 import { useDaemonState, type Inspector } from "./useDaemonState.js";
 import { useDaemonControls } from "./useDaemonControls.js";
 import { useLogTail } from "./useLogTail.js";
+import { useInterfaceStatus } from "./useInterfaceStatus.js";
 import { loadSettings, saveSettings } from "../daemon/settings.js";
+import { setWifi } from "../daemon/radios.js";
+import {
+  detectWifi,
+  ifaceForIp,
+  sshServerIp,
+  type WifiPresence,
+} from "../hardware/network.js";
 import type { RunMode } from "../agent/telemetry.js";
 
 const LIST_WIDTH = 22;
@@ -46,12 +54,19 @@ export function MonitorApp({
 
   const { status, now, refresh } = useDaemonState(1000, inspector);
   const controls = useDaemonControls(agentArgs, refresh);
+  const interfaces = useInterfaceStatus();
   const [selected, setSelected] = useState(0);
   const [operating, setOperating] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [modeChoice, setModeChoice] = useState<RunMode | null>(null);
   const [mediaChoice, setMediaChoice] = useState<boolean | null>(null);
   const [settingsRow, setSettingsRow] = useState(0);
+  // WiFi row state: live presence/enabled, an "applying" flag, a self-cutoff
+  // confirm gate, and a nonce we bump to re-probe after a toggle.
+  const [wifi, setWifiState] = useState<WifiPresence | null>(null);
+  const [wifiBusy, setWifiBusy] = useState(false);
+  const [wifiConfirm, setWifiConfirm] = useState(false);
+  const [wifiNonce, setWifiNonce] = useState(0);
   const logLines = useLogTail(showLogs);
 
   const running = status.kind === "running";
@@ -62,25 +77,74 @@ export function MonitorApp({
   // row), so the pane is correct regardless of how it was enabled (settings.json or
   // the MEDIA_ENABLED env). The toggle still edits settings.json on apply.
   const mediaEnabled = snapshot?.mediaEnabled ?? false;
+  // Number of focusable Settings rows: mode, media, and wifi (only when present).
+  const settingsRowCount = wifi?.present ? 3 : 2;
+
+  // Probe the WiFi device while the Settings pane is selected; re-probe after a
+  // toggle (wifiNonce). Detection runs only here, never on the telemetry path.
+  useEffect(() => {
+    if (!onSettings) {
+      setWifiState(null);
+      return;
+    }
+    let alive = true;
+    void detectWifi().then((w) => alive && setWifiState(w));
+    return () => {
+      alive = false;
+    };
+  }, [onSettings, wifiNonce]);
+
+  // Toggle WiFi from the Settings pane. Guards against cutting our own uplink
+  // (SSH path / only internet) with a two-press confirm before applying.
+  const toggleWifi = (): void => {
+    if (!wifi?.present || wifiBusy) return;
+    const device = wifi.device ?? "wlan0";
+    const turningOff = wifi.enabled;
+    if (turningOff && !wifiConfirm) {
+      const overSsh = ifaceForIp(sshServerIp(process.env.SSH_CONNECTION)) === device;
+      const online = interfaces.filter((i) => i.state === "online");
+      const onlyUplink = online.length === 1 && online[0].name === device;
+      if (overSsh || onlyUplink) {
+        setWifiConfirm(true); // first press: ask to confirm
+        return;
+      }
+    }
+    setWifiConfirm(false);
+    setWifiBusy(true);
+    void setWifi(!wifi.enabled).finally(() => {
+      setWifiBusy(false);
+      setWifiNonce((n) => n + 1); // re-probe to reflect the new state
+    });
+  };
 
   useInput((input, key) => {
     if (operating) {
       if (input === "q" || input === "Q" || key.escape || key.leftArrow) {
         setOperating(false);
+        setWifiConfirm(false);
         return;
       }
       if (onSettings) {
-        if (key.upArrow || key.downArrow || input === "j" || input === "k") {
-          setSettingsRow((r) => (r === 0 ? 1 : 0)); // move between run mode / media
+        if (key.upArrow || input === "k") {
+          setWifiConfirm(false);
+          setSettingsRow((r) => (r - 1 + settingsRowCount) % settingsRowCount);
+        } else if (key.downArrow || input === "j") {
+          setWifiConfirm(false);
+          setSettingsRow((r) => (r + 1) % settingsRowCount);
+        } else if (settingsRow === 2) {
+          // WiFi row: space/↵ apply immediately (OS-level, no daemon restart).
+          if (input === " " || key.return || input === "a" || input === "A") {
+            toggleWifi();
+          }
         } else if (input === " ") {
-          // Toggle the focused row's pending value.
+          // mode/media: toggle the focused row's pending value.
           if (settingsRow === 0) {
             setModeChoice((c) => ((c ?? snapshot?.mode ?? "sim") === "sim" ? "real" : "sim"));
           } else {
             setMediaChoice((c) => !(c ?? mediaEnabled));
           }
         } else if (key.return || input === "a" || input === "A") {
-          // Persist both choices, then restart so loadConfig picks them up.
+          // Persist mode/media choices, then restart so loadConfig picks them up.
           saveSettings({
             ...loadSettings(),
             mode: modeChoice ?? snapshot?.mode ?? "sim",
@@ -153,6 +217,9 @@ export function MonitorApp({
           mediaEnabled={mediaEnabled}
           row={settingsRow}
           operating={operating}
+          wifi={wifi}
+          wifiBusy={wifiBusy}
+          wifiConfirm={wifiConfirm}
         />
       ) : (
         <Detail snapshot={snapshot} now={now} />
@@ -168,12 +235,18 @@ export function MonitorApp({
       ]
     : operating
       ? onSettings
-        ? [
-            { keys: "↑↓", label: "field" },
-            { keys: "space", label: "toggle" },
-            { keys: "↵", label: "apply & restart" },
-            { keys: "←/q", label: "back" },
-          ]
+        ? settingsRow === 2
+          ? [
+              { keys: "↑↓", label: "field" },
+              { keys: "space/↵", label: "toggle wifi" },
+              { keys: "←/q", label: "back" },
+            ]
+          : [
+              { keys: "↑↓", label: "field" },
+              { keys: "space", label: "toggle" },
+              { keys: "↵", label: "apply & restart" },
+              { keys: "←/q", label: "back" },
+            ]
         : [{ keys: "←/q", label: "back" }]
       : [
           { keys: "↑↓", label: "select" },
@@ -186,7 +259,7 @@ export function MonitorApp({
 
   return (
     <Box flexDirection="column">
-      <MonitorHeader status={status} now={now} />
+      <MonitorHeader status={status} now={now} interfaces={interfaces} />
 
       {controls.busy ? (
         <Box marginBottom={1}>

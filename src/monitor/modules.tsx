@@ -18,6 +18,7 @@ import {
 } from "../hardware/modem.js";
 import { detectImu, IMU, type ImuDetect } from "../hardware/imu.js";
 import { GPS_NMEA_PORT } from "../hardware/gps.js";
+import type { WifiPresence } from "../hardware/network.js";
 import type {
   ActivityEvent,
   MediaStream,
@@ -422,9 +423,14 @@ interface SettingsDetailProps extends DetailProps {
   mediaChoice?: boolean;
   /** Current persisted media toggle (settings.json); snapshot doesn't carry it. */
   mediaEnabled?: boolean;
-  /** Focused row while operating: 0 = run mode, 1 = media. */
+  /** Focused row while operating: 0 = run mode, 1 = media, 2 = wifi. */
   row?: number;
   operating?: boolean;
+  /** Live WiFi presence/state for the wifi row (null while probing). */
+  wifi?: WifiPresence | null;
+  wifiBusy?: boolean;
+  /** True after a risky first toggle press, asking to confirm the cutoff. */
+  wifiConfirm?: boolean;
 }
 
 export function SettingsDetail({
@@ -434,6 +440,9 @@ export function SettingsDetail({
   mediaEnabled,
   row = 0,
   operating,
+  wifi,
+  wifiBusy,
+  wifiConfirm,
 }: SettingsDetailProps) {
   const curMode = snapshot?.mode ?? "sim";
   const curMedia = mediaEnabled ?? false;
@@ -448,7 +457,7 @@ export function SettingsDetail({
   return (
     <Box flexDirection="column">
       <DetailTitle>Settings</DetailTitle>
-      <Text color="gray">Run mode (sim/real) and the KVS WebRTC media runtime.</Text>
+      <Text color="gray">Run mode (sim/real), KVS WebRTC media, and the WiFi radio.</Text>
       <Box marginTop={1} flexDirection="column">
         {rows.map((r, i) => {
           const focused = !!operating && row === i;
@@ -464,15 +473,55 @@ export function SettingsDetail({
             </Text>
           );
         })}
+        <WifiRow
+          wifi={wifi}
+          focused={!!operating && row === 2}
+          busy={!!wifiBusy}
+          confirm={!!wifiConfirm}
+        />
       </Box>
       <Box marginTop={1}>
         <Text color="gray" dimColor>
           {operating
-            ? "↑↓ field · space toggle · ↵ apply & restart · ←/q back"
+            ? row === 2
+              ? "↑↓ field · space/↵ toggle wifi · ←/q back"
+              : "↑↓ field · space toggle · ↵ apply & restart · ←/q back"
             : "↵ to edit settings"}
         </Text>
       </Box>
     </Box>
+  );
+}
+
+/** Settings row for the WiFi radio: live on/off, "not present", or "applying…". */
+function WifiRow({
+  wifi,
+  focused,
+  busy,
+  confirm,
+}: {
+  wifi?: WifiPresence | null;
+  focused: boolean;
+  busy: boolean;
+  confirm: boolean;
+}) {
+  if (wifi && !wifi.present) {
+    return (
+      <Text color="gray" dimColor>
+        {"  "}
+        {"wifi".padEnd(9)} — not present
+      </Text>
+    );
+  }
+  const value = !wifi ? "…" : busy ? "applying…" : wifi.enabled ? "on" : "off";
+  return (
+    <Text color={focused ? "cyan" : "white"}>
+      {focused ? "▶ " : "  "}
+      <Text color="gray">{"wifi".padEnd(9)}</Text> {value}
+      {confirm ? (
+        <Text color="yellow"> · press again to confirm cutoff</Text>
+      ) : null}
+    </Text>
   );
 }
 

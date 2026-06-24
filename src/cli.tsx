@@ -112,7 +112,8 @@ Commands:
   restart    Stop then start
   status     Show whether the daemon is running (pid, uptime, connection, telemetry)
   manage     Open the live ink dashboard (start/stop/restart + Settings from inside)
-  set        Persist a setting and apply it, e.g. 'set mode <sim|real>' or 'set media <on|off>'
+  set        Persist a setting and apply it: 'set mode <sim|real>', 'set media <on|off>',
+             or 'set wifi <on|off> [--force]' (runtime WiFi toggle via NetworkManager)
   pipeline   Manage per-stream KVS pipelines: 'pipeline list|show|set|clear <streamKey> [file]'
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service

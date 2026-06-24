@@ -6,14 +6,27 @@
  * with precedence flag > settings > env), then the daemon is restarted to apply
  * — reusing its recorded launch flags so creds / --offline are preserved.
  * `--no-restart` persists without restarting.
+ *
+ * `wifi` (<on|off>) is different: it toggles the OS WiFi device at runtime via
+ * NetworkManager (not settings.json, no daemon restart). It refuses to cut the
+ * uplink you're connected over unless `--force` is given.
  */
 import { loadSettings, saveSettings, type AgentSettings } from "../daemon/settings.js";
 import { inspect, restart } from "../daemon/manager.js";
+import { setWifi } from "../daemon/radios.js";
+import {
+  detectWifi,
+  ifaceForIp,
+  interfaceStatuses,
+  sshServerIp,
+} from "../hardware/network.js";
 
-const USAGE = "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>)";
+const USAGE =
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, wifi <on|off> [--force])";
 
 export async function setCommand(rest: string[]): Promise<void> {
   const noRestart = rest.includes("--no-restart");
+  const force = rest.includes("--force");
   const positionals = rest.filter((a) => !a.startsWith("-"));
   const key = positionals[0];
   const value = positionals[1];
@@ -21,6 +34,12 @@ export async function setCommand(rest: string[]): Promise<void> {
   if (!key) {
     console.error(USAGE);
     process.exitCode = 1;
+    return;
+  }
+
+  // WiFi is an OS-level runtime toggle: handle it before the settings.json path.
+  if (key === "wifi") {
+    await setWifiCommand(value, force);
     return;
   }
 
@@ -45,7 +64,7 @@ export async function setCommand(rest: string[]): Promise<void> {
     next.mediaEnabled = value === "on";
     applied = `media ${value} (KVS WebRTC runtime)`;
   } else {
-    console.error(`unknown setting '${key}' (supported: mode, media)`);
+    console.error(`unknown setting '${key}' (supported: mode, media, wifi)`);
     process.exitCode = 1;
     return;
   }
@@ -72,6 +91,52 @@ export async function setCommand(rest: string[]): Promise<void> {
   } else {
     console.error(`  could not restart automatically: ${res.message}`);
     console.error("  on systemd installs, run: sudo systemctl restart xorgate-agent");
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * `xorgate set wifi <on|off> [--force]`. Toggles the WiFi device at runtime via
+ * NetworkManager. Without `--force`, refuses to turn it off when doing so would
+ * cut your own session — i.e. the WiFi device carries your SSH connection, or it
+ * is currently the only interface with internet.
+ */
+async function setWifiCommand(value: string | undefined, force: boolean): Promise<void> {
+  if (value !== "on" && value !== "off") {
+    console.error(`wifi must be 'on' or 'off', got '${value ?? ""}'`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const wifi = await detectWifi();
+  if (!wifi.present) {
+    console.error("wifi: no WiFi adapter detected on this device");
+    process.exitCode = 1;
+    return;
+  }
+  const device = wifi.device ?? "wlan0";
+
+  if (value === "off" && !force) {
+    const sshIface = ifaceForIp(sshServerIp(process.env.SSH_CONNECTION));
+    const overSsh = sshIface === device;
+    const online = (await interfaceStatuses()).filter((s) => s.state === "online");
+    const onlyUplink = online.length === 1 && online[0].name === device;
+    if (overSsh || onlyUplink) {
+      const why = overSsh
+        ? `your SSH session is over ${device}`
+        : `${device} is currently your only internet connection`;
+      console.error(`refusing to turn WiFi off: ${why}.`);
+      console.error("re-run with --force if you're sure (you may lose connectivity).");
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  const res = await setWifi(value === "on");
+  if (res.ok) {
+    console.log(`✓ ${res.message}`);
+  } else {
+    console.error(res.message);
     process.exitCode = 1;
   }
 }

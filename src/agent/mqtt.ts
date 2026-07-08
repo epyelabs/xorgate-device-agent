@@ -32,7 +32,7 @@ export interface AgentClient {
 export function connect(config: AgentConfig): AgentClient {
   if (config.offline) return createStubClient();
 
-  const { endpoint, deviceId, creds, statusTopic } = config;
+  const { endpoint, deviceId, creds, statusTopic, mqttKeepaliveSec } = config;
   if (!creds) throw new Error("missing creds for online connect (internal)");
 
   const will = {
@@ -50,6 +50,10 @@ export function connect(config: AgentConfig): AgentClient {
     protocolId: "MQTT",
     protocolVersion: 5,
     clean: true,
+    // Controls Last-Will latency: the broker fires the LWT ~1.5x keepalive after
+    // the device goes silent, distinguishing a true power-off from a brief tunnel.
+    // Configurable via MQTT_KEEPALIVE_SEC (default 60). See kvs-webrtc-lts §4.2/§6.
+    keepalive: mqttKeepaliveSec,
     reconnectPeriod: 2000,
     connectTimeout: 30_000,
     will,

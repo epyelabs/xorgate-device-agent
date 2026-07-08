@@ -63,6 +63,13 @@ export interface AgentConfig {
   mode: RunMode;
   rateHz: number;
   intervalMs: number;
+  /**
+   * MQTT keepalive (seconds). Controls Last-Will latency: the broker fires the
+   * LWT ~1.5x keepalive after the device goes silent, which is what distinguishes
+   * a true power-off from a brief tunnel. Lower = faster power-off detection,
+   * slightly more MQTT overhead. See kvs-webrtc-lts plan §4.2 / §6.
+   */
+  mqttKeepaliveSec: number;
   offline: boolean;
   telemetryTopic: string;
   statusTopic: string;
@@ -136,6 +143,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
   const flagMode = typeof args.mode === "string" ? (args.mode as string) : undefined;
   const mode = (flagMode ?? settings.mode ?? process.env.MODE ?? "sim") as RunMode;
   const rateHz = Number(get("rate", "RATE_HZ", "1"));
+  const mqttKeepaliveSec = Number(get("mqtt-keepalive", "MQTT_KEEPALIVE_SEC", "60"));
 
   // Offline mode needs no real device identity / endpoint; give it placeholders
   // so the simulator + topics still resolve coherently.
@@ -150,6 +158,9 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
   if (!endpoint) throw new Error("IOT_DATA_ENDPOINT (or --endpoint) is required (or pass --offline)");
   if (!Number.isFinite(rateHz) || rateHz <= 0) {
     throw new Error(`RATE_HZ must be a positive number, got ${rateHz}`);
+  }
+  if (!Number.isFinite(mqttKeepaliveSec) || mqttKeepaliveSec <= 0) {
+    throw new Error(`MQTT_KEEPALIVE_SEC must be a positive number, got ${mqttKeepaliveSec}`);
   }
   if (mode !== "sim" && mode !== "real") {
     throw new Error(`MODE must be "sim" or "real", got "${mode}"`);
@@ -206,6 +217,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     mode,
     rateHz,
     intervalMs: Math.round(1000 / rateHz),
+    mqttKeepaliveSec,
     offline,
     telemetryTopic: `xorgate/devices/${deviceId}/telemetry`,
     statusTopic: `xorgate/devices/${deviceId}/status`,

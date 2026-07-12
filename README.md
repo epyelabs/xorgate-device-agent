@@ -189,20 +189,19 @@ src/
 test/                # vitest: pidfile/state/process/manager logic + monitor UI smoke
 ```
 
-Under `MODE=real` the **IMU and system collectors are live** — IMU (BNO085 over
-I2C — see below) and system (CPU usage/temp, RAM, disk via pure `/proc` + `/sys`
-
-- `df` reads, no privileges needed; `cpu_temp`/`disk_usage` are omitted off-Pi
-  hosts that lack a thermal zone). The remaining serial GPS/LTE reads are still
-  inert stubs landing in **P5 (device firmware)**. The UI scaffolding (ink
-  components, host-metrics readers) and the IMU read path are adapted from
-  `argus-test-bench/argus-cli`.
+Under `MODE=real` **all four collectors are live** — IMU (BNO085 over I2C — see
+below), system (CPU usage/temp, RAM, disk via pure `/proc` + `/sys` +
+`df` reads, no privileges needed; `cpu_temp`/`disk_usage` are omitted off-Pi
+hosts that lack a thermal zone), GPS (NMEA off the SIM7600 — see the
+**GPS / GNSS** section below) and LTE (the connection-manager's telemetry
+JSON). The UI scaffolding (ink components, host-metrics readers) and the IMU
+read path are adapted from `argus-test-bench/argus-cli`.
 
 The monitor is a master/detail dashboard (argus-cli style): the header shows the
 daemon's **Connection** and **Daemon** stats, the left sidebar lists the telemetry
 modules (IMU/GPS/LTE/System/Media/Activity) with live status, and `↑↓`/`↵` open a
 module's detail on the right. The values shown are what the **daemon publishes**
-(simulated in `sim`/`--offline`; real reads land in P5).
+(simulated in `sim`/`--offline`; hardware reads in `real`).
 
 ## Two ways it runs
 
@@ -298,7 +297,9 @@ sudo xorgate update --from https://<bucket>   # override the source
 `update` stages the new tarball on the `/opt` filesystem, validates it, runs
 `npm ci`, **atomically swaps** `/opt/xorgate` (rolling back on failure),
 reinstalls the unit + wrapper (your `User=` drop-in and certs are left intact),
-and restarts. The CLI ships in the tarball, so this upgrades the CLI too. The
+refreshes the SIM7600 modem assets when the daemon is installed (applied on
+next boot — the LTE daemon is not restarted mid-update; see the GPS section),
+and restarts the agent. The CLI ships in the tarball, so this upgrades the CLI too. The
 source is `DEVICE_DIST_BUCKET_URL` from `agent.env`; builds are published to S3 by
 `.github/workflows/device-deploy-{dev,prod}.yml` (dev on push to `main`, prod on
 release).
@@ -331,6 +332,89 @@ sudo usermod -aG i2c "$USER"                                 # non-root bus acce
 
 Iterate off-hardware with `XORGATE_MOCK=1` (or any non-Linux host): detection
 reports a synthetic sensor and the stream emits a slowly-rotating mock signal.
+
+## GPS / GNSS (SIM7600, `MODE=real`)
+
+Two processes cooperate. The **connection-manager daemon**
+(`modem/sim7600-lte.sh`, installed as `sim7600-lte.service` by the provisioning
+flow) owns the modem's AT port (`/dev/ttyUSB2`): it configures and starts the
+GNSS engine, keeps its assistance data fresh, and brings up the LTE link. The
+**agent's gps collector** only ever reads the NMEA stream on `/dev/ttyUSB1`
+(never writes AT), parses GGA/RMC/GSA/GSV into a rolling fix
+(`src/lib/nmea.ts`), and publishes it each tick.
+
+### Why TTFF is fast (assistance, not luck)
+
+A bare standalone GNSS start must demodulate ephemeris from the satellites at
+50 bit/s, which needs a strong signal — exactly what urban canyons deny, giving
+multi-minute (or never) first fixes. The daemon instead sets up, once and
+idempotently (re-checked every boot, one `AT+CRESET` only when a setting
+actually changed):
+
+- **All constellations** — `AT+CGNSSMODE=15,0`: GPS + GLONASS + BeiDou +
+  Galileo + QZSS, DPO power-saving off. Roughly doubles satellites in view, so
+  a narrow slot of sky still yields workable geometry. Needs LE20-era firmware
+  (`AT+CGMR`); on older firmware the daemon logs a warning and continues.
+- **XTRA predicted ephemeris** — `AT+CGPSXE=1` + `AT+CGPSXDAUTO=1`: a ~40 kB
+  file downloaded over LTE (valid ~7 days, stored in module flash, survives
+  reboots and even `AT+CGPSDEL`). Re-checked every 6 h while connected,
+  re-downloaded under 1 day of validity; result exposed as `xtra_valid_min` in
+  the telemetry JSON. Needs an accurate module clock — NITZ normally provides
+  it; HTP sync is only attempted when the clock is obviously bogus (some
+  SIMs/carriers just `ERROR` on `AT+CHTPUPDATE`).
+- **SUPL UE-based AGPS** — `AT+CGPSURL="supl.google.com:7276"` +
+  `AT+CGPS=1,2`; the modem auto-falls back to standalone when the server is
+  unreachable. (Mode 3 / UE-assisted is broken with public SUPL servers —
+  don't use it.)
+- **Early coarse fixes** — `AT+CGPSHOR=100` (factory 50): reports an early
+  ~100 m fix in bad geometry that then refines; for a tracker an early rough
+  position beats a late precise one.
+- The engine is **re-asserted every 10 min** while connected (a modem reset
+  otherwise comes back with GNSS off, since `AT+CGPSAUTO=0`).
+
+Measured on the reference device (SIM7600G-H-M2, LE20B04): assisted cold start
+(aiding wiped, XTRA valid) ≈ **90 s**; warm starts far less. Tune via
+`SIM7600_GNSS_MODE` / `SIM7600_GNSS_DPO` / `SIM7600_GNSS_XTRA` /
+`SIM7600_SUPL_URL` / `SIM7600_GNSS_ACCURACY` env (see the unit file's override
+notes); `SIM7600_GNSS_ANT_BIAS=1` powers an **active antenna's** LNA from the
+module's VDD_AUX LDO (max 3.05 V) — only useful when the carrier board routes
+VDD_AUX to the antenna feed.
+
+### What the collector publishes
+
+Beyond `lat/lon/alt/speed/satellites/fix_quality`:
+
+- `gps.satellites_in_view` (GSV, summed across constellations) vs
+  `gps.satellites` used (GGA) separates "bad sky view / antenna problem" from
+  "seeing plenty, solution still converging".
+- `gps.hdop` (GSA) is the fix-confidence number — lower is better, <2 is good.
+  A "fix" with hdop 5+ in urban multipath can be tens of meters off.
+- **Stale positions are cleared, not frozen**: on lock loss (GGA quality 0 /
+  void RMC) the aggregator drops position + hdop, so a published lat/lon is
+  always current. `fix_quality: 0` with no lat/lon = "acquiring".
+- SIM7600 quirk baked into the parser: GSA arrives once per constellation, and
+  a no-fix one (`$BDGSA,A,1` with empty DOPs) must not clobber the combined
+  fix's hdop — `fixType 1` GSA sentences are ignored.
+
+### Troubleshooting
+
+```sh
+journalctl -u sim7600-lte -f | grep -E "GNSS|XTRA"   # config + assistance log
+cat /run/sim7600-lte/telemetry.json                   # incl. xtra_valid_min
+```
+
+The daemon owns `/dev/ttyUSB2` — never open it from another process while the
+service runs (stop it first for manual AT debugging). A full SIM SMS inbox
+spams `+SMS FULL` on the AT port (clear with `AT+CMGD=1,4`). GNSS/LTE config
+changes ship in the agent tarball (`modem/`) and are installed by provisioning
+**and** refreshed by `sudo xorgate update` — but update deliberately does not
+restart `sim7600-lte` (it would drop the LTE link mid-update); the new script
+applies on next boot or a manual `systemctl restart sim7600-lte`.
+
+The deeper reference — AT flows, hardware quirks (XTRA/HTP/GSA gotchas),
+device verification + TTFF measurement procedure, telemetry interpretation,
+and antenna selection — is in
+[`docs/gnss-bringup.md`](docs/gnss-bringup.md).
 
 ## Media runtime (KVS WebRTC, `MODE=real`)
 

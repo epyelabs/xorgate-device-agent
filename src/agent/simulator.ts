@@ -48,6 +48,8 @@ export function createSimulator(): () => TelemetryReading {
   const alt = channel(20, 0.5, 0, 120);
   const speed = channel(0, 1.5, 0, 25); // km/h
   const satellites = channel(9, 0.6, 4, 14); // count used in the fix
+  const satellitesInView = channel(16, 0.8, 8, 28); // GSV: visible across constellations
+  const hdop = channel(1.1, 0.1, 0.6, 3.5); // GSA: fix confidence
 
   // LTE signal.
   const rssi = channel(-67, 1.5, -110, -50); // dBm
@@ -96,6 +98,8 @@ export function createSimulator(): () => TelemetryReading {
           speed: { value: round(spd, 1), unit: "km/h" },
           satellites: { value: Math.round(satellites()) },
           fix_quality: { value: 1 }, // 1 = GPS fix
+          satellites_in_view: { value: Math.round(satellitesInView()) },
+          hdop: { value: round(hdop(), 1) },
         },
         lte: {
           rssi: { value: round(rssi(), 0), unit: "dBm" },

@@ -6,7 +6,13 @@
 #
 # Features:
 #   - Waits for stable signal (AT+CSQ) before connecting
-#   - Enables GNSS (AT+CGPS) so NMEA streams on the dedicated GPS port
+#   - Configures + enables GNSS so NMEA streams on the dedicated GPS port:
+#       * all constellations (AT+CGNSSMODE), DPO off for max sensitivity
+#       * XTRA predicted-ephemeris assistance (AT+CGPSXE/AT+CGPSXD) with
+#         periodic re-download — the big TTFF win in urban canyons
+#       * SUPL UE-based AGPS (AT+CGPSURL + AT+CGPS=1,2), auto-falls back to
+#         standalone when the server is unreachable
+#   - Re-asserts the GNSS engine while connected (survives modem resets)
 #   - Adaptive CSQ polling: faster when signal is changing rapidly
 #   - Signal-aware reconnect: distinguishes dead zone vs network failure
 #   - Atomic JSON telemetry output for consumption by other processes
@@ -44,6 +50,35 @@ CSQ_RAPID_DELTA=3            # CSQ change threshold to trigger fast polling
 
 # GPS / GNSS
 ENABLE_GPS="${SIM7600_ENABLE_GPS:-1}"   # set 0 to skip enabling GNSS
+# Constellations on top of GPS (AT+CGNSSMODE bitmask): 1 GLONASS, 2 BeiDou,
+# 4 Galileo, 8 QZSS. 15 = everything; more satellites = better geometry when
+# only a slot of sky is visible (urban canyon). Needs LE20-era firmware.
+GNSS_MODE="${SIM7600_GNSS_MODE:-15}"
+GNSS_DPO="${SIM7600_GNSS_DPO:-0}"       # DPO duty-cycling: 0 = off (max sensitivity)
+GNSS_XTRA="${SIM7600_GNSS_XTRA:-1}"     # XTRA predicted-ephemeris assistance
+# SUPL server for UE-based AGPS (AT+CGPS=1,2). Empty = plain standalone start.
+# Port 7276 = plain TCP; 7275 would need a carrier TLS cert (AT+CGPSSSL=1).
+SUPL_URL="${SIM7600_SUPL_URL:-supl.google.com:7276}"
+# Horizontal accuracy threshold in meters (AT+CGPSHOR, factory default 50).
+# Looser lets the engine report an early coarse fix in bad geometry; it then
+# refines. For a tracker an early rough position beats a late precise one.
+GNSS_ACCURACY="${SIM7600_GNSS_ACCURACY:-100}"
+# NMEA sentence bitmask (AT+CGPSNMEA). 197119 = GGA+RMC+GSV+GSA+VTG+ the
+# GLONASS/Galileo/BeiDou GSA/GSV variants — the agent parses GSA (HDOP) and
+# GSV (satellites in view) for fix confidence.
+NMEA_MASK="${SIM7600_NMEA_MASK:-197119}"
+# Aux LDO powering an ACTIVE GNSS antenna's LNA (AT+CVAUXS/AT+CVAUXV). Off by
+# default: only useful when the carrier board routes VDD_AUX to the antenna
+# feed AND an active antenna is fitted. 3050 mV is the LDO maximum.
+GNSS_ANT_BIAS="${SIM7600_GNSS_ANT_BIAS:-0}"
+GNSS_ANT_BIAS_MV="${SIM7600_GNSS_ANT_BIAS_MV:-3050}"
+# XTRA maintenance: re-download when validity drops under a day (file is good
+# for ~7 days; SIMCom suggests daily refresh), checking every 6 h while up.
+XTRA_MIN_VALID_MIN=1440
+XTRA_CHECK_INTERVAL=21600
+XTRA_RETRY_DELAY=600                 # re-attempt sooner after a failed download
+HTP_HOST="${SIM7600_HTP_HOST:-www.google.com}"  # HTP time source (XTRA needs accurate clock)
+GNSS_REASSERT_INTERVAL=600           # re-check the engine every 10 min while connected
 
 # Telemetry
 TELEMETRY_FILE="${SIM7600_TELEMETRY_FILE:-/run/sim7600-lte/telemetry.json}"
@@ -69,6 +104,7 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a /var/log/sim7
 #   "status":       "connected" | "connecting" | "disconnected" | "dead_zone"
 #   "iface":        interface name
 #   "ip":           current IP string, or null
+#   "xtra_valid_min": minutes of GNSS XTRA assistance validity left, or null
 # }
 write_telemetry() {
     local csq="$1"
@@ -107,7 +143,8 @@ write_telemetry() {
   "csq_interval": $csq_interval,
   "status": "$status",
   "iface": "$IFACE",
-  "ip": $ip
+  "ip": $ip,
+  "xtra_valid_min": ${XTRA_VALID_MIN:-null}
 }
 EOF
 
@@ -126,6 +163,16 @@ at_query() {
     local cmd="$1"
     echo -e "${cmd}\r" > "$SERIAL"
     timeout 2 cat "$SERIAL" 2>/dev/null | tr -d '\r'
+}
+
+# Send a command and wait (up to $2 seconds) for a line matching $3 — for
+# commands that answer with a delayed URC (XTRA download, HTP time sync).
+# grep -m1 returns as soon as the URC lands, so the happy path doesn't burn
+# the full timeout. Prints the matched line, or nothing on timeout.
+at_wait_urc() {
+    local cmd="$1" secs="$2" pattern="$3"
+    echo -e "${cmd}\r" > "$SERIAL"
+    timeout "$secs" grep -m1 -aE "$pattern" "$SERIAL" 2>/dev/null | tr -d '\r'
 }
 
 # --- Signal quality ----------------------------------------------------------
@@ -169,18 +216,202 @@ adaptive_interval() {
 }
 
 # --- GPS / GNSS --------------------------------------------------------------
-# Enable the GNSS engine so NMEA sentences stream on the dedicated GPS port
-# (/dev/ttyUSB1), where the agent's gps collector reads them. One-shot and
-# idempotent: if GPS is already running the modem replies "+CME ERROR" which we
-# ignore. NMEA output is on a separate tty from this AT port, so it does not
-# interfere with AT+CSQ polling.
-enable_gps() {
-    if [[ "$ENABLE_GPS" != "1" ]]; then
-        log "GNSS enable skipped (SIM7600_ENABLE_GPS=$ENABLE_GPS)."
+# The GNSS engine streams NMEA on the dedicated GPS port (/dev/ttyUSB1), where
+# the agent's gps collector reads it; everything here talks only to the AT port
+# so there is no contention with that stream.
+#
+# TTFF strategy (why this is more than the old one-shot AT+CGPS=1):
+#   - A bare standalone start must demodulate ephemeris from the satellites at
+#     50 bit/s, which needs ~-144 dBm — exactly what an urban canyon denies.
+#   - XTRA sideloads predicted ephemeris over LTE instead (valid ~7 days,
+#     survives reboots in module flash), so the engine only needs to *track*
+#     satellites, not decode them. Requires an accurate module clock, hence
+#     the HTP time sync before every download.
+#   - SUPL UE-based AGPS (AT+CGPS=1,2) adds server-computed assistance when
+#     the data link is up, and the modem auto-falls back to standalone.
+
+# Minutes of XTRA validity left (telemetry), and maintenance timestamps.
+XTRA_VALID_MIN=null
+LAST_XTRA_CHECK=0
+LAST_GNSS_CHECK=0
+
+gps_engine_on() {
+    local state
+    state=$(at_query "AT+CGPS?" | sed -n 's/.*+CGPS: \([01]\).*/\1/p')
+    [[ "$state" == "1" ]]
+}
+
+gps_stop() {
+    if gps_engine_on; then
+        log "Stopping GNSS engine for reconfiguration (AT+CGPS=0)..."
+        at_cmd "AT+CGPS=0" 3
+    fi
+}
+
+gps_start() {
+    if gps_engine_on; then
         return
     fi
-    log "Enabling GNSS (AT+CGPS=1)..."
-    at_cmd "AT+CGPS=1" 2
+    if [[ -n "$SUPL_URL" ]]; then
+        log "Starting GNSS in UE-based AGPS mode (AT+CGPS=1,2; falls back to standalone)..."
+        at_cmd "AT+CGPS=1,2" 2
+    else
+        log "Starting GNSS in standalone mode (AT+CGPS=1,1)..."
+        at_cmd "AT+CGPS=1,1" 2
+    fi
+    # Some firmware rejects the mode argument when a previous session is still
+    # winding down — a plain start is better than no GNSS at all.
+    if ! gps_engine_on; then
+        warn "GNSS start with explicit mode not accepted; retrying plain AT+CGPS=1."
+        at_cmd "AT+CGPS=1" 2
+    fi
+}
+
+# Read a "+PREFIX: value" style current setting; prints the raw value part.
+at_setting() {
+    local cmd="$1" prefix="$2"
+    at_query "$cmd" | sed -n "s/.*+${prefix}: *//p" | head -1
+}
+
+# One-time (idempotent) GNSS configuration. Compares each persisted setting
+# and only writes on drift, so a normal boot makes no config writes and no
+# modem reset. Settings that need the engine stopped stop it first; settings
+# that only apply after a module restart set need_reset, and we AT+CRESET
+# once at the end (values persist in NV, so the post-reset pass is a no-op).
+configure_gnss() {
+    if [[ "$ENABLE_GPS" != "1" ]]; then
+        log "GNSS setup skipped (SIM7600_ENABLE_GPS=$ENABLE_GPS)."
+        return
+    fi
+
+    local need_reset=0 cur
+
+    # Constellations + DPO (persists in NV; module restart to take effect).
+    cur=$(at_setting "AT+CGNSSMODE?" "CGNSSMODE" | tr -d ' ')
+    if [[ -z "$cur" ]]; then
+        warn "AT+CGNSSMODE not supported (old firmware?) — staying on firmware default constellations."
+    elif [[ "$cur" != "$GNSS_MODE,$GNSS_DPO" ]]; then
+        log "GNSS constellations: $cur -> $GNSS_MODE,$GNSS_DPO (AT+CGNSSMODE)."
+        gps_stop
+        at_cmd "AT+CGNSSMODE=$GNSS_MODE,$GNSS_DPO" 2
+        need_reset=1
+    fi
+
+    # XTRA enable (module restart to take effect).
+    cur=$(at_setting "AT+CGPSXE?" "CGPSXE" | tr -d ' ')
+    if [[ -n "$cur" && "$cur" != "$GNSS_XTRA" ]]; then
+        log "GNSS XTRA: $cur -> $GNSS_XTRA (AT+CGPSXE)."
+        gps_stop
+        at_cmd "AT+CGPSXE=$GNSS_XTRA" 2
+        need_reset=1
+    fi
+
+    # SUPL server for UE-based AGPS (module restart to take effect).
+    if [[ -n "$SUPL_URL" ]]; then
+        cur=$(at_setting "AT+CGPSURL?" "CGPSURL" | tr -d '"')
+        if [[ "$cur" != "$SUPL_URL" ]]; then
+            log "AGPS SUPL server: '${cur:-unset}' -> $SUPL_URL (AT+CGPSURL)."
+            gps_stop
+            at_cmd "AT+CGPSURL=\"$SUPL_URL\"" 1
+            at_cmd "AT+CGPSSSL=0" 1
+            need_reset=1
+        fi
+    fi
+
+    # NMEA sentence mask (needs the engine stopped, no restart).
+    cur=$(at_setting "AT+CGPSNMEA?" "CGPSNMEA" | tr -d ' ')
+    if [[ -n "$cur" && "$cur" != "$NMEA_MASK" ]]; then
+        log "NMEA sentence mask: $cur -> $NMEA_MASK (AT+CGPSNMEA)."
+        gps_stop
+        at_cmd "AT+CGPSNMEA=$NMEA_MASK" 1
+    fi
+
+    # Horizontal accuracy threshold: plain write, idempotent.
+    at_cmd "AT+CGPSHOR=$GNSS_ACCURACY" 1
+
+    # Active-antenna LNA bias via the VDD_AUX LDO (opt-in; see config notes).
+    if [[ "$GNSS_ANT_BIAS" == "1" ]]; then
+        log "Enabling GNSS active-antenna bias (AT+CVAUXV=$GNSS_ANT_BIAS_MV)..."
+        at_cmd "AT+CVAUXV=$GNSS_ANT_BIAS_MV" 1
+        at_cmd "AT+CVAUXS=1" 1
+    fi
+
+    if [[ "$need_reset" -eq 1 ]]; then
+        log "GNSS settings changed — resetting modem (AT+CRESET) to apply..."
+        at_cmd "AT+CRESET" 2
+        sleep "$MODEM_BOOT_WAIT"
+        wait_for_serial || return 1
+        wait_for_modem_ready || return 1
+        log "Modem back after GNSS config reset."
+    fi
+
+    # XTRA auto-inject at GPS start. Must run AFTER the reset: the command is
+    # rejected with "+CME ERROR: XTRA Disabled" until CGPSXE=1 is in effect.
+    if [[ "$GNSS_XTRA" == "1" ]]; then
+        at_cmd "AT+CGPSXDAUTO=1" 1
+    fi
+
+    gps_start
+}
+
+# Keep XTRA assistance fresh. Call whenever the data link is up; self-throttles
+# to every XTRA_CHECK_INTERVAL (retries sooner after a failure). Syncs the
+# module clock over HTP first — XTRA injection silently underperforms with a
+# wrong clock. The download runs over the modem's own PS data connection.
+xtra_maintain() {
+    [[ "$ENABLE_GPS" == "1" && "$GNSS_XTRA" == "1" ]] || return 0
+
+    local now
+    now=$(date +%s)
+    (( now - LAST_XTRA_CHECK < XTRA_CHECK_INTERVAL )) && return 0
+    LAST_XTRA_CHECK=$now
+
+    local valid
+    valid=$(at_setting "AT+CGPSXTRADATA?" "CGPSXTRADATA" | cut -d, -f1 | tr -d ' ')
+    if [[ -n "$valid" && "$valid" -ge "$XTRA_MIN_VALID_MIN" ]]; then
+        XTRA_VALID_MIN=$valid
+        log "XTRA assistance valid for ${valid} min — no download needed."
+        return 0
+    fi
+
+    log "XTRA assistance stale/missing (${valid:-unknown} min) — downloading..."
+
+    # XTRA injection needs an accurate module clock. NITZ normally provides it;
+    # only fall back to HTP time sync when the clock is obviously bogus (some
+    # carriers/SIMs just ERROR on CHTPUPDATE, so it can't be the primary path).
+    local year
+    year=$(at_setting "AT+CCLK?" "CCLK" | tr -d '"' | cut -d/ -f1)
+    if [[ -z "$year" || "10#$year" -lt 24 ]]; then
+        warn "Module clock looks unset (year '20${year:-??}') — trying HTP time sync..."
+        at_cmd "AT+CHTPSERV=\"ADD\",\"$HTP_HOST\",80,1" 1
+        at_wait_urc "AT+CHTPUPDATE" 15 '\+CHTPUPDATE:|ERROR' >/dev/null
+    fi
+
+    # Trigger the download, then trust a re-query of the stored file over the
+    # URC — the +CGPSXD result can slip between two reads of the AT port.
+    at_wait_urc "AT+CGPSXD=0" 60 '\+CGPSXD:' >/dev/null
+    valid=$(at_setting "AT+CGPSXTRADATA?" "CGPSXTRADATA" | cut -d, -f1 | tr -d ' ')
+    if [[ -n "$valid" && "$valid" -ge "$XTRA_MIN_VALID_MIN" ]]; then
+        XTRA_VALID_MIN=$valid
+        log "XTRA assistance downloaded OK (valid ${valid} min)."
+    else
+        warn "XTRA download failed (validity ${valid:-unknown} min); will retry in ${XTRA_RETRY_DELAY}s."
+        LAST_XTRA_CHECK=$(( now - XTRA_CHECK_INTERVAL + XTRA_RETRY_DELAY ))
+    fi
+}
+
+# Cheap engine liveness re-assert (modem may reset underneath us and come back
+# with GNSS off since AT+CGPSAUTO=0). Self-throttles to GNSS_REASSERT_INTERVAL.
+gnss_reassert() {
+    [[ "$ENABLE_GPS" == "1" ]] || return 0
+    local now
+    now=$(date +%s)
+    (( now - LAST_GNSS_CHECK < GNSS_REASSERT_INTERVAL )) && return 0
+    LAST_GNSS_CHECK=$now
+    if ! gps_engine_on; then
+        warn "GNSS engine found off — restarting it."
+        gps_start
+    fi
 }
 
 # --- Modem / interface helpers -----------------------------------------------
@@ -307,6 +538,9 @@ monitor_connection() {
             fail_count=0
             write_telemetry "$csq" "connected" "$interval"
             log "Health OK — CSQ=$csq ($dbm) [poll=${interval}s]"
+            # GNSS upkeep while the link is healthy (both self-throttle).
+            gnss_reassert
+            xtra_maintain
         else
             (( fail_count++ ))
             warn "Ping failed ($fail_count/$HEALTH_FAIL_THRESHOLD) — CSQ=$csq ($dbm)"
@@ -340,8 +574,10 @@ main() {
     wait_for_serial || exit 1
     wait_for_modem_ready || exit 1
 
-    # Turn on GNSS once the AT interface is up so NMEA flows on the GPS port.
-    enable_gps
+    # Configure + start GNSS once the AT interface is up so NMEA flows on the
+    # GPS port. May AT+CRESET once on first boot (or config drift) to apply
+    # NV settings; a failure here must not block the LTE uplink.
+    configure_gnss || warn "GNSS configuration failed; continuing with LTE only."
 
     while true; do
         # 1. Wait for stable signal
@@ -350,6 +586,9 @@ main() {
         # 2. Bring up interface
         if bring_up_interface; then
             log "LTE connection established."
+
+            # Data is up: fetch/refresh XTRA assistance now (self-throttled).
+            xtra_maintain
 
             # 3. Monitor — exit code tells us why it failed
             monitor_connection

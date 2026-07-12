@@ -19,11 +19,16 @@ const NMEA_STALE_MS = 10_000;
  * `read()` reports three distinguishable states so the UI can tell "no GPS at
  * all" apart from "GPS streaming, just no fix yet" (e.g. indoors):
  *   - no fresh NMEA            → {}                       (group omitted)
- *   - NMEA streaming, no lock  → { fix_quality[, satellites] }   ("acquiring")
- *   - position lock            → { lat, lon, alt, speed, satellites, fix_quality }
+ *   - NMEA streaming, no lock  → { fix_quality[, satellites, satellites_in_view] }
+ *   - position lock            → { lat, lon, alt, speed, satellites,
+ *                                  satellites_in_view, hdop, fix_quality }
  * `fix_quality` is always present while NMEA flows (GGA carries it even with no
  * lock), so its presence is the "GNSS is live" signal; the absence of lat/lon
- * is what marks the acquiring state.
+ * is what marks the acquiring state. The aggregator clears position + hdop on
+ * lock loss, so lat/lon here are always current, never a frozen last-known.
+ * `satellites_in_view` (GSV) vs `satellites` used (GGA) separates "bad sky
+ * view / antenna" from "seeing plenty, geometry still converging"; `hdop`
+ * (GSA) is the fix-confidence number (lower is better, <2 is good).
  */
 export function createGpsCollector(): Collector {
   let started = false;
@@ -65,6 +70,10 @@ export function createGpsCollector(): Collector {
         fix_quality: { value: typeof fix.fixQuality === "number" ? fix.fixQuality : 0 },
       };
       if (typeof fix.satellites === "number") out.satellites = { value: fix.satellites };
+      if (typeof fix.satellitesInView === "number") {
+        out.satellites_in_view = { value: fix.satellitesInView };
+      }
+      if (typeof fix.hdop === "number") out.hdop = { value: round(fix.hdop, 1) };
       if (hasPosition(fix)) {
         out.lat = { value: round(fix.latitude!, 6) };
         out.lon = { value: round(fix.longitude!, 6) };

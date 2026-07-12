@@ -8,6 +8,9 @@ const NMEA =
   [
     "$GPGGA,083745.000,1430.1234,N,12101.5678,E,1,08,0.9,545.4,M,46.9,M,,*56",
     "$GPRMC,083745.000,A,1430.1234,N,12101.5678,E,0.06,31.66,130626,,,A*5A",
+    "$GPGSA,A,3,04,05,,09,12,,,24,,,,,2.5,1.3,2.1*39",
+    "$GPGSV,3,1,11,03,03,111,00,04,15,270,00*7F",
+    "$GLGSV,2,1,08,65,50,100,40,66,30,200,35*6A",
   ].join("\n") + "\n";
 
 type Leaf = { value: number; unit?: string };
@@ -42,6 +45,37 @@ describe("createGpsCollector", () => {
     expect(fields.alt).toEqual({ value: 545.4, unit: "m" });
     expect(fields.satellites.value).toBe(8);
     expect(fields.fix_quality.value).toBe(1);
+    expect(fields.hdop).toEqual({ value: 1.3 });
+    expect(fields.satellites_in_view).toEqual({ value: 19 }); // 11 GPS + 8 GLONASS
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("drops the stale position (not the group) after the lock is lost", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xorgate-gps-"));
+    const file = join(dir, "nmea.txt");
+    // A good fix, then the lock drops (GGA quality 0, empty position fields).
+    await writeFile(file, NMEA + "$GPGGA,083750.000,,,,,0,00,,,M,,M,,*71\n");
+
+    vi.stubEnv("GPS_NMEA_PORT", file);
+    vi.resetModules();
+    const { createGpsCollector } = await import("../src/agent/collectors/gps.js");
+    const collector = createGpsCollector();
+
+    // Poll until the final (lock-lost) state lands: quality 0 and no position.
+    let fields: Record<string, Leaf> = {};
+    for (let i = 0; i < 50; i++) {
+      fields = (await collector.read()) as Record<string, Leaf>;
+      if (fields.fix_quality?.value === 0) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(fields.fix_quality).toEqual({ value: 0 });
+    expect(fields.lat).toBeUndefined();
+    expect(fields.lon).toBeUndefined();
+    expect(fields.alt).toBeUndefined();
+    expect(fields.speed).toBeUndefined();
+    // Diagnostics survive so the UI can show a meaningful "acquiring" state.
+    expect(fields.satellites_in_view).toEqual({ value: 19 });
 
     await rm(dir, { recursive: true, force: true });
   });

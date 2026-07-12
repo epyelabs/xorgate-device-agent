@@ -22,6 +22,13 @@ RestartSec=10
 #   Environment="SIM7600_MIN_CSQ=10"
 #   Environment="SIM7600_GOOD_CSQ=15"
 #   Environment="SIM7600_ENABLE_GPS=1"
+# GNSS tuning (defaults live in the script):
+#   Environment="SIM7600_GNSS_MODE=15"        # extra constellations bitmask (GLO|BDS|GAL|QZSS)
+#   Environment="SIM7600_GNSS_DPO=0"          # 1 = duty-cycled power saving
+#   Environment="SIM7600_GNSS_XTRA=1"         # XTRA predicted-ephemeris assistance
+#   Environment="SIM7600_SUPL_URL=supl.google.com:7276"   # "" = plain standalone
+#   Environment="SIM7600_GNSS_ACCURACY=100"   # AT+CGPSHOR meters
+#   Environment="SIM7600_GNSS_ANT_BIAS=1"     # power an active antenna LNA via VDD_AUX
 Environment="SIM7600_SERIAL=/dev/ttyUSB2"
 Environment="SIM7600_IFACE=usb0"
 Environment="SIM7600_PING_HOST=8.8.8.8"

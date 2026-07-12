@@ -194,7 +194,8 @@ const gps: Module = {
               alt {leaf(m?.alt, 1)} · speed {leaf(m?.speed, 1)}
             </Text>
             <Text color="gray">
-              sats {leaf(m?.satellites, 0)} · fix {fixLabel(m?.fix_quality)}
+              sats {leaf(m?.satellites, 0)}/{leaf(m?.satellites_in_view, 0)} in view · hdop{" "}
+              {leaf(m?.hdop, 1)} · fix {fixLabel(m?.fix_quality)}
             </Text>
           </Box>
         ) : m ? (
@@ -202,7 +203,10 @@ const gps: Module = {
           // streaming, just no satellites yet (e.g. indoors).
           <Box flexDirection="column">
             <Text color="yellow">○ Receiving NMEA but no position fix yet.</Text>
-            <Text color="gray">sats {leaf(m?.satellites, 0)} · waiting for satellite lock.</Text>
+            <Text color="gray">
+              sats {leaf(m?.satellites, 0)}/{leaf(m?.satellites_in_view, 0)} in view · waiting
+              for satellite lock.
+            </Text>
           </Box>
         ) : (
           <Text color="gray">○ no NMEA — waiting for GNSS stream.</Text>

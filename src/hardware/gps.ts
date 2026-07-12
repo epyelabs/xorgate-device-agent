@@ -9,7 +9,7 @@
  * writes happen here, so there's no contention with the daemon's AT polling.
  */
 import { createReadStream, type ReadStream } from "node:fs";
-import { parseSentence, type GpsFix } from "../lib/nmea.js";
+import { createFixAggregator, type GpsFix } from "../lib/nmea.js";
 
 /** NMEA GPS port. Override with GPS_NMEA_PORT (handy for local testing). */
 export const GPS_NMEA_PORT = process.env.GPS_NMEA_PORT ?? "/dev/ttyUSB1";
@@ -38,7 +38,9 @@ function describeError(err: NodeJS.ErrnoException, port: string): string {
  */
 export function streamGps(port: string = GPS_NMEA_PORT, handlers: GpsStreamHandlers): GpsStreamHandle {
   let buf = "";
-  const fix: GpsFix = {};
+  // Rolling merged fix; also clears stale position/HDOP when the lock drops
+  // and sums GSV satellites-in-view across constellations (see lib/nmea.ts).
+  const agg = createFixAggregator();
 
   let stream: ReadStream;
   try {
@@ -55,18 +57,9 @@ export function streamGps(port: string = GPS_NMEA_PORT, handlers: GpsStreamHandl
     buf = parts.pop() ?? "";
     let updated = false;
     for (const line of parts) {
-      const partial = parseSentence(line);
-      if (!partial) continue;
-      for (const [k, v] of Object.entries(partial)) {
-        // Merge only defined, non-NaN values (mirrors nmea.aggregateFix), so a
-        // sentence missing a field never clobbers a good prior value.
-        if (v !== undefined && !Number.isNaN(v as number)) {
-          (fix as Record<string, unknown>)[k] = v;
-          updated = true;
-        }
-      }
+      if (agg.update(line)) updated = true;
     }
-    if (updated) handlers.onFix?.({ ...fix });
+    if (updated) handlers.onFix?.({ ...agg.fix });
   });
 
   stream.on("error", (err) => handlers.onError?.(describeError(err as NodeJS.ErrnoException, port)));

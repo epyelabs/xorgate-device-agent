@@ -39,6 +39,17 @@ const WRAPPER_BODY = `#!/usr/bin/env bash
 exec env XORGATE_HOME="\${XORGATE_HOME:-/var/lib/xorgate}" node ${INSTALL_PREFIX}/dist/cli.js "$@"
 `;
 
+// SIM7600 connection-manager assets shipped in the tarball (mirrors the
+// install script). Refreshed on update so GNSS/LTE fixes reach the fleet; the
+// running daemon is NOT restarted here — on a cellular-only device that would
+// drop the very link this update rode in on. New script applies on next boot
+// or a manual `systemctl restart sim7600-lte`.
+const MODEM_ASSETS: Array<[src: string, dest: string, mode: number]> = [
+  ["modem/sim7600-lte.sh", "/usr/local/bin/sim7600-lte.sh", 0o755],
+  ["modem/sim7600-lte.service", "/etc/systemd/system/sim7600-lte.service", 0o644],
+  ["modem/99-sim7600-lte.rules", "/etc/udev/rules.d/99-sim7600-lte.rules", 0o644],
+];
+
 const log = (s: string): void => console.log(`[xorgate] ${s}`);
 const fail = (s: string): never => {
   console.error(`[xorgate] update failed: ${s}`);
@@ -149,6 +160,24 @@ export async function updateCommand(argv: string[]): Promise<void> {
     rmSync(WRAPPER, { force: true }); // break any prior symlink before writing
     writeFileSync(WRAPPER, WRAPPER_BODY, { mode: 0o755 });
     chmodSync(WRAPPER, 0o755);
+
+    // 5b. Refresh the SIM7600 modem assets when the build ships them AND the
+    //     device has the daemon installed (skip devices without the modem).
+    if (existsSync("/usr/local/bin/sim7600-lte.sh")) {
+      let refreshed = 0;
+      for (const [src, dest, mode] of MODEM_ASSETS) {
+        const from = join(INSTALL_PREFIX, src);
+        if (!existsSync(from)) continue;
+        copyFileSync(from, dest);
+        chmodSync(dest, mode);
+        refreshed++;
+      }
+      if (refreshed > 0) {
+        log(
+          "modem assets refreshed — applies on next boot, or now with: sudo systemctl restart sim7600-lte",
+        );
+      }
+    }
   } catch (err) {
     // Roll back to the previous build so we never leave a broken install.
     rmSync(INSTALL_PREFIX, { recursive: true, force: true });

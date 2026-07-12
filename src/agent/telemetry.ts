@@ -41,6 +41,10 @@ export interface TelemetryMetrics {
     satellites: MetricLeaf;
     /** GGA fix quality: 0 = none, 1 = GPS, 2 = DGPS. */
     fix_quality: MetricLeaf;
+    /** Satellites in view across constellations (GSV) — sky-view/antenna diagnostic. */
+    satellites_in_view?: MetricLeaf;
+    /** Horizontal dilution of precision (GSA) — fix confidence, lower is better. */
+    hdop?: MetricLeaf;
   };
   lte: { rssi: MetricLeaf; quality: MetricLeaf };
   system: {

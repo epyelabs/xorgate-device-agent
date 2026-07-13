@@ -12,6 +12,7 @@
  * read it. This file must NOT import ink/React — keep the detached process lean.
  */
 import { loadConfig } from "./agent/config.js";
+import { applyCloudConfig, parseCloudConfig } from "./agent/cloud-config.js";
 import { connect } from "./agent/mqtt.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector } from "./agent/collectors/index.js";
@@ -113,6 +114,34 @@ process.on("unhandledRejection", (reason) => {
 
 const client = connect(config);
 
+// Cloud config messages (retained; re-delivered on every connect). Persist into
+// settings.json — the sim7600-lte daemon polls the file and applies gnssAntBias
+// live. Registered once; the subscription itself is (re)made on each connect
+// because the session is clean.
+client.on("message", (topic: string, payload: Buffer) => {
+  if (topic !== config.configTopic) return;
+  const now = Date.now();
+  const parsed = parseCloudConfig(payload);
+  if (parsed === null) {
+    console.error("[agent] ignoring malformed config message");
+    store.event("warn", "ignoring malformed cloud config message", now);
+    store.flush(now, true);
+    return;
+  }
+  try {
+    const { changed } = applyCloudConfig(parsed);
+    if (changed) {
+      console.log(`[agent] cloud config applied: gnssAntBias=${parsed.gnssAntBias}`);
+      store.event("info", `cloud config applied: gnssAntBias=${parsed.gnssAntBias}`, now);
+      store.flush(now, true);
+    }
+  } catch (err) {
+    console.error("[agent] cloud config apply failed", (err as Error).message);
+    store.event("warn", `cloud config apply failed: ${(err as Error).message}`, now);
+    store.flush(now, true);
+  }
+});
+
 client.on("connect", () => {
   const now = Date.now();
   console.log(
@@ -128,6 +157,18 @@ client.on("connect", () => {
     JSON.stringify({ v: 1, deviceId: config.deviceId, ts: now, online: true }),
     { qos: 0 },
   );
+
+  // Clean session: re-subscribe on every connect. The broker then replays the
+  // retained config message, so a device that was offline through a settings
+  // change converges right here.
+  client.subscribe(config.configTopic, { qos: 1 }, (err) => {
+    if (err) {
+      const t = Date.now();
+      console.error("[agent] config subscribe failed", err.message);
+      store.event("warn", `config subscribe failed: ${err.message}`, t);
+      store.flush(t, true);
+    }
+  });
 
   if (timer) return; // already running across a reconnect
   timer = setInterval(async () => {

@@ -155,8 +155,8 @@ Facts that constrain the choice:
   are on the card itself and the bias tee is on-card, fed from the module's
   VDD_AUX LDO and switched by `AT+CVAUXS` — Waveshare's FAQ for this exact
   card: "you can use `AT+CVAUXS=1` to power the antenna, allowing it to work
-  with an active antenna". `SIM7600_GNSS_ANT_BIAS=1` makes the daemon do
-  this properly ordered: `AT+CVAUXV=3050` (max) **then** `AT+CVAUXS=1`.
+  with an active antenna". The `gnssAntBias` device setting makes the daemon
+  do this properly ordered: `AT+CVAUXV=3050` (max) **then** `AT+CVAUXS=1`.
   Order matters: our unit's LDO register sat at the 1700 mV minimum, so
   enabling before raising the voltage would brown-out most LNAs. Definitive
   check: multimeter DC on the GNSS MHF4 center pin, toggling `AT+CVAUXS`
@@ -192,7 +192,16 @@ Pigtail alternates: Taoglas CAB.01055 (150 mm, MHF4 to SMA-F bulkhead).
 The stock passive FPC combo antenna is the floor: no LNA, no ground plane
 control, LTE radiator centimeters away. Any option above is an upgrade.
 
-### Enabling antenna bias on a device (`SIM7600_GNSS_ANT_BIAS`)
+### Enabling antenna bias on a device (the `gnssAntBias` setting)
+
+Antenna bias is a **per-device setting**, not an env var: `gnssAntBias` in the
+agent's `settings.json` (`/var/lib/xorgate/settings.json`). Set it from the
+web app's device settings page ("Power the GPS antenna") or on the device with
+`xorgate set gps-antenna <active|passive>`. A missing key means passive (bias
+off), the hardware-safe default. The daemon asserts the state at boot (both
+directions, so a replaced/reflashed module always matches) and re-reads the
+file about every 30 s while connected, applying changes live — no service
+restart, no LTE drop. The bias voltage is fixed at 3050 mV.
 
 Order of operations matters — **swap the antenna first, then enable bias**.
 A passive antenna can present a DC short across the coax; 3.05 V into a short
@@ -200,26 +209,16 @@ through the card's small bias resistor can exceed the VDD_AUX LDO's ~150 mA
 budget. Same in reverse: disable bias before going back to a passive antenna.
 
 1. Physically connect the active antenna to the M.2 card's GNSS MHF4.
-2. Set the env var via a systemd drop-in (survives `xorgate update`, which
-   overwrites the unit file itself but leaves drop-ins alone):
-
-   ```sh
-   sudo mkdir -p /etc/systemd/system/sim7600-lte.service.d
-   sudo tee /etc/systemd/system/sim7600-lte.service.d/override.conf >/dev/null <<'EOF'
-   [Service]
-   Environment="SIM7600_GNSS_ANT_BIAS=1"
-   EOF
-   sudo systemctl daemon-reload
-   sudo systemctl restart sim7600-lte
-   ```
-
-   On restart the daemon sends `AT+CVAUXV=3050` then `AT+CVAUXS=1` (that
-   order — the LDO register can sit at the 1700 mV minimum, and enabling
-   before raising the voltage browns out most LNAs).
+2. Flip the setting: web device settings page → "Power the GPS antenna", or
+   `xorgate set gps-antenna active` on the device. The daemon sends
+   `AT+CVAUXV=3050` then `AT+CVAUXS=1` (that order — the LDO register can sit
+   at the 1700 mV minimum, and enabling before raising the voltage browns out
+   most LNAs).
 3. Verify. Cheapest check is the journal plus the in-view count:
 
    ```sh
-   journalctl -u sim7600-lte -n 50 | grep -i bias   # "Enabling GNSS active-antenna bias"
+   journalctl -u sim7600-lte -n 50 | grep -i bias   # "GNSS antenna bias -> on"
+   cat /run/sim7600-lte/telemetry.json               # "gnss_ant_bias": 1
    xorgate manage                                    # GPS pane: sats in view should jump vs the old antenna
    ```
 
@@ -227,12 +226,10 @@ budget. Same in reverse: disable bias before going back to a passive antenna.
    `AT+CVAUXS?` → `+CVAUXS: 1`, `AT+CVAUXV?` → `+CVAUXV: 3050` — or put a
    multimeter on the GNSS MHF4 center pin (expect ~3.05 V vs ~0 V with
    `AT+CVAUXS=0`).
-4. To disable (before refitting a passive antenna): delete the drop-in, then
-   `sudo systemctl daemon-reload && sudo systemctl restart sim7600-lte`, and
-   since the LDO setting persists in the modem, also send `AT+CVAUXS=0` once
-   (daemon stopped), or power-cycle the modem.
+4. To disable (before refitting a passive antenna): flip the setting back
+   (web page, or `xorgate set gps-antenna passive`); the daemon applies
+   `AT+CVAUXS=0` live within ~30 s.
 
-To make it fleet-default instead of per-device, flip the default in
-`modem/sim7600-lte.sh` (`SIM7600_GNSS_ANT_BIAS:-0` → `:-1`) and roll out via
-the normal tarball — but only once every deployed unit has an active antenna
-fitted, because of the passive-short caveat above.
+The web path works end-to-end even for offline devices: the backend publishes
+the setting as a retained MQTT config message, the agent persists it into
+settings.json on (re)connect, and the daemon picks it up from the file.

@@ -10,11 +10,17 @@ import type { AgentConfig } from "./config.js";
 export interface AgentClient {
   on(event: "connect" | "reconnect" | "close", handler: () => void): unknown;
   on(event: "error", handler: (err: Error) => void): unknown;
+  on(event: "message", handler: (topic: string, payload: Buffer) => void): unknown;
   publish(
     topic: string,
     message: string,
     opts: { qos: 0 | 1 | 2; retain?: boolean },
     cb?: (err?: Error) => void,
+  ): unknown;
+  subscribe(
+    topic: string,
+    opts: { qos: 0 | 1 | 2 },
+    cb?: (err?: Error | null) => void,
   ): unknown;
   end(force: boolean, opts: Record<string, never>, cb: () => void): unknown;
 }
@@ -80,6 +86,12 @@ export function createStubClient(): AgentClient {
     },
     publish(_topic: string, _message: string, _opts: unknown, cb?: (err?: Error) => void) {
       cb?.(undefined);
+      return client;
+    },
+    subscribe(_topic: string, _opts: unknown, cb?: (err?: Error | null) => void) {
+      // No broker offline — nothing will ever arrive, but succeed so the
+      // worker's subscribe-on-connect path is exercised.
+      cb?.(null);
       return client;
     },
     end(_force: boolean, _opts: Record<string, never>, cb: () => void) {

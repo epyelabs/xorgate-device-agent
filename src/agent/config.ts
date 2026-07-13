@@ -73,6 +73,8 @@ export interface AgentConfig {
   offline: boolean;
   telemetryTopic: string;
   statusTopic: string;
+  /** Retained cloud->device config messages (e.g. gnssAntBias) arrive here. */
+  configTopic: string;
   certPath: string;
   keyPath: string;
   caPath: string;
@@ -221,6 +223,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     offline,
     telemetryTopic: `xorgate/devices/${deviceId}/telemetry`,
     statusTopic: `xorgate/devices/${deviceId}/status`,
+    configTopic: `xorgate/devices/${deviceId}/config`,
     certPath,
     keyPath,
     caPath,

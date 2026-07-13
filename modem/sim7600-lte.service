@@ -28,7 +28,10 @@ RestartSec=10
 #   Environment="SIM7600_GNSS_XTRA=1"         # XTRA predicted-ephemeris assistance
 #   Environment="SIM7600_SUPL_URL=supl.google.com:7276"   # "" = plain standalone
 #   Environment="SIM7600_GNSS_ACCURACY=100"   # AT+CGPSHOR meters
-#   Environment="SIM7600_GNSS_ANT_BIAS=1"     # power an active antenna LNA via VDD_AUX
+# GNSS antenna bias (active vs passive antenna) is NOT an env knob: it comes
+# from the agent's settings.json (web device settings page or
+# `xorgate set gps-antenna <active|passive>`); missing key = passive/bias off.
+#   Environment="SIM7600_SETTINGS_FILE=/var/lib/xorgate/settings.json"  # dev relocation only
 Environment="SIM7600_SERIAL=/dev/ttyUSB2"
 Environment="SIM7600_IFACE=usb0"
 Environment="SIM7600_PING_HOST=8.8.8.8"

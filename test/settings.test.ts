@@ -29,6 +29,18 @@ describe("settings persistence", () => {
     expect(loadSettings()).toEqual({ mode: "real" });
   });
 
+  it("round-trips the GNSS antenna bias alongside other keys", () => {
+    saveSettings({ mode: "real", gnssAntBias: true });
+    expect(loadSettings()).toEqual({ mode: "real", gnssAntBias: true });
+    saveSettings({ mode: "real", gnssAntBias: false });
+    expect(loadSettings()).toEqual({ mode: "real", gnssAntBias: false });
+  });
+
+  it("ignores a non-boolean gnssAntBias", () => {
+    writeFileSync(settingsPath(), JSON.stringify({ mode: "real", gnssAntBias: 1 }));
+    expect(loadSettings()).toEqual({ mode: "real" });
+  });
+
   it("returns {} when the file is missing", () => {
     expect(loadSettings()).toEqual({});
   });

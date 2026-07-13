@@ -67,11 +67,16 @@ GNSS_ACCURACY="${SIM7600_GNSS_ACCURACY:-100}"
 # GLONASS/Galileo/BeiDou GSA/GSV variants — the agent parses GSA (HDOP) and
 # GSV (satellites in view) for fix confidence.
 NMEA_MASK="${SIM7600_NMEA_MASK:-197119}"
-# Aux LDO powering an ACTIVE GNSS antenna's LNA (AT+CVAUXS/AT+CVAUXV). Off by
-# default: only useful when the carrier board routes VDD_AUX to the antenna
-# feed AND an active antenna is fitted. 3050 mV is the LDO maximum.
-GNSS_ANT_BIAS="${SIM7600_GNSS_ANT_BIAS:-0}"
-GNSS_ANT_BIAS_MV="${SIM7600_GNSS_ANT_BIAS_MV:-3050}"
+# Aux LDO powering an ACTIVE GNSS antenna's LNA (AT+CVAUXS/AT+CVAUXV). Driven
+# by `gnssAntBias` in the agent's settings.json (set from the web device
+# settings page or `xorgate set gps-antenna`); missing/unreadable file or key
+# means passive (bias off), the hardware-safe default. Asserted at boot and
+# re-checked live in the health loop — no daemon restart needed to change it.
+# The env var only relocates the file for dev setups; it is not a value
+# override. 3050 mV is the LDO maximum (hardcoded; set BEFORE output on).
+SETTINGS_FILE="${SIM7600_SETTINGS_FILE:-/var/lib/xorgate/settings.json}"
+GNSS_ANT_BIAS_MV=3050
+GNSS_BIAS_CHECK_INTERVAL=30          # settings.json re-read cadence (seconds)
 # XTRA maintenance: re-download when validity drops under a day (file is good
 # for ~7 days; SIMCom suggests daily refresh), checking every 6 h while up.
 XTRA_MIN_VALID_MIN=1440
@@ -105,6 +110,7 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a /var/log/sim7
 #   "iface":        interface name
 #   "ip":           current IP string, or null
 #   "xtra_valid_min": minutes of GNSS XTRA assistance validity left, or null
+#   "gnss_ant_bias": 0|1 last-applied antenna bias state, or null before first apply
 # }
 write_telemetry() {
     local csq="$1"
@@ -144,7 +150,8 @@ write_telemetry() {
   "status": "$status",
   "iface": "$IFACE",
   "ip": $ip,
-  "xtra_valid_min": ${XTRA_VALID_MIN:-null}
+  "xtra_valid_min": ${XTRA_VALID_MIN:-null},
+  "gnss_ant_bias": ${GNSS_BIAS_APPLIED:-null}
 }
 EOF
 
@@ -234,6 +241,60 @@ adaptive_interval() {
 XTRA_VALID_MIN=null
 LAST_XTRA_CHECK=0
 LAST_GNSS_CHECK=0
+# Last-applied antenna bias (0/1; empty until configure_gnss asserts it).
+GNSS_BIAS_APPLIED=""
+LAST_BIAS_CHECK=0
+
+# Desired antenna bias from the agent's settings.json: prints 1 (active) or 0
+# (passive). Any failure — missing/unreadable file, bad JSON, missing key, no
+# python3 — resolves to 0, the hardware-safe default (jq is not guaranteed on
+# the device; python3 is).
+gnss_bias_desired() {
+    local out
+    out=$(python3 - "$SETTINGS_FILE" 2>/dev/null <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        v = json.load(f).get("gnssAntBias")
+    print("1" if v is True else "0")
+except Exception:
+    print("0")
+PYEOF
+    )
+    if [[ "$out" == "1" ]]; then echo 1; else echo 0; fi
+}
+
+# Assert the antenna bias state on the modem (both directions). Safe to apply
+# live — it never touches the GNSS engine or the LTE link.
+gnss_bias_apply() {
+    local desired="$1"
+    if [[ "$desired" == "1" ]]; then
+        # Order matters: program the LDO voltage BEFORE switching the output
+        # on — the register can sit at 1700 mV, which browns out most LNAs.
+        log "GNSS antenna bias -> on (AT+CVAUXV=$GNSS_ANT_BIAS_MV then AT+CVAUXS=1) (source: settings)"
+        at_cmd "AT+CVAUXV=$GNSS_ANT_BIAS_MV" 1
+        at_cmd "AT+CVAUXS=1" 1
+    else
+        log "GNSS antenna bias -> off (AT+CVAUXS=0) (source: settings)"
+        at_cmd "AT+CVAUXS=0" 1
+    fi
+    GNSS_BIAS_APPLIED="$desired"
+}
+
+# Live re-apply: re-read settings.json (self-throttled) and only touch the AT
+# port when the desired state differs from what was last applied.
+gnss_bias_maintain() {
+    [[ "$ENABLE_GPS" == "1" ]] || return 0
+    local now
+    now=$(date +%s)
+    (( now - LAST_BIAS_CHECK < GNSS_BIAS_CHECK_INTERVAL )) && return 0
+    LAST_BIAS_CHECK=$now
+    local desired
+    desired=$(gnss_bias_desired)
+    if [[ "$desired" != "$GNSS_BIAS_APPLIED" ]]; then
+        gnss_bias_apply "$desired"
+    fi
+}
 
 gps_engine_on() {
     local state
@@ -329,12 +390,10 @@ configure_gnss() {
     # Horizontal accuracy threshold: plain write, idempotent.
     at_cmd "AT+CGPSHOR=$GNSS_ACCURACY" 1
 
-    # Active-antenna LNA bias via the VDD_AUX LDO (opt-in; see config notes).
-    if [[ "$GNSS_ANT_BIAS" == "1" ]]; then
-        log "Enabling GNSS active-antenna bias (AT+CVAUXV=$GNSS_ANT_BIAS_MV)..."
-        at_cmd "AT+CVAUXV=$GNSS_ANT_BIAS_MV" 1
-        at_cmd "AT+CVAUXS=1" 1
-    fi
+    # Active-antenna LNA bias from settings.json. Asserted unconditionally in
+    # BOTH directions at boot so a replaced/reflashed module always matches the
+    # setting; the health loop (gnss_bias_maintain) re-applies live changes.
+    gnss_bias_apply "$(gnss_bias_desired)"
 
     if [[ "$need_reset" -eq 1 ]]; then
         log "GNSS settings changed — resetting modem (AT+CRESET) to apply..."
@@ -538,9 +597,10 @@ monitor_connection() {
             fail_count=0
             write_telemetry "$csq" "connected" "$interval"
             log "Health OK — CSQ=$csq ($dbm) [poll=${interval}s]"
-            # GNSS upkeep while the link is healthy (both self-throttle).
+            # GNSS upkeep while the link is healthy (all self-throttle).
             gnss_reassert
             xtra_maintain
+            gnss_bias_maintain
         else
             (( fail_count++ ))
             warn "Ping failed ($fail_count/$HEALTH_FAIL_THRESHOLD) — CSQ=$csq ($dbm)"

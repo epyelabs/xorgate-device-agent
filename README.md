@@ -376,9 +376,16 @@ Measured on the reference device (SIM7600G-H-M2, LE20B04): assisted cold start
 (aiding wiped, XTRA valid) ≈ **90 s**; warm starts far less. Tune via
 `SIM7600_GNSS_MODE` / `SIM7600_GNSS_DPO` / `SIM7600_GNSS_XTRA` /
 `SIM7600_SUPL_URL` / `SIM7600_GNSS_ACCURACY` env (see the unit file's override
-notes); `SIM7600_GNSS_ANT_BIAS=1` powers an **active antenna's** LNA from the
-module's VDD_AUX LDO (max 3.05 V) — only useful when the carrier board routes
-VDD_AUX to the antenna feed.
+notes).
+
+**GPS antenna power (active antenna)** is a device setting, not an env knob:
+`gnssAntBias` in the agent's `settings.json`, set from the web device settings
+page ("Power the GPS antenna") or `xorgate set gps-antenna <active|passive>`.
+`true`/active powers an **active antenna's** LNA from the module's VDD_AUX LDO
+(3.05 V, `AT+CVAUXV=3050` then `AT+CVAUXS=1`); an absent key means passive
+(bias off), the hardware-safe default. The modem daemon asserts the state at
+boot and re-reads the file live (~30 s) — no service restart, no LTE drop.
+Current state is exposed as `gnss_ant_bias` in the daemon's telemetry JSON.
 
 ### What the collector publishes
 

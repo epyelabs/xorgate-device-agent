@@ -1,11 +1,13 @@
 /**
  * `xorgate set <key> <value>` — persist an agent setting and apply it.
  *
- * Supported keys: `mode` (<sim|real>) and `media` (<on|off>, the KVS WebRTC
- * runtime toggle). The value is merged into settings.json (read by loadConfig
- * with precedence flag > settings > env), then the daemon is restarted to apply
- * — reusing its recorded launch flags so creds / --offline are preserved.
- * `--no-restart` persists without restarting.
+ * Supported keys: `mode` (<sim|real>), `media` (<on|off>, the KVS WebRTC
+ * runtime toggle), and `gps-antenna` (<active|passive>, the GNSS antenna bias).
+ * The value is merged into settings.json (read by loadConfig with precedence
+ * flag > settings > env), then the daemon is restarted to apply — reusing its
+ * recorded launch flags so creds / --offline are preserved. `--no-restart`
+ * persists without restarting. `gps-antenna` needs no restart at all: the
+ * sim7600-lte daemon polls settings.json and applies the bias live.
  *
  * `wifi` (<on|off>) is different: it toggles the OS WiFi device at runtime via
  * NetworkManager (not settings.json, no daemon restart). It refuses to cut the
@@ -22,7 +24,7 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, wifi <on|off> [--force])";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, wifi <on|off> [--force])";
 
 export async function setCommand(rest: string[]): Promise<void> {
   const noRestart = rest.includes("--no-restart");
@@ -63,8 +65,23 @@ export async function setCommand(rest: string[]): Promise<void> {
     }
     next.mediaEnabled = value === "on";
     applied = `media ${value} (KVS WebRTC runtime)`;
+  } else if (key === "gps-antenna") {
+    if (value !== "active" && value !== "passive") {
+      console.error(`gps-antenna must be 'active' or 'passive', got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    next.gnssAntBias = value === "active";
+    saveSettings(next);
+    // No daemon restart: the sim7600-lte daemon polls settings.json and toggles
+    // the antenna bias live (and asserts it at boot).
+    console.log(
+      `✓ GPS antenna set to ${value} (bias ${value === "active" ? "on" : "off"}, persisted to settings.json)`,
+    );
+    console.log("  the modem daemon applies it live within ~a minute (journalctl -u sim7600-lte)");
+    return;
   } else {
-    console.error(`unknown setting '${key}' (supported: mode, media, wifi)`);
+    console.error(`unknown setting '${key}' (supported: mode, media, gps-antenna, wifi)`);
     process.exitCode = 1;
     return;
   }

@@ -1,5 +1,5 @@
 import type { Collector } from "./index.js";
-import { streamGps, GPS_NMEA_PORT } from "../../hardware/gps.js";
+import { streamGps, GPS_NMEA_PORT, type GpsStreamHandle } from "../../hardware/gps.js";
 import { hasPosition, type GpsFix } from "../../lib/nmea.js";
 
 /**
@@ -8,6 +8,15 @@ import { hasPosition, type GpsFix } from "../../lib/nmea.js";
  * showing a stale "acquiring"/position. NMEA is ~1 Hz, so this is generous.
  */
 const NMEA_STALE_MS = 10_000;
+
+/**
+ * If the open stream stays silent this long, assume the fd is dead and reopen.
+ * A modem reset (AT+CRESET or a crash) re-enumerates the USB serial ports and
+ * can leave the old tty fd open but permanently silent — no data, no error,
+ * no close — so onEnd never fires and the collector would wait forever.
+ * Longer than NMEA_STALE_MS so the "group omitted" signal always fires first.
+ */
+const REOPEN_SILENT_MS = 30_000;
 
 /**
  * GPS collector — NMEA from the SIM7600 GNSS port (/dev/ttyUSB1).
@@ -30,27 +39,38 @@ const NMEA_STALE_MS = 10_000;
  * view / antenna" from "seeing plenty, geometry still converging"; `hdop`
  * (GSA) is the fix-confidence number (lower is better, <2 is good).
  */
-export function createGpsCollector(): Collector {
+export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): Collector {
   let started = false;
   let latest: GpsFix | null = null;
   let lastFixAt = 0;
   let warned = false;
+  let handle: GpsStreamHandle | null = null;
+  let openedAt = 0;
+  // Generation guard: callbacks from a stream we already replaced (a destroyed
+  // stream's close event can land after the reopen) must not touch the state
+  // of its successor.
+  let gen = 0;
 
   function start(): void {
     started = true; // set before opening so reads don't double-start
-    streamGps(GPS_NMEA_PORT, {
+    openedAt = Date.now();
+    const myGen = ++gen;
+    handle = streamGps(GPS_NMEA_PORT, {
       onFix: (fix) => {
+        if (myGen !== gen) return;
         latest = fix;
         lastFixAt = Date.now();
         warned = false; // streaming again — allow a fresh warning if it drops
       },
       onError: (msg) => {
+        if (myGen !== gen) return;
         if (!warned) {
           console.warn(`[gps] ${msg}`);
           warned = true;
         }
       },
       onEnd: () => {
+        if (myGen !== gen) return;
         // Allow a re-open next tick (recovers when the modem re-enumerates). The
         // staleness check below handles the "stream died" case on its own.
         started = false;
@@ -61,7 +81,17 @@ export function createGpsCollector(): Collector {
   return {
     group: "gps",
     async read() {
-      if (!started) start();
+      if (!started) {
+        start();
+      } else if (Date.now() - Math.max(lastFixAt, openedAt) > reopenSilentMs) {
+        // Silent-fd watchdog: the stream is "open" but nothing has arrived for
+        // far too long — a dead tty from a modem USB re-enumeration. Destroy it
+        // and reopen on the next tick, picking up the fresh device node.
+        console.warn("[gps] NMEA silent too long — reopening the port");
+        handle?.stop();
+        handle = null;
+        started = false;
+      }
       // Require *fresh* NMEA: a stale stream means GNSS isn't actually emitting.
       if (!latest || Date.now() - lastFixAt > NMEA_STALE_MS) return {};
 

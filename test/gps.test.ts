@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Collector } from "../src/agent/collectors/index.js";
@@ -98,6 +99,37 @@ describe("createGpsCollector", () => {
     expect(fields.lon).toBeUndefined();
 
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it("destroys and reopens a silently-dead stream (modem USB re-enumeration)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xorgate-gps-"));
+    const fifo = join(dir, "nmea.fifo");
+    // A FIFO with no writer: the open never completes and no data/error/close
+    // ever arrives — the same observable behavior as a tty fd orphaned by a
+    // modem USB re-enumeration.
+    execFileSync("mkfifo", [fifo]);
+
+    vi.stubEnv("GPS_NMEA_PORT", fifo);
+    vi.resetModules();
+    const { createGpsCollector } = await import("../src/agent/collectors/gps.js");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const collector = createGpsCollector(40); // reopen after 40 ms of silence
+      expect(await collector.read()).toEqual({}); // opens the (silent) stream
+      await new Promise((r) => setTimeout(r, 60));
+      expect(await collector.read()).toEqual({}); // watchdog: destroy
+      expect(warn).toHaveBeenCalledWith("[gps] NMEA silent too long — reopening the port");
+      warn.mockClear();
+      expect(await collector.read()).toEqual({}); // next tick: reopen
+      // The reopened stream is silent again — the watchdog must fire again
+      // (proves the reopen actually re-armed rather than wedged).
+      await new Promise((r) => setTimeout(r, 60));
+      expect(await collector.read()).toEqual({});
+      expect(warn).toHaveBeenCalledWith("[gps] NMEA silent too long — reopening the port");
+    } finally {
+      warn.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("returns {} when the NMEA port is absent", async () => {

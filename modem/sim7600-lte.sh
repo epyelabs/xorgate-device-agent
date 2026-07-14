@@ -468,8 +468,14 @@ gnss_reassert() {
     (( now - LAST_GNSS_CHECK < GNSS_REASSERT_INTERVAL )) && return 0
     LAST_GNSS_CHECK=$now
     if ! gps_engine_on; then
-        warn "GNSS engine found off — restarting it."
+        warn "GNSS engine found off (modem reset?) — restarting it."
         gps_start
+        # An engine found off usually means the modem reset underneath us, which
+        # also reverts AT+CVAUXS (antenna bias) to off while our last-applied
+        # tracker still says on. Clear the tracker + throttle so the very next
+        # gnss_bias_maintain tick re-asserts the bias from settings.json.
+        GNSS_BIAS_APPLIED=""
+        LAST_BIAS_CHECK=0
     fi
 }
 

@@ -16,15 +16,17 @@ import type { StreamHandle } from "../../lib/exec.js";
  * Self-gating mirrors the IMU collector: detection + manifest load happen lazily
  * on the first read and return inert state when the runtime can't run (off-Pi,
  * missing binary, no manifest/channels). A master that keeps exiting *before it
- * stabilizes* (e.g. the user-supplied KVS SDK `.so` libs are missing) is parked
- * as `failed` after a few quick crashes rather than tight-looped — fix the cause
- * and restart the daemon to retry.
+ * stabilizes* (e.g. the user-supplied KVS SDK `.so` libs are missing, or the LTE
+ * link is down) is parked as `failed` after a few quick crashes rather than
+ * tight-looped, then re-attempted on a slow cadence so a transient cause (network
+ * outage) heals itself without a daemon restart.
  */
 
 const STABLE_MS = 15_000; // a master alive this long is considered up; resets backoff
 const BASE_BACKOFF_MS = 2_000; // matches run-master.sh's `sleep 2`
 const MAX_BACKOFF_MS = 30_000;
 const MAX_QUICK_FAILURES = 3; // quick crashes before we park the channel as failed
+const PARKED_RETRY_MS = 60_000; // parked channels re-attempt this often instead of staying dead
 
 interface ChannelSupervisor {
   streamKey: string;
@@ -192,12 +194,19 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
 
     c.quickFailures += 1;
     if (c.quickFailures >= MAX_QUICK_FAILURES) {
+      // Park with a slow retry rather than permanently: quick-crash streaks also
+      // happen transiently (LTE interface torn down mid-outage, creds endpoint
+      // unreachable at boot), and a permanently parked channel would stay dead
+      // after the network recovers until someone restarts the daemon.
       c.state = "failed";
       console.error(
         `[media ${channelName}] master exited (code ${exitCode ?? "?"}) before stabilizing ` +
-          `${c.quickFailures}x; parking. Check: KVS SDK .so libs in ${cfg.libDir}, ` +
-          "GStreamer install, and IoT creds. Restart the daemon to retry.",
+          `${c.quickFailures}x; parking for ${PARKED_RETRY_MS / 1000}s. Check: KVS SDK .so libs ` +
+          `in ${cfg.libDir}, GStreamer install, and IoT creds.`,
       );
+      c.quickFailures = 0;
+      c.backoffMs = BASE_BACKOFF_MS;
+      scheduleRestart(c, PARKED_RETRY_MS);
       return;
     }
     c.state = "retrying";
@@ -209,12 +218,12 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
     c.backoffMs = Math.min(c.backoffMs * 2, MAX_BACKOFF_MS);
   }
 
-  function scheduleRestart(c: ChannelSupervisor): void {
+  function scheduleRestart(c: ChannelSupervisor, delayMs = c.backoffMs): void {
     if (stopped) return;
     c.restartTimer = setTimeout(() => {
       c.restartTimer = null;
       spawn(c.channelName);
-    }, c.backoffMs);
+    }, delayMs);
   }
 
   return {

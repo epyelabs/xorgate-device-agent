@@ -75,6 +75,10 @@ export interface AgentConfig {
   statusTopic: string;
   /** Retained cloud->device config messages (e.g. gnssAntBias) arrive here. */
   configTopic: string;
+  /** Non-retained one-shot cloud->device commands (reboot, power_off) arrive here. */
+  commandTopic: string;
+  /** Accept/reject/fail acks for commandTopic are published here. */
+  commandResponseTopic: string;
   certPath: string;
   keyPath: string;
   caPath: string;
@@ -224,6 +228,8 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     telemetryTopic: `xorgate/devices/${deviceId}/telemetry`,
     statusTopic: `xorgate/devices/${deviceId}/status`,
     configTopic: `xorgate/devices/${deviceId}/config`,
+    commandTopic: `xorgate/devices/${deviceId}/command`,
+    commandResponseTopic: `xorgate/devices/${deviceId}/command/response`,
     certPath,
     keyPath,
     caPath,

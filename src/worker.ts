@@ -13,6 +13,13 @@
  */
 import { loadConfig } from "./agent/config.js";
 import { applyCloudConfig, parseCloudConfig } from "./agent/cloud-config.js";
+import {
+  claimCommand,
+  executeCommand,
+  isExpired,
+  parseCommand,
+  type DeviceCommandName,
+} from "./agent/commands.js";
 import { connect } from "./agent/mqtt.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector } from "./agent/collectors/index.js";
@@ -116,10 +123,8 @@ const client = connect(config);
 
 // Cloud config messages (retained; re-delivered on every connect). Persist into
 // settings.json — the sim7600-lte daemon polls the file and applies gnssAntBias
-// live. Registered once; the subscription itself is (re)made on each connect
-// because the session is clean.
-client.on("message", (topic: string, payload: Buffer) => {
-  if (topic !== config.configTopic) return;
+// live.
+function handleConfigMessage(payload: Buffer): void {
   const now = Date.now();
   const parsed = parseCloudConfig(payload);
   if (parsed === null) {
@@ -139,6 +144,126 @@ client.on("message", (topic: string, payload: Buffer) => {
     console.error("[agent] cloud config apply failed", (err as Error).message);
     store.event("warn", `cloud config apply failed: ${(err as Error).message}`, now);
     store.flush(now, true);
+  }
+}
+
+/** How long to wait for the ack's PUBACK before going down anyway. */
+const ACK_FLUSH_TIMEOUT_MS = 3000;
+
+/**
+ * Publish a command ack and resolve once the broker has PUBACKed it — or once
+ * ACK_FLUSH_TIMEOUT_MS elapses, so a slow broker cannot wedge the command.
+ * Awaited before executing: a reboot severs the connection, so an unflushed ack
+ * would be lost and the cloud would never learn the command landed.
+ */
+function publishCommandAck(ack: {
+  requestId: string;
+  command: DeviceCommandName;
+  status: "accepted" | "rejected" | "failed";
+  reason?: string;
+}): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    client.publish(
+      config.commandResponseTopic,
+      JSON.stringify({ v: 1, deviceId: config.deviceId, ts: Date.now(), ...ack }),
+      { qos: 1 },
+      done,
+    );
+    setTimeout(done, ACK_FLUSH_TIMEOUT_MS).unref();
+  });
+}
+
+/**
+ * One-shot cloud commands (non-retained). Guarded twice over, because a stray
+ * reboot on a fielded device is expensive: an `expiresAt` TTL rejects anything
+ * delayed in flight, and a disk-backed ledger rejects a redelivery even across
+ * the reboot it triggered.
+ *
+ * On success this function does not return in any meaningful sense — systemd
+ * stops the unit, our SIGTERM handler runs the normal shutdown (offline status,
+ * KVS teardown), and the box goes down. It only falls through to the failure ack
+ * when the privileged call itself was refused, in which case the device is still
+ * very much alive and the operator needs to know why nothing happened.
+ */
+async function handleCommandMessage(payload: Buffer): Promise<void> {
+  const now = Date.now();
+  const cmd = parseCommand(payload);
+  if (cmd === null) {
+    // No trustworthy requestId to ack against — drop it with a local trail.
+    console.error("[agent] ignoring malformed command message");
+    store.event("warn", "ignoring malformed command message", now);
+    store.flush(now, true);
+    return;
+  }
+
+  if (isExpired(cmd, now)) {
+    const age = Math.round((now - cmd.ts) / 1000);
+    console.warn(`[agent] rejecting expired ${cmd.command} command (issued ${age}s ago)`);
+    store.event("warn", `rejected expired ${cmd.command} command (${age}s old)`, now);
+    store.flush(now, true);
+    await publishCommandAck({ ...cmd, status: "rejected", reason: "expired" });
+    return;
+  }
+
+  // Claim BEFORE executing. `systemctl reboot` tears the process down, so an
+  // execute-then-record ordering would record nothing at all.
+  let claimed: boolean;
+  try {
+    claimed = claimCommand(cmd.requestId, now);
+  } catch (err) {
+    // Can't write the ledger => can't promise this won't replay => don't do it.
+    const reason = `ledger write failed: ${(err as Error).message}`;
+    console.error(`[agent] refusing ${cmd.command}: ${reason}`);
+    store.event("warn", `refused ${cmd.command}: ${reason}`, now);
+    store.flush(now, true);
+    await publishCommandAck({ ...cmd, status: "failed", reason });
+    return;
+  }
+  if (!claimed) {
+    console.warn(`[agent] ignoring duplicate ${cmd.command} command ${cmd.requestId}`);
+    store.event("warn", `ignored duplicate ${cmd.command} command`, now);
+    store.flush(now, true);
+    await publishCommandAck({ ...cmd, status: "rejected", reason: "duplicate" });
+    return;
+  }
+
+  console.log(`[agent] ${cmd.command} command accepted (${cmd.requestId})`);
+  store.event("info", `${cmd.command} command accepted`, now);
+  store.flush(now, true);
+  await publishCommandAck({ ...cmd, status: "accepted" });
+
+  const res = await executeCommand(cmd.command);
+  if (!res.failed) return; // going down; systemd's SIGTERM drives shutdown()
+  const t = Date.now();
+  const reason = res.notFound
+    ? "sudo not found"
+    : res.stderr.trim() || `exit ${res.exitCode}`;
+  console.error(`[agent] ${cmd.command} failed: ${reason}`);
+  store.event("warn", `${cmd.command} failed: ${reason}`, t);
+  store.flush(t, true);
+  await publishCommandAck({ ...cmd, status: "failed", reason });
+}
+
+// Registered once; the subscriptions themselves are (re)made on each connect
+// because the session is clean.
+client.on("message", (topic: string, payload: Buffer) => {
+  if (topic === config.configTopic) {
+    handleConfigMessage(payload);
+    return;
+  }
+  if (topic === config.commandTopic) {
+    void handleCommandMessage(payload).catch((err: Error) => {
+      const t = Date.now();
+      console.error("[agent] command handler crashed", err.message);
+      store.event("warn", `command handler crashed: ${err.message}`, t);
+      store.flush(t, true);
+    });
   }
 });
 
@@ -160,15 +285,21 @@ client.on("connect", () => {
 
   // Clean session: re-subscribe on every connect. The broker then replays the
   // retained config message, so a device that was offline through a settings
-  // change converges right here.
-  client.subscribe(config.configTopic, { qos: 1 }, (err) => {
-    if (err) {
-      const t = Date.now();
-      console.error("[agent] config subscribe failed", err.message);
-      store.event("warn", `config subscribe failed: ${err.message}`, t);
-      store.flush(t, true);
-    }
-  });
+  // change converges right here. Commands are NOT retained, so there is nothing
+  // to replay — a command issued while we were away is gone, by design.
+  for (const [label, topic] of [
+    ["config", config.configTopic],
+    ["command", config.commandTopic],
+  ] as const) {
+    client.subscribe(topic, { qos: 1 }, (err) => {
+      if (err) {
+        const t = Date.now();
+        console.error(`[agent] ${label} subscribe failed`, err.message);
+        store.event("warn", `${label} subscribe failed: ${err.message}`, t);
+        store.flush(t, true);
+      }
+    });
+  }
 
   if (timer) return; // already running across a reconnect
   timer = setInterval(async () => {

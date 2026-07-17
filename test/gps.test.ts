@@ -44,6 +44,7 @@ describe("createGpsCollector", () => {
     expect(fields.lat.value).toBeCloseTo(14.50206, 4);
     expect(fields.lon.value).toBeCloseTo(121.02613, 4);
     expect(fields.alt).toEqual({ value: 545.4, unit: "m" });
+    expect(fields.course).toEqual({ value: 31.7, unit: "°" }); // RMC track angle, rounded to 0.1
     expect(fields.satellites.value).toBe(8);
     expect(fields.fix_quality.value).toBe(1);
     expect(fields.hdop).toEqual({ value: 1.3 });

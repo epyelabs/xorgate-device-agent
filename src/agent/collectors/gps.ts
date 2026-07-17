@@ -111,6 +111,12 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
         if (typeof fix.speedKmh === "number") {
           out.speed = { value: round(fix.speedKmh, 1), unit: "km/h" };
         }
+        // Course over ground (direction of travel). Present only while moving;
+        // held from the last movement otherwise (the aggregator clears it on
+        // lock loss), so it's always tied to the current position.
+        if (typeof fix.course === "number") {
+          out.course = { value: round(fix.course, 1), unit: "°" };
+        }
       }
       return out;
     },

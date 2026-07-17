@@ -45,6 +45,9 @@ export function createSimulator(): () => TelemetryReading {
   // GPS: drift around a seed coordinate (San Francisco) as if slowly moving.
   let lat = 37.7749;
   let lon = -122.4194;
+  // Heading (deg true) drives the drift direction so the track and the course
+  // arrow stay coherent; it wanders slowly and wraps 0-360.
+  let heading = 45;
   const alt = channel(20, 0.5, 0, 120);
   const speed = channel(0, 1.5, 0, 25); // km/h
   const satellites = channel(9, 0.6, 4, 14); // count used in the fix
@@ -63,10 +66,13 @@ export function createSimulator(): () => TelemetryReading {
 
   return function next(): TelemetryReading {
     const spd = speed();
-    // Nudge position proportional to speed so the map track is coherent.
+    // Wander the heading slowly, then step position along it so the track and
+    // the course arrow point the same way.
+    heading = (heading + (Math.random() * 2 - 1) * 12 + 360) % 360;
+    const bearing = (heading * Math.PI) / 180;
     const drift = (spd / 25) * 0.0004;
-    lat = clamp(lat + (Math.random() * 2 - 1) * drift, 37.7, 37.83);
-    lon = clamp(lon + (Math.random() * 2 - 1) * drift, -122.52, -122.36);
+    lat = clamp(lat + Math.cos(bearing) * drift, 37.7, 37.83);
+    lon = clamp(lon + Math.sin(bearing) * drift, -122.52, -122.36);
 
     imuT += 0.05;
     const quat = normalizeQuat({
@@ -96,6 +102,7 @@ export function createSimulator(): () => TelemetryReading {
           lon: { value: round(lon, 6) },
           alt: { value: round(alt(), 1), unit: "m" },
           speed: { value: round(spd, 1), unit: "km/h" },
+          course: { value: round(heading, 1), unit: "°" },
           satellites: { value: Math.round(satellites()) },
           fix_quality: { value: 1 }, // 1 = GPS fix
           satellites_in_view: { value: Math.round(satellitesInView()) },

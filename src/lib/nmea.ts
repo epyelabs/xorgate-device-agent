@@ -25,6 +25,13 @@ export interface GpsFix {
   satellites?: number;
   /** Speed over ground in km/h (from RMC knots). */
   speedKmh?: number;
+  /**
+   * Course over ground in degrees true, 0-360 (RMC track angle). This is the
+   * direction of travel, not device heading — the modem only reports it while
+   * moving, so a stationary receiver leaves the field empty and the last value
+   * persists until the next movement (or clears on lock loss).
+   */
+  course?: number;
   /** RMC status: true = "A" (valid), false = "V" (void). */
   valid?: boolean;
   /** UTC time HH:MM:SS as reported. */
@@ -92,12 +99,16 @@ export function parseSentence(line: string): Partial<GpsFix> | null {
 
   if (type === "RMC") {
     const knots = fields[7] ? parseFloat(fields[7]) : NaN;
+    // Field 8 = track angle / course over ground (degrees true). Empty when the
+    // receiver is stationary (no meaningful direction of travel).
+    const course = fields[8] ? parseFloat(fields[8]) : NaN;
     return {
       utcTime: formatUtc(fields[1]),
       valid: fields[2] === "A",
       latitude: nmeaCoordToDecimal(fields[3], fields[4]),
       longitude: nmeaCoordToDecimal(fields[5], fields[6]),
       speedKmh: Number.isNaN(knots) ? undefined : knots * 1.852,
+      course: Number.isNaN(course) ? undefined : course,
     };
   }
 
@@ -138,7 +149,7 @@ export interface FixAggregator {
 }
 
 // Fields that must not outlive the lock that produced them.
-const POSITION_KEYS = ["latitude", "longitude", "altitude", "speedKmh", "hdop"] as const;
+const POSITION_KEYS = ["latitude", "longitude", "altitude", "speedKmh", "course", "hdop"] as const;
 
 /**
  * Rolling multi-sentence fix. Merges only defined, non-NaN values so a

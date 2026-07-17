@@ -43,10 +43,19 @@ describe("parseSentence", () => {
     expect(fix.fixQuality).toBe(1);
   });
 
-  it("parses RMC validity and speed", () => {
+  it("parses RMC validity, speed and course", () => {
     const fix = parseSentence(NMEA_LINES[1])!;
     expect(fix.valid).toBe(true);
     expect(fix.speedKmh).toBeCloseTo(0.06 * 1.852, 4);
+    expect(fix.course).toBeCloseTo(31.66, 2);
+  });
+
+  it("leaves course undefined for a stationary RMC (empty track field)", () => {
+    // Field 8 empty — the receiver reports no direction of travel when stopped.
+    // Captured verbatim off the SIM7600 so the checksum validates.
+    const fix = parseSentence("$GPRMC,153342.00,A,4339.799299,N,07931.163812,W,0.0,,170726,7.7,W,A*17")!;
+    expect(fix.speedKmh).toBeCloseTo(0, 4);
+    expect(fix.course).toBeUndefined();
   });
 
   it("parses GSA fix type and hdop", () => {
@@ -95,6 +104,7 @@ describe("createFixAggregator", () => {
     const agg = createFixAggregator();
     for (const line of [...NMEA_LINES, GSA_3D]) agg.update(line);
     expect(hasPosition(agg.fix)).toBe(true);
+    expect(agg.fix.course).toBeCloseTo(31.66, 2);
 
     // Lock drops: GGA quality 0 + void RMC.
     expect(agg.update(GGA_NO_LOCK)).toBe(true);
@@ -103,6 +113,7 @@ describe("createFixAggregator", () => {
     expect(hasPosition(agg.fix)).toBe(false);
     expect(agg.fix.altitude).toBeUndefined();
     expect(agg.fix.speedKmh).toBeUndefined();
+    expect(agg.fix.course).toBeUndefined();
     expect(agg.fix.hdop).toBeUndefined();
     // Liveness/diagnostic fields survive so the UI can still show "acquiring".
     expect(agg.fix.fixQuality).toBe(0);

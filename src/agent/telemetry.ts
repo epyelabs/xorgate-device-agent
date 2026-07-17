@@ -37,6 +37,8 @@ export interface TelemetryMetrics {
     lon: MetricLeaf;
     alt: MetricLeaf;
     speed: MetricLeaf;
+    /** Course over ground in degrees true, 0-360 (RMC). Direction of travel, present only while moving. */
+    course?: MetricLeaf;
     /** Satellites used in the fix (GGA). */
     satellites: MetricLeaf;
     /** GGA fix quality: 0 = none, 1 = GPS, 2 = DGPS. */

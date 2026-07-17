@@ -48,6 +48,9 @@ const MODEM_ASSETS: Array<[src: string, dest: string, mode: number]> = [
   ["modem/sim7600-lte.sh", "/usr/local/bin/sim7600-lte.sh", 0o755],
   ["modem/sim7600-lte.service", "/etc/systemd/system/sim7600-lte.service", 0o644],
   ["modem/99-sim7600-lte.rules", "/etc/udev/rules.d/99-sim7600-lte.rules", 0o644],
+  // usb0 must be unmanaged by NetworkManager or it races the daemon's dhclient
+  // for the modem's internal DHCP lease and wedges reconnection after outages.
+  ["modem/99-sim7600-unmanaged.conf", "/etc/NetworkManager/conf.d/99-sim7600-unmanaged.conf", 0o644],
 ];
 
 const log = (s: string): void => console.log(`[xorgate] ${s}`);

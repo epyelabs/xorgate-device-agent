@@ -15,8 +15,23 @@
 #   - Re-asserts the GNSS engine while connected (survives modem resets)
 #   - Adaptive CSQ polling: faster when signal is changing rapidly
 #   - Signal-aware reconnect: distinguishes dead zone vs network failure
+#   - Registration-aware: good RSSI alone never triggers a connect attempt;
+#     the modem must also be attached to the network (AT+CEREG)
+#   - Escalating recovery ladder for failures a plain retry can't fix:
+#     PS re-attach (AT+CGATT/AT+COPS) -> radio cycle (AT+CFUN) -> full modem
+#     reset (AT+CRESET, the same cure a host reboot provides)
+#   - Wedge detection in dead-zone wait: no service for too long nudges the
+#     radio, then resets the modem (firmware can stop cell-searching after a
+#     prolonged outage)
 #   - Atomic JSON telemetry output for consumption by other processes
 #   - Automatic reconnect on link failure
+#
+# NOTE (RNDIS mode, USB PID 9011): the LTE data call is dialed by the modem
+# firmware itself; usb0's DHCP lease comes from the modem's INTERNAL NAT
+# (192.168.225.1), so a successful dhclient bind proves nothing about the WAN.
+# Connectivity must be verified end-to-end (ping) and recovery must happen at
+# the modem level — AT+NETOPEN/NETCLOSE only drive the internal socket stack.
+# usb0 must NOT be managed by NetworkManager (see 99-sim7600-unmanaged.conf).
 #
 # The xorgate-device-agent reads two things this daemon produces:
 #   - LTE signal: the telemetry JSON at TELEMETRY_FILE (lte collector)
@@ -38,9 +53,21 @@ GOOD_CSQ="${SIM7600_GOOD_CSQ:-15}"
 SIGNAL_STABLE_COUNT=3        # consecutive good readings before connecting
 HEALTH_CHECK_INTERVAL=15     # how often to ping while connected
 HEALTH_FAIL_THRESHOLD=3      # consecutive ping failures before reconnect
-RECONNECT_DELAY=5            # wait before attempting reconnect
+RECONNECT_DELAY=5            # base wait before attempting reconnect (backs off)
 AT_CMD_DELAY=1               # pause between AT commands
 MODEM_BOOT_WAIT=8            # initial wait for modem USB enumeration
+
+# Recovery ladder / wedge detection (seconds unless noted)
+# After consecutive failed connect cycles the ladder escalates:
+#   fail 1: plain retry, fail 2: PS re-attach, fail 3: radio cycle,
+#   fail 4: modem reset (AT+CRESET) — then the ladder repeats.
+DEADZONE_NUDGE_SECS="${SIM7600_DEADZONE_NUDGE_SECS:-600}"  # no service this long -> nudge radio
+RECONNECT_DELAY_MAX=60       # cap for backed-off reconnect delay
+
+# Default-route metric for the LTE uplink. Must stay ABOVE the WiFi metric
+# (50, see 10-uplink-priority.conf) so WiFi wins while associated; dhclient
+# alone would install metric 0 and silently steal the whole uplink.
+LTE_ROUTE_METRIC="${SIM7600_ROUTE_METRIC:-100}"
 
 # Adaptive CSQ polling intervals (seconds)
 CSQ_INTERVAL_FAST=3          # signal changing rapidly (delta >= CSQ_RAPID_DELTA)
@@ -107,6 +134,8 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a /var/log/sim7
 #   "rssi_dbm":     integer dBm, or null if unknown
 #   "csq_interval": current adaptive poll interval in seconds
 #   "status":       "connected" | "connecting" | "disconnected" | "dead_zone"
+#   "reg":          last seen registration <stat> (1 home, 5 roaming, 2
+#                   searching, 3 denied, 0 none, 99 unknown)
 #   "iface":        interface name
 #   "ip":           current IP string, or null
 #   "xtra_valid_min": minutes of GNSS XTRA assistance validity left, or null
@@ -148,6 +177,7 @@ write_telemetry() {
   "rssi_dbm": $rssi_dbm,
   "csq_interval": $csq_interval,
   "status": "$status",
+  "reg": ${LAST_REG:-99},
   "iface": "$IFACE",
   "ip": $ip,
   "xtra_valid_min": ${XTRA_VALID_MIN:-null},
@@ -159,17 +189,43 @@ EOF
 }
 
 # --- AT command helpers -------------------------------------------------------
+# CRITICAL: every open of $SERIAL must be guarded by [[ -c ]]. When the modem
+# drops off USB (AT+CRESET, power blip) the device node vanishes, and a bare
+# `>` or `<>` redirect would CREATE A REGULAR FILE at that path — which then
+# blocks the kernel from recreating the real node on re-enumeration. That
+# wedges the AT port until someone deletes the file (i.e. "until a reboot").
 at_cmd() {
     local cmd="$1"
     local wait="${2:-$AT_CMD_DELAY}"
+    [[ -c "$SERIAL" ]] || return 1
     echo -e "${cmd}\r" > "$SERIAL"
     sleep "$wait"
 }
 
+# Send a command and return its full response. Opens the port on an fd, drains
+# any stale bytes first (leftover URCs / echoes from fire-and-forget at_cmd),
+# then reads line-by-line until the final result code or timeout. This avoids
+# the write-then-open-reader race of the old `echo; timeout cat` approach,
+# which routinely lost responses and produced spurious CSQ=99 readings.
 at_query() {
-    local cmd="$1"
-    echo -e "${cmd}\r" > "$SERIAL"
-    timeout 2 cat "$SERIAL" 2>/dev/null | tr -d '\r'
+    local cmd="$1" secs="${2:-4}" line resp=""
+    [[ -c "$SERIAL" ]] || return 1
+    exec 3<>"$SERIAL" 2>/dev/null || return 1
+    while IFS= read -r -t 0.1 -u 3 line; do :; done
+    printf '%s\r' "$cmd" >&3
+    local deadline=$(( SECONDS + secs ))
+    while (( SECONDS < deadline )); do
+        if IFS= read -r -t 1 -u 3 line; then
+            line="${line%$'\r'}"
+            [[ -z "$line" ]] && continue
+            resp+="$line"$'\n'
+            case "$line" in
+                OK|ERROR|*"+CME ERROR"*|*"+CMS ERROR"*|*"+IP ERROR"*) break ;;
+            esac
+        fi
+    done
+    exec 3<&- 3>&-
+    printf '%s' "$resp"
 }
 
 # Send a command and wait (up to $2 seconds) for a line matching $3 — for
@@ -178,17 +234,57 @@ at_query() {
 # the full timeout. Prints the matched line, or nothing on timeout.
 at_wait_urc() {
     local cmd="$1" secs="$2" pattern="$3"
+    [[ -c "$SERIAL" ]] || return 1
     echo -e "${cmd}\r" > "$SERIAL"
     timeout "$secs" grep -m1 -aE "$pattern" "$SERIAL" 2>/dev/null | tr -d '\r'
 }
 
 # --- Signal quality ----------------------------------------------------------
 get_csq() {
-    local raw
-    raw=$(at_query "AT+CSQ" | grep "+CSQ:" | head -1)
-    local val
-    val=$(echo "$raw" | sed -n 's/.*+CSQ: \([0-9]*\),.*/\1/p')
+    # One retry on 99/empty: a lost AT response must not masquerade as a dead
+    # zone — that misclassification drives the wrong reconnect path.
+    local raw val attempt
+    for attempt in 1 2; do
+        raw=$(at_query "AT+CSQ" | grep "+CSQ:" | head -1)
+        val=$(echo "$raw" | sed -n 's/.*+CSQ: \([0-9]*\),.*/\1/p')
+        if [[ -n "$val" && "$val" -ne 99 ]]; then
+            echo "$val"
+            return
+        fi
+        sleep 1
+    done
     echo "${val:-99}"
+}
+
+# --- Network registration -----------------------------------------------------
+# CS/PS registration status from AT+CEREG (LTE), falling back to AT+CGREG.
+# Prints the <stat> digit: 1 home, 5 roaming, 2 searching, 3 denied, 0 none,
+# 99 unknown/no-response. Good RSSI without registration is exactly the state
+# a long outage leaves behind — it must never be treated as "ready to connect".
+LAST_REG=99
+# Updates LAST_REG in the CURRENT shell (no command substitution — a subshell
+# would throw the value away and telemetry/logs would show a stale 99).
+update_reg() {
+    local stat
+    stat=$(at_query "AT+CEREG?" | sed -n 's/.*+CEREG: [0-9],\([0-9]\).*/\1/p' | head -1)
+    if [[ -z "$stat" ]]; then
+        stat=$(at_query "AT+CGREG?" | sed -n 's/.*+CGREG: [0-9],\([0-9]\).*/\1/p' | head -1)
+    fi
+    LAST_REG="${stat:-99}"
+}
+
+is_registered() {
+    update_reg
+    [[ "$LAST_REG" == "1" || "$LAST_REG" == "5" ]]
+}
+
+# True when PDP context 1 holds a real WAN address (the RNDIS data call is up
+# modem-side). dhclient success can NOT stand in for this — the lease comes
+# from the modem's internal NAT and is granted even with the WAN dead.
+wan_ip_up() {
+    local addr
+    addr=$(at_query "AT+CGPADDR=1" | sed -n 's/.*+CGPADDR: 1,"\{0,1\}\([0-9.]*\).*/\1/p' | head -1)
+    [[ -n "$addr" && "$addr" != "0.0.0.0" ]]
 }
 
 csq_to_dbm() {
@@ -398,9 +494,7 @@ configure_gnss() {
     if [[ "$need_reset" -eq 1 ]]; then
         log "GNSS settings changed — resetting modem (AT+CRESET) to apply..."
         at_cmd "AT+CRESET" 2
-        sleep "$MODEM_BOOT_WAIT"
-        wait_for_serial || return 1
-        wait_for_modem_ready || return 1
+        wait_for_modem_reboot || return 1
         log "Modem back after GNSS config reset."
     fi
 
@@ -484,6 +578,13 @@ wait_for_serial() {
     log "Waiting for modem serial port $SERIAL..."
     local attempts=0
     while [[ ! -c "$SERIAL" ]]; do
+        # A REGULAR file at the serial path (left by an unguarded write while
+        # the modem was off USB) blocks the kernel from recreating the real
+        # node — delete it or the AT port never comes back without a reboot.
+        if [[ -e "$SERIAL" ]]; then
+            warn "$SERIAL exists but is not a character device — removing impostor file."
+            rm -f "$SERIAL"
+        fi
         sleep 2
         (( attempts++ ))
         if (( attempts > 30 )); then
@@ -491,6 +592,9 @@ wait_for_serial() {
             return 1
         fi
     done
+    # Best-effort sane line discipline (raw, no echo) — a freshly enumerated
+    # tty comes up with defaults that can mangle AT responses.
+    stty -F "$SERIAL" 115200 raw -echo 2>/dev/null || true
     log "Serial port $SERIAL is available."
 }
 
@@ -514,36 +618,170 @@ wait_for_modem_ready() {
     log "Modem is responsive."
 }
 
+# After AT+CRESET the modem takes a few seconds to actually drop off USB.
+# Checking for the serial port too early sees the OLD node still present and
+# then races the disappearance — so first wait for the port to GO AWAY (up to
+# 30s; if it never does, proceed anyway), then wait for it to come back.
+wait_for_modem_reboot() {
+    local waited=0
+    while [[ -c "$SERIAL" ]] && (( waited < 30 )); do
+        sleep 1
+        (( waited++ ))
+    done
+    if [[ ! -c "$SERIAL" ]]; then
+        log "Modem dropped off USB (expected after reset)."
+    else
+        warn "Modem never left the USB bus after reset; continuing anyway."
+    fi
+    wait_for_serial || return 1
+    wait_for_modem_ready || return 1
+}
+
+# --- Recovery ladder ----------------------------------------------------------
+# Escalating interventions for connect cycles that keep failing. A plain
+# NETOPEN+dhclient retry cannot fix a wedged data call: the DHCP lease comes
+# from the modem's internal NAT and succeeds regardless of WAN state. These
+# operate on the thing that is actually broken — the modem's network attach.
+
+# L1 — PS re-attach + operator reselect. Cheapest; fixes a stale PDP/attach
+# left behind when the network detached us during a long outage.
+recover_reattach() {
+    warn "Recovery L1: PS re-attach (AT+CGATT 0/1) + operator reselect (AT+COPS 2/0)..."
+    at_query "AT+CGATT=0" 15 >/dev/null
+    sleep 2
+    at_query "AT+CGATT=1" 15 >/dev/null
+    at_query "AT+COPS=2" 15 >/dev/null
+    sleep 2
+    at_query "AT+COPS=0" 20 >/dev/null
+}
+
+# L2 — radio cycle (airplane-mode bounce). Forces a full cell reselection and
+# fresh registration; recovers a radio that stopped cell-searching.
+recover_radio_cycle() {
+    warn "Recovery L2: radio cycle (AT+CFUN=0 -> AT+CFUN=1)..."
+    at_query "AT+CFUN=0" 15 >/dev/null
+    sleep 5
+    at_query "AT+CFUN=1" 20 >/dev/null
+    sleep 5
+}
+
+# L3 — full modem reboot. The nuclear option: equivalent to power-cycling the
+# module. The modem drops off USB and re-enumerates, so we must re-wait for
+# the serial port and re-assert GNSS state afterwards.
+recover_modem_reset() {
+    err "Recovery L3: full modem reset (AT+CRESET)..."
+    at_query "AT+CRESET" 5 >/dev/null
+    wait_for_modem_reboot || return 1
+    log "Modem back after recovery reset."
+    # Modem rebooted: GNSS engine and antenna bias reverted; reassert them.
+    GNSS_BIAS_APPLIED=""
+    LAST_BIAS_CHECK=0
+    LAST_GNSS_CHECK=0
+    configure_gnss || warn "GNSS reconfiguration after recovery reset failed; continuing with LTE only."
+}
+
+# Consecutive failed connect cycles (reset by the health monitor on the first
+# successful ping). Drives the ladder: 1 plain retry, 2 re-attach, 3 radio
+# cycle, 4 modem reset — then the ladder repeats while failures continue.
+CONNECT_FAILS=0
+escalate_recovery() {
+    (( CONNECT_FAILS >= 2 )) || return 0
+    case $(( (CONNECT_FAILS - 2) % 3 )) in
+        0) recover_reattach ;;
+        1) recover_radio_cycle ;;
+        2) recover_modem_reset || warn "Modem reset recovery failed; ladder will retry." ;;
+    esac
+}
+
 teardown_interface() {
     if ip link show "$IFACE" &>/dev/null; then
         log "Tearing down $IFACE..."
         dhclient -r "$IFACE" 2>/dev/null || true
+        # dhclient -r only releases the newest lease; stale addresses from
+        # earlier cycles (or a meddling NetworkManager) linger and can become
+        # the ping source address, which the modem's NAT silently drops.
+        pkill -f "dhclient.*$IFACE" 2>/dev/null || true
+        ip addr flush dev "$IFACE" 2>/dev/null || true
         ip link set "$IFACE" down 2>/dev/null || true
     fi
     at_cmd "AT+NETCLOSE" 2
 }
 
 bring_up_interface() {
+    # The RNDIS data call is dialed by the modem firmware; make sure it is
+    # actually up modem-side before touching the host interface at all.
+    if ! wan_ip_up; then
+        log "PDP context 1 has no WAN address — activating (AT+CGACT=1,1)..."
+        at_query "AT+CGACT=1,1" 30 >/dev/null
+        if ! wan_ip_up; then
+            warn "PDP context still has no WAN address; data call is down modem-side."
+            return 1
+        fi
+    fi
+
     log "Opening modem network context (AT+NETOPEN)..."
     at_cmd "AT+NETOPEN" 3
 
+    # The netdev vanishes across modem resets/re-enumeration — wait for it.
+    local tries=0
+    while ! ip link show "$IFACE" &>/dev/null; do
+        (( tries++ ))
+        if (( tries > 15 )); then
+            err "Interface $IFACE never appeared."
+            return 1
+        fi
+        sleep 2
+    done
+
+    # Own the interface exclusively: no leftover dhclient, no stale addresses.
+    pkill -f "dhclient.*$IFACE" 2>/dev/null || true
+    ip addr flush dev "$IFACE" 2>/dev/null || true
+    ip link set "$IFACE" up 2>/dev/null || true
+
     log "Running dhclient on $IFACE..."
-    if dhclient -v "$IFACE" 2>&1 | tee -a /var/log/sim7600-lte.log; then
-        log "Interface $IFACE is up."
-        ip addr show "$IFACE" | grep "inet " | tee -a /var/log/sim7600-lte.log
-        return 0
-    else
-        err "dhclient failed on $IFACE."
+    timeout 45 dhclient -1 -v "$IFACE" 2>&1 | tee -a /var/log/sim7600-lte.log
+    local dh_status="${PIPESTATUS[0]}"
+    if [[ "$dh_status" -ne 0 ]]; then
+        err "dhclient failed on $IFACE (exit $dh_status)."
         return 1
     fi
+    log "Interface $IFACE is up."
+    ip addr show "$IFACE" | grep "inet " | tee -a /var/log/sim7600-lte.log
+
+    # dhclient installs its default route at metric 0, which would out-rank
+    # WiFi (metric 50) and steal the whole uplink. Re-install it at
+    # LTE_ROUTE_METRIC so LTE stays the fallback path.
+    local gw
+    gw=$(ip route show dev "$IFACE" default 2>/dev/null | awk '{print $3; exit}')
+    if [[ -n "$gw" ]]; then
+        ip route del default via "$gw" dev "$IFACE" 2>/dev/null || true
+        ip route replace default via "$gw" dev "$IFACE" metric "$LTE_ROUTE_METRIC" 2>/dev/null || true
+    fi
+
+    # Verify END-TO-END connectivity before declaring victory: the DHCP lease
+    # is granted by the modem's own NAT and proves nothing about the WAN.
+    local i
+    for i in 1 2 3; do
+        if ping -c 1 -W 4 -I "$IFACE" "$PING_HOST" &>/dev/null; then
+            return 0
+        fi
+        sleep 3
+    done
+    err "No end-to-end connectivity through $IFACE after DHCP — WAN side is dead."
+    return 1
 }
 
 # --- Signal wait loop --------------------------------------------------------
 wait_for_stable_signal() {
-    log "Waiting for stable LTE signal (min CSQ=$MIN_CSQ, need $SIGNAL_STABLE_COUNT consecutive reads >= $GOOD_CSQ)..."
+    log "Waiting for stable LTE signal (min CSQ=$MIN_CSQ, need $SIGNAL_STABLE_COUNT consecutive reads >= $GOOD_CSQ, registered)..."
     local stable_count=0
     local prev_csq=99
     local interval=$CSQ_INTERVAL_WEAK
+    # Wedge detection: if the modem has had no usable service (signal +
+    # registration) for DEADZONE_NUDGE_SECS, it may have stopped searching —
+    # nudge the radio, then escalate to a full modem reset.
+    local no_service_since nudge_level=0
+    no_service_since=$(date +%s)
 
     while true; do
         local csq dbm
@@ -562,18 +800,47 @@ wait_for_stable_signal() {
             write_telemetry "$csq" "dead_zone" "$interval"
 
         elif [[ "$csq" -ge "$GOOD_CSQ" ]]; then
-            (( stable_count++ ))
-            log "Good signal: CSQ=$csq ($dbm) [$stable_count/$SIGNAL_STABLE_COUNT stable] [poll=${interval}s]"
-            write_telemetry "$csq" "connecting" "$interval"
-            if [[ "$stable_count" -ge "$SIGNAL_STABLE_COUNT" ]]; then
-                log "Signal stable. Proceeding with connection."
-                return 0
+            if is_registered; then
+                no_service_since=$(date +%s)
+                nudge_level=0
+                (( stable_count++ ))
+                # We are actively trying to connect — poll fast regardless of
+                # what the adaptive backoff says, so reconnects aren't delayed
+                # by the 30s "stable" interval.
+                interval=$CSQ_INTERVAL_FAST
+                log "Good signal: CSQ=$csq ($dbm), registered (stat=$LAST_REG) [$stable_count/$SIGNAL_STABLE_COUNT stable] [poll=${interval}s]"
+                write_telemetry "$csq" "connecting" "$interval"
+                if [[ "$stable_count" -ge "$SIGNAL_STABLE_COUNT" ]]; then
+                    log "Signal stable and registered. Proceeding with connection."
+                    return 0
+                fi
+            else
+                # RF is fine but the network doesn't have us — the classic
+                # post-outage wedge. Never connect in this state; the nudge
+                # timer below is what gets us out if it persists.
+                warn "Good signal (CSQ=$csq, $dbm) but NOT registered (stat=$LAST_REG). Waiting for network attach... [poll=${interval}s]"
+                stable_count=0
+                write_telemetry "$csq" "disconnected" "$interval"
             fi
 
         else
             log "Marginal signal: CSQ=$csq ($dbm). Waiting for improvement... [poll=${interval}s]"
             stable_count=0
             write_telemetry "$csq" "disconnected" "$interval"
+        fi
+
+        local now
+        now=$(date +%s)
+        if (( now - no_service_since > DEADZONE_NUDGE_SECS )); then
+            (( nudge_level++ ))
+            warn "No usable service for ${DEADZONE_NUDGE_SECS}s (nudge #$nudge_level) — modem may be wedged."
+            if (( nudge_level == 1 )); then
+                recover_radio_cycle
+            else
+                recover_modem_reset || warn "Modem reset during dead-zone wait failed; will retry."
+            fi
+            no_service_since=$(date +%s)
+            stable_count=0
         fi
 
         prev_csq="$csq"
@@ -601,6 +868,8 @@ monitor_connection() {
 
         if ping -c 2 -W 4 -I "$IFACE" "$PING_HOST" &>/dev/null; then
             fail_count=0
+            # A verified-healthy link heals the recovery ladder.
+            CONNECT_FAILS=0
             write_telemetry "$csq" "connected" "$interval"
             log "Health OK — CSQ=$csq ($dbm) [poll=${interval}s]"
             # GNSS upkeep while the link is healthy (all self-throttle).
@@ -617,7 +886,8 @@ monitor_connection() {
                     err "Connection lost — signal too weak (CSQ=$csq). Entering dead zone wait."
                     return 2
                 else
-                    err "Connection lost — signal OK (CSQ=$csq) but ping failing. Network issue, reconnecting."
+                    update_reg
+                    err "Connection lost — signal OK (CSQ=$csq, reg=$LAST_REG) but ping failing. Network issue, reconnecting."
                     return 1
                 fi
             fi
@@ -646,12 +916,12 @@ main() {
     configure_gnss || warn "GNSS configuration failed; continuing with LTE only."
 
     while true; do
-        # 1. Wait for stable signal
+        # 1. Wait for stable signal AND network registration
         wait_for_stable_signal
 
-        # 2. Bring up interface
+        # 2. Bring up interface (verified end-to-end before it returns 0)
         if bring_up_interface; then
-            log "LTE connection established."
+            log "LTE connection established (verified end-to-end)."
 
             # Data is up: fetch/refresh XTRA assistance now (self-throttled).
             xtra_maintain
@@ -665,16 +935,28 @@ main() {
             teardown_interface
 
             if [[ "$monitor_exit" -eq 2 ]]; then
-                # Dead zone — go straight back to signal wait, no reconnect delay
+                # Dead zone — go straight back to signal wait, no reconnect
+                # delay, and no ladder escalation: losing signal is expected
+                # in the field, not a fault to punish the modem for.
                 log "Dead zone detected. Waiting for signal recovery..."
                 continue
             fi
+            (( CONNECT_FAILS++ ))
         else
             err "Failed to bring up interface."
+            teardown_interface
+            (( CONNECT_FAILS++ ))
         fi
 
-        log "Retrying in ${RECONNECT_DELAY}s..."
-        sleep "$RECONNECT_DELAY"
+        # 5. Escalate when plain retries aren't working
+        escalate_recovery
+
+        # Backed-off retry delay: 5s, 10s, ... capped at RECONNECT_DELAY_MAX.
+        local delay=$(( RECONNECT_DELAY * CONNECT_FAILS ))
+        (( delay > RECONNECT_DELAY_MAX )) && delay=$RECONNECT_DELAY_MAX
+        (( delay < RECONNECT_DELAY )) && delay=$RECONNECT_DELAY
+        log "Retrying in ${delay}s (consecutive failed cycles: $CONNECT_FAILS)..."
+        sleep "$delay"
         log "--- Reconnect attempt ---"
     done
 }

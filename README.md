@@ -343,6 +343,36 @@ GNSS engine, keeps its assistance data fresh, and brings up the LTE link. The
 (never writes AT), parses GGA/RMC/GSA/GSV into a rolling fix
 (`src/lib/nmea.ts`), and publishes it each tick.
 
+### LTE link: reconnection & recovery
+
+The modem runs in RNDIS mode (USB PID `9011`): the LTE data call is dialed by
+the modem firmware itself, and `usb0`'s DHCP lease comes from the modem's
+**internal** NAT (`192.168.225.1`) — so a lease proves nothing about the WAN.
+The daemon therefore verifies connectivity **end-to-end** (interface-bound
+ping) before declaring the link up, and recovers at the modem level when
+retries stop working:
+
+- **Registration-aware connect** — good RSSI alone never triggers a connect;
+  the modem must also be attached (`AT+CEREG`, exposed as `reg` in the
+  telemetry JSON: 1 home / 5 roaming / 2 searching).
+- **Escalating recovery ladder** on consecutive failed connect cycles: plain
+  retry → PS re-attach (`AT+CGATT` 0/1 + `AT+COPS` 2/0) → radio cycle
+  (`AT+CFUN` 0/1) → full modem reset (`AT+CRESET`), then repeats. A healthy
+  ping heals the ladder. Losing signal (dead zone) is *not* punished — the
+  ladder only escalates when the network is reachable but the link won't come
+  back.
+- **Wedge detection while waiting for signal**: no usable service for 10 min
+  (`SIM7600_DEADZONE_NUDGE_SECS`) nudges the radio, then resets the modem —
+  SIM7600 firmware can stop cell-searching entirely after a prolonged outage.
+- **Exclusive interface ownership** — `usb0` must be unmanaged by
+  NetworkManager (`modem/99-sim7600-unmanaged.conf` →
+  `/etc/NetworkManager/conf.d/`). Otherwise NM races the daemon's dhclient
+  for the modem's DHCP lease and leaves stale duplicate addresses behind
+  after an outage; traffic then sources from an address the modem's NAT no
+  longer maps, and the link never recovers until a reboot wipes host state.
+  The daemon also flushes stale addresses around every cycle and re-installs
+  the default route at metric 100 so WiFi (metric 50) keeps uplink priority.
+
 ### Why TTFF is fast (assistance, not luck)
 
 A bare standalone GNSS start must demodulate ephemeris from the satellites at

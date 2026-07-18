@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "../lib/atomicWrite.js";
 import { runtimeHome } from "./runtime.js";
+import { parseImuMount, type ImuMount } from "../lib/orientation.js";
 import type { RunMode } from "../agent/telemetry.js";
 
 export interface AgentSettings {
@@ -30,6 +31,13 @@ export interface AgentSettings {
    * sim7600-lte daemon.
    */
   gnssAntBias?: boolean;
+  /**
+   * IMU mounting correction (how the sensor is rotated relative to the
+   * vehicle). Set from the web device settings page (retained MQTT config ->
+   * worker); applied LIVE by the IMU collector, which re-reads this file each
+   * tick — no restart needed. Absent = publish sensor-frame euler as-is.
+   */
+  imuMount?: ImuMount;
 }
 
 export function settingsPath(): string {
@@ -48,6 +56,8 @@ export function loadSettings(path: string = settingsPath()): AgentSettings {
       if (typeof mediaEnabled === "boolean") out.mediaEnabled = mediaEnabled;
       const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
       if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
+      const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
+      if (imuMount) out.imuMount = imuMount;
       return out;
     }
   } catch {

@@ -4,16 +4,20 @@
  * device setting changes; the worker receives it (on change, and re-delivered
  * on every connect because it is retained) and persists it into settings.json,
  * where the consumer picks it up — e.g. the sim7600-lte daemon polls the file
- * and applies `gnssAntBias` live.
+ * and applies `gnssAntBias` live, and the IMU collector re-reads `imuMount`
+ * each tick.
  *
  * Payload shape (full config object, not a delta — idempotent by design):
- *   { "v": 1, "gnssAntBias": boolean, "ts": <epoch ms> }
+ *   { "v": 1, "gnssAntBias": boolean,
+ *     "imuMount": { enabled, rollDeg, pitchDeg, yawDeg }, "ts": <epoch ms> }
  * Future cloud-configurable knobs slot in as additional keys.
  */
 import { loadSettings, saveSettings, settingsPath } from "../daemon/settings.js";
+import { parseImuMount, type ImuMount } from "../lib/orientation.js";
 
 export interface CloudConfig {
   gnssAntBias?: boolean;
+  imuMount?: ImuMount;
 }
 
 /**
@@ -33,7 +37,19 @@ export function parseCloudConfig(payload: Buffer | string): CloudConfig | null {
   const out: CloudConfig = {};
   const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
   if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
+  const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
+  if (imuMount) out.imuMount = imuMount;
   return out;
+}
+
+function imuMountEqual(a: ImuMount | undefined, b: ImuMount | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return (
+    a.enabled === b.enabled &&
+    a.rollDeg === b.rollDeg &&
+    a.pitchDeg === b.pitchDeg &&
+    a.yawDeg === b.yawDeg
+  );
 }
 
 /**
@@ -50,9 +66,16 @@ export function applyCloudConfig(
   path: string = settingsPath(),
 ): { changed: boolean } {
   const current = loadSettings(path);
-  if (config.gnssAntBias === undefined || current.gnssAntBias === config.gnssAntBias) {
-    return { changed: false };
+  const next: AgentSettingsPatch = {};
+  if (config.gnssAntBias !== undefined && config.gnssAntBias !== current.gnssAntBias) {
+    next.gnssAntBias = config.gnssAntBias;
   }
-  saveSettings({ ...current, gnssAntBias: config.gnssAntBias }, path);
+  if (config.imuMount !== undefined && !imuMountEqual(config.imuMount, current.imuMount)) {
+    next.imuMount = config.imuMount;
+  }
+  if (Object.keys(next).length === 0) return { changed: false };
+  saveSettings({ ...current, ...next }, path);
   return { changed: true };
 }
+
+type AgentSettingsPatch = { gnssAntBias?: boolean; imuMount?: ImuMount };

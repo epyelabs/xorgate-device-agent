@@ -1,6 +1,7 @@
 import type { Collector } from "./index.js";
 import { detectImu, streamImuData, type ImuSample } from "../../hardware/imu.js";
-import { quatToEuler } from "../../lib/orientation.js";
+import { applyMountCorrection, quatToEuler } from "../../lib/orientation.js";
+import { loadSettings } from "../../daemon/settings.js";
 import { toHexAddr } from "../../lib/format.js";
 import type { StreamHandle } from "../../lib/exec.js";
 
@@ -87,7 +88,17 @@ export function createImuCollector(): Collector {
       if (!latest) return {};
 
       const { quat, linaccel } = latest;
-      const euler = quatToEuler(quat);
+      // Mount correction is applied to the DERIVED euler only: the quaternion
+      // stays the sensor's raw output (the ground truth a future re-config can
+      // always re-derive from), while euler becomes vehicle-frame so every
+      // consumer — live view, DB, workflows — sees roll/pitch/yaw of the
+      // vehicle, not of however the box happens to be bolted in. Re-read from
+      // settings.json each tick (1 Hz, trivially cheap) so a cloud config
+      // change applies live, same as the sim7600 daemon's poll.
+      const mount = loadSettings().imuMount;
+      const euler = quatToEuler(
+        mount?.enabled ? applyMountCorrection(quat, mount) : quat,
+      );
       return {
         quat_r: { value: round(quat.r, 4) },
         quat_i: { value: round(quat.i, 4) },

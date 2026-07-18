@@ -30,6 +30,14 @@ describe("parseCloudConfig", () => {
   it("drops known keys with the wrong type", () => {
     expect(parseCloudConfig(JSON.stringify({ v: 1, gnssAntBias: "on" }))).toEqual({});
   });
+
+  it("parses an imuMount object and drops malformed ones", () => {
+    const m = { enabled: true, rollDeg: 90, pitchDeg: 0, yawDeg: 180 };
+    expect(parseCloudConfig(JSON.stringify({ v: 1, imuMount: m }))).toEqual({ imuMount: m });
+    expect(
+      parseCloudConfig(JSON.stringify({ v: 1, imuMount: { enabled: true, rollDeg: "90" } })),
+    ).toEqual({});
+  });
 });
 
 describe("applyCloudConfig", () => {
@@ -57,5 +65,14 @@ describe("applyCloudConfig", () => {
     writeFileSync(settingsPath(), "not json");
     expect(applyCloudConfig({ gnssAntBias: true })).toEqual({ changed: true });
     expect(loadSettings()).toEqual({ gnssAntBias: true });
+  });
+
+  it("persists imuMount and no-ops on an identical re-delivery", () => {
+    const m = { enabled: true, rollDeg: 0, pitchDeg: 0, yawDeg: 90 };
+    expect(applyCloudConfig({ imuMount: m })).toEqual({ changed: true });
+    expect(loadSettings().imuMount).toEqual(m);
+    expect(applyCloudConfig({ imuMount: { ...m } })).toEqual({ changed: false });
+    expect(applyCloudConfig({ imuMount: { ...m, yawDeg: 180 } })).toEqual({ changed: true });
+    expect(loadSettings().imuMount?.yawDeg).toBe(180);
   });
 });

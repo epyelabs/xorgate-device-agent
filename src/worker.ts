@@ -136,8 +136,9 @@ function handleConfigMessage(payload: Buffer): void {
   try {
     const { changed } = applyCloudConfig(parsed);
     if (changed) {
-      console.log(`[agent] cloud config applied: gnssAntBias=${parsed.gnssAntBias}`);
-      store.event("info", `cloud config applied: gnssAntBias=${parsed.gnssAntBias}`, now);
+      const summary = JSON.stringify(parsed);
+      console.log(`[agent] cloud config applied: ${summary}`);
+      store.event("info", `cloud config applied: ${summary}`, now);
       store.flush(now, true);
     }
   } catch (err) {

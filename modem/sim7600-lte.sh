@@ -63,6 +63,13 @@ MODEM_BOOT_WAIT=8            # initial wait for modem USB enumeration
 #   fail 4: modem reset (AT+CRESET) — then the ladder repeats.
 DEADZONE_NUDGE_SECS="${SIM7600_DEADZONE_NUDGE_SECS:-600}"  # no service this long -> nudge radio
 RECONNECT_DELAY_MAX=60       # cap for backed-off reconnect delay
+# Power-aware cooldowns: a radio cycle and especially a modem reset force a
+# full re-registration, during which the SIM7600 pulls TX bursts up to ~2A.
+# On a marginal vehicle supply, clustering those events risks browning out the
+# host. These floors bound how often each rung may fire; on cooldown the rung
+# is skipped (logged) and the cheaper retries continue.
+RADIO_CYCLE_COOLDOWN="${SIM7600_RADIO_CYCLE_COOLDOWN:-300}"   # min secs between AT+CFUN cycles
+MODEM_RESET_COOLDOWN="${SIM7600_MODEM_RESET_COOLDOWN:-1800}"  # min secs between AT+CRESET
 
 # Default-route metric for the LTE uplink. Must stay ABOVE the WiFi metric
 # (50, see 10-uplink-priority.conf) so WiFi wins while associated; dhclient
@@ -657,7 +664,15 @@ recover_reattach() {
 
 # L2 — radio cycle (airplane-mode bounce). Forces a full cell reselection and
 # fresh registration; recovers a radio that stopped cell-searching.
+LAST_RADIO_CYCLE=0
 recover_radio_cycle() {
+    local now
+    now=$(date +%s)
+    if (( now - LAST_RADIO_CYCLE < RADIO_CYCLE_COOLDOWN )); then
+        warn "Recovery L2 skipped — radio cycle on cooldown ($(( RADIO_CYCLE_COOLDOWN - (now - LAST_RADIO_CYCLE) ))s left; re-registration TX bursts are power-expensive)."
+        return 0
+    fi
+    LAST_RADIO_CYCLE=$now
     warn "Recovery L2: radio cycle (AT+CFUN=0 -> AT+CFUN=1)..."
     at_query "AT+CFUN=0" 15 >/dev/null
     sleep 5
@@ -668,7 +683,15 @@ recover_radio_cycle() {
 # L3 — full modem reboot. The nuclear option: equivalent to power-cycling the
 # module. The modem drops off USB and re-enumerates, so we must re-wait for
 # the serial port and re-assert GNSS state afterwards.
+LAST_MODEM_RESET=0
 recover_modem_reset() {
+    local now
+    now=$(date +%s)
+    if (( now - LAST_MODEM_RESET < MODEM_RESET_COOLDOWN )); then
+        warn "Recovery L3 skipped — modem reset on cooldown ($(( MODEM_RESET_COOLDOWN - (now - LAST_MODEM_RESET) ))s left; a reset's boot + attach draws ~2A bursts)."
+        return 0
+    fi
+    LAST_MODEM_RESET=$now
     err "Recovery L3: full modem reset (AT+CRESET)..."
     at_query "AT+CRESET" 5 >/dev/null
     wait_for_modem_reboot || return 1

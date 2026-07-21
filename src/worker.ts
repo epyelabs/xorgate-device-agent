@@ -23,7 +23,10 @@ import {
 import { connect } from "./agent/mqtt.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector, type GroupSample } from "./agent/collectors/index.js";
-import { RecordingManager } from "./recording/manager.js";
+import { loadManifest } from "./media/manifest.js";
+import { IotCredentialsProvider } from "./recording/iot-creds.js";
+import { s3Put } from "./recording/s3-put.js";
+import { RecordingManager, type RecordingUploadOptions } from "./recording/manager.js";
 import type { StateSnapshot, TelemetryPayload, TelemetryReading } from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
 import { ensureHome, workerPath } from "./daemon/runtime.js";
@@ -117,10 +120,45 @@ const initial: StateSnapshot = {
 const store = new StateStore(initial);
 store.flush(now0, true); // publish "connecting" immediately for status/monitor
 
+/**
+ * Segment-upload plumbing (offline recording plan, Phase 2). The kvs.json
+ * manifest supplies the IoT credential endpoint + role alias (already used by
+ * the KVS runtime) and — from Phase 2 provisioning — the upload bucket;
+ * XORGATE_UPLOAD_BUCKET overrides for dev/test devices. Missing pieces mean
+ * uploads are simply off: recording still works, segments accumulate under the
+ * retention quota.
+ */
+function buildUploadOptions(): RecordingUploadOptions | undefined {
+  if (config.offline) return undefined;
+  const manifest = loadManifest(config.media.manifestPath);
+  const bucket = process.env.XORGATE_UPLOAD_BUCKET || manifest?.uploadBucket;
+  if (!manifest || !bucket) {
+    console.log(
+      `[agent] segment upload disabled (${!manifest ? "no kvs.json manifest" : "no upload bucket configured"})`,
+    );
+    return undefined;
+  }
+  const creds = new IotCredentialsProvider({
+    credentialEndpoint: manifest.credentialEndpoint,
+    roleAlias: manifest.roleAlias,
+    thingName: config.deviceId,
+    certPath: config.certPath,
+    keyPath: config.keyPath,
+  });
+  return {
+    put: async (key, body, contentType, signal) => {
+      const credentials = await creds.get();
+      await s3Put({ region: manifest.region, bucket, key, body, contentType, credentials, signal });
+    },
+    isOnline: () => store.snapshot().connection === "connected",
+  };
+}
+
 // On-device recording (offline telemetry plan, Phase 1). Runs independently of
 // MQTT connectivity — its own sampling interval, applied live from settings.json.
 const recording = new RecordingManager({
   deviceId: config.deviceId,
+  upload: buildUploadOptions(),
   sampleGroups: () => source.sampleGroups(),
   onStatus: (status) => {
     store.setRecording(status);
@@ -317,6 +355,7 @@ client.on("connect", () => {
   store.setConnection("connected", now);
   store.event("info", `connected to ${config.endpoint}`, now);
   store.flush(now, true);
+  recording.notifyConnectivity(true); // resume any pending segment uploads
 
   client.publish(
     config.statusTopic,
@@ -356,6 +395,10 @@ client.on("connect", () => {
         seq: seq++,
         metrics,
         media,
+        // Phase 2: recording/backlog status rides the live payload (cloud
+        // schemas carry the matching optional block; D4 keys the live/batch
+        // authority split off recording.enabled).
+        recording: recording.status(),
       };
       store.setLatest(payload);
       client.publish(config.telemetryTopic, JSON.stringify(payload), { qos: 0 }, (err) => {
@@ -395,6 +438,7 @@ client.on("close", () => {
   store.setConnection("closed", now);
   store.event("warn", "connection closed", now);
   store.flush(now, true);
+  recording.notifyConnectivity(false); // abort any in-flight segment upload
 });
 
 setInterval(

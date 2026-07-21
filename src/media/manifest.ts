@@ -26,6 +26,13 @@ export interface KvsManifest {
   credentialEndpoint: string;
   roleAlias: string;
   channels: KvsChannel[];
+  /**
+   * S3 bucket recording-segment uploads PUT into (offline recording plan,
+   * Phase 2). Optional: pre-Phase-2 manifests don't carry it; without it the
+   * agent's uploader stays disabled. Written by the install script from the
+   * claim response; XORGATE_UPLOAD_BUCKET env overrides for dev/test.
+   */
+  uploadBucket?: string;
 }
 
 function nonEmptyString(v: unknown): v is string {
@@ -71,5 +78,6 @@ export function loadManifest(path: string): KvsManifest | null {
     credentialEndpoint: o.credentialEndpoint,
     roleAlias: o.roleAlias,
     channels,
+    ...(nonEmptyString(o.uploadBucket) ? { uploadBucket: o.uploadBucket } : {}),
   };
 }

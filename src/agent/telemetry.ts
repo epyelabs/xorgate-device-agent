@@ -81,6 +81,13 @@ export interface TelemetryPayload {
   seq: number;
   metrics: Partial<TelemetryMetrics>;
   media: TelemetryMedia;
+  /**
+   * On-device recording status (offline recording plan, Phase 2). Optional so
+   * sim/offline payload fixtures stay valid; the worker includes it every tick.
+   * The cloud schemas (backend src/schemas/telemetry.ts, frontend
+   * src/lib/schemas.ts) mirror this shape — change all three together.
+   */
+  recording?: RecordingStatus;
 }
 
 /** One reading produced per tick by the simulator or a real collector. */
@@ -90,11 +97,10 @@ export interface TelemetryReading {
 }
 
 /**
- * On-device recording status (offline recording plan, Phase 1). Lives in
- * state.json only for now: the cloud/frontend telemetry schemas are strict and
- * the matching `recording` payload block lands cloud-side in Phase 2 — do NOT
- * add this to TelemetryPayload until the backend zod change is deployed.
- * `uploading`/`lastUploadAt` are provisioned for Phase 2's uploader.
+ * On-device recording status (offline recording plan). Phase 1 surfaced it in
+ * state.json; Phase 2 also publishes it as the payload's `recording` block
+ * (deploy ordering: land the cloud schema change before an agent build that
+ * publishes it reaches a shared environment).
  */
 export interface RecordingStatus {
   enabled: boolean;

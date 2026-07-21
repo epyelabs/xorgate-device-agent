@@ -22,7 +22,8 @@ import {
 } from "./agent/commands.js";
 import { connect } from "./agent/mqtt.js";
 import { createSimulator } from "./agent/simulator.js";
-import { createCollector } from "./agent/collectors/index.js";
+import { createCollector, type GroupSample } from "./agent/collectors/index.js";
+import { RecordingManager } from "./recording/manager.js";
 import type { StateSnapshot, TelemetryPayload, TelemetryReading } from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
 import { ensureHome, workerPath } from "./daemon/runtime.js";
@@ -41,7 +42,11 @@ ensureHome();
 //   - lte    — reads the connection-manager daemon's telemetry JSON, {} if absent.
 // Wiring the exact set from per-device io_capabilities (instead of enabling all)
 // is a later step; enabling all is safe because each collector self-gates.
-const source: { read: () => Promise<TelemetryReading>; stop?: () => void } =
+const source: {
+  read: () => Promise<TelemetryReading>;
+  sampleGroups: () => Promise<Record<string, GroupSample>>;
+  stop?: () => void;
+} =
   config.mode === "real"
     ? createCollector(
         { sensors: { imu: true }, system: true, comm: { gps: true, signal: true } },
@@ -49,7 +54,21 @@ const source: { read: () => Promise<TelemetryReading>; stop?: () => void } =
       )
     : (() => {
         const next = createSimulator();
-        return { read: async () => next() };
+        return {
+          read: async () => next(),
+          // Recorder view of the simulator: every group counts as freshly
+          // updated each call; the recorder's native-cadence caps still hold
+          // non-IMU groups to ~1 Hz, so sim recordings look like real ones.
+          sampleGroups: async () => {
+            const { metrics } = next();
+            const mono = process.hrtime.bigint();
+            const out: Record<string, GroupSample> = {};
+            for (const [group, fields] of Object.entries(metrics)) {
+              out[group] = { fields: fields as Record<string, unknown>, updatedMono: mono };
+            }
+            return out;
+          },
+        };
       })();
 
 const now0 = Date.now();
@@ -98,6 +117,24 @@ const initial: StateSnapshot = {
 const store = new StateStore(initial);
 store.flush(now0, true); // publish "connecting" immediately for status/monitor
 
+// On-device recording (offline telemetry plan, Phase 1). Runs independently of
+// MQTT connectivity — its own sampling interval, applied live from settings.json.
+const recording = new RecordingManager({
+  deviceId: config.deviceId,
+  sampleGroups: () => source.sampleGroups(),
+  onStatus: (status) => {
+    store.setRecording(status);
+    store.flush(Date.now());
+  },
+  onEvent: (level, msg) => {
+    const t = Date.now();
+    console.log(`[agent] ${msg}`);
+    store.event(level, msg, t);
+    store.flush(t, true);
+  },
+});
+recording.start();
+
 let seq = 0;
 let shuttingDown = false;
 let timer: NodeJS.Timeout | null = null;
@@ -135,6 +172,9 @@ function handleConfigMessage(payload: Buffer): void {
   }
   try {
     const { changed } = applyCloudConfig(parsed);
+    // Cloud config can (from Phase 5) carry the recording namespace; re-reading
+    // settings here is how a cloud change applies without an agent restart.
+    recording.reapply();
     if (changed) {
       const summary = JSON.stringify(parsed);
       console.log(`[agent] cloud config applied: ${summary}`);
@@ -369,6 +409,10 @@ function shutdown(sig: string): void {
   console.log(`\n[agent] shutting down (${sig})…`);
   if (timer) clearInterval(timer);
   clearInterval(heartbeat);
+  // Finalize the active recording segment (sync) so a clean stop never leaves
+  // an orphan .jsonl for the next boot's crash recovery to mop up.
+  recording.stop();
+  store.setRecording(recording.status());
   // SIGINT any KVS master subprocesses so they deregister from their channels
   // cleanly instead of being orphaned/force-killed.
   source.stop?.();

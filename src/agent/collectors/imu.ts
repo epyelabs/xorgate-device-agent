@@ -19,6 +19,7 @@ export function createImuCollector(): Collector {
   let started = false;
   let stream: StreamHandle | null = null;
   let latest: ImuSample | null = null;
+  let latestMono = 0n;
   let everSampled = false;
   let warned = false;
 
@@ -54,6 +55,7 @@ export function createImuCollector(): Collector {
     stream = streamImuData(detect.imuAddress, {
       onSample: (s) => {
         latest = s;
+        latestMono = process.hrtime.bigint();
         everSampled = true;
       },
       onError: (msg) => console.error(`[imu] ${msg}`),
@@ -76,6 +78,33 @@ export function createImuCollector(): Collector {
     });
   }
 
+  function mapLatest(sample: ImuSample): Record<string, unknown> {
+    const { quat, linaccel } = sample;
+    // Mount correction is applied to the DERIVED euler only: the quaternion
+    // stays the sensor's raw output (the ground truth a future re-config can
+    // always re-derive from), while euler becomes vehicle-frame so every
+    // consumer — live view, DB, workflows — sees roll/pitch/yaw of the
+    // vehicle, not of however the box happens to be bolted in. Re-read from
+    // settings.json each tick (trivially cheap) so a cloud config change
+    // applies live, same as the sim7600 daemon's poll.
+    const mount = loadSettings().imuMount;
+    const euler = quatToEuler(
+      mount?.enabled ? applyMountCorrection(quat, mount) : quat,
+    );
+    return {
+      quat_r: { value: round(quat.r, 4) },
+      quat_i: { value: round(quat.i, 4) },
+      quat_j: { value: round(quat.j, 4) },
+      quat_k: { value: round(quat.k, 4) },
+      euler_roll: { value: round(euler.roll, 1), unit: "°" },
+      euler_pitch: { value: round(euler.pitch, 1), unit: "°" },
+      euler_yaw: { value: round(euler.yaw, 1), unit: "°" },
+      accel_x: { value: round(linaccel.x, 3), unit: "m/s^2" },
+      accel_y: { value: round(linaccel.y, 3), unit: "m/s^2" },
+      accel_z: { value: round(linaccel.z, 3), unit: "m/s^2" },
+    };
+  }
+
   return {
     group: "imu",
     async read() {
@@ -86,31 +115,19 @@ export function createImuCollector(): Collector {
         return {};
       }
       if (!latest) return {};
-
-      const { quat, linaccel } = latest;
-      // Mount correction is applied to the DERIVED euler only: the quaternion
-      // stays the sensor's raw output (the ground truth a future re-config can
-      // always re-derive from), while euler becomes vehicle-frame so every
-      // consumer — live view, DB, workflows — sees roll/pitch/yaw of the
-      // vehicle, not of however the box happens to be bolted in. Re-read from
-      // settings.json each tick (1 Hz, trivially cheap) so a cloud config
-      // change applies live, same as the sim7600 daemon's poll.
-      const mount = loadSettings().imuMount;
-      const euler = quatToEuler(
-        mount?.enabled ? applyMountCorrection(quat, mount) : quat,
-      );
-      return {
-        quat_r: { value: round(quat.r, 4) },
-        quat_i: { value: round(quat.i, 4) },
-        quat_j: { value: round(quat.j, 4) },
-        quat_k: { value: round(quat.k, 4) },
-        euler_roll: { value: round(euler.roll, 1), unit: "°" },
-        euler_pitch: { value: round(euler.pitch, 1), unit: "°" },
-        euler_yaw: { value: round(euler.yaw, 1), unit: "°" },
-        accel_x: { value: round(linaccel.x, 3), unit: "m/s^2" },
-        accel_y: { value: round(linaccel.y, 3), unit: "m/s^2" },
-        accel_z: { value: round(linaccel.z, 3), unit: "m/s^2" },
-      };
+      return mapLatest(latest);
+    },
+    // Recorder view: same lazy start (recording may run with the live loop
+    // idle, e.g. booted offline), same mapping, plus the freshness stamp the
+    // recorder gates on. The BNO085 streams ~20 Hz, so this is the one group
+    // that genuinely refreshes faster than the 1 Hz live loop.
+    async sample() {
+      if (!started) {
+        void start();
+        return null;
+      }
+      if (!latest) return null;
+      return { fields: mapLatest(latest), updatedMono: latestMono };
     },
   };
 }

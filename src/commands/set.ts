@@ -12,8 +12,25 @@
  * `wifi` (<on|off>) is different: it toggles the OS WiFi device at runtime via
  * NetworkManager (not settings.json, no daemon restart). It refuses to cut the
  * uplink you're connected over unless `--force` is given.
+ *
+ * `recording.*` dotted keys (offline recording plan D7) also need no restart:
+ * the worker's recording manager polls settings.json and applies changes live
+ * (telemetry recorder start/stop, retention limits). Supported paths:
+ *   recording.telemetry.enabled <on|off>     recording.telemetry.rateHz <1-20>
+ *   recording.video.enabled <on|off>         recording.video.preset <name>
+ *   recording.video.segmentSeconds <10-600>  recording.upload.mode <auto|off>
+ *   recording.retention.maxBytes <n>         recording.retention.minFreeBytes <n>
+ * (video/upload keys are plumbing for Phases 2–3 — persisted but inert today.)
  */
-import { loadSettings, saveSettings, type AgentSettings } from "../daemon/settings.js";
+import {
+  loadSettings,
+  parseRecordingSettings,
+  saveSettings,
+  RECORDING_RATE_HZ_MAX,
+  RECORDING_RATE_HZ_MIN,
+  type AgentSettings,
+  type RecordingSettings,
+} from "../daemon/settings.js";
 import { inspect, restart } from "../daemon/manager.js";
 import { setWifi } from "../daemon/radios.js";
 import {
@@ -24,7 +41,84 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, wifi <on|off> [--force])";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, wifi <on|off> [--force], recording.<group>.<field> <value>)";
+
+/** Parse an on/off/true/false/1/0 CLI value; undefined when unrecognizable. */
+function parseBoolValue(v: string | undefined): boolean | undefined {
+  if (v === "on" || v === "true" || v === "1") return true;
+  if (v === "off" || v === "false" || v === "0") return false;
+  return undefined;
+}
+
+/**
+ * `xorgate set recording.<section>.<field> <value>` — validate one dotted path,
+ * merge it into the persisted `recording` namespace, and let the running
+ * worker's settings poll apply it live (~5 s; no restart).
+ */
+function setRecordingCommand(key: string, value: string | undefined): void {
+  const parts = key.split(".");
+  const [, section, field] = parts;
+  if (parts.length !== 3 || !section || !field) {
+    console.error(
+      "recording keys are dotted paths, e.g. xorgate set recording.telemetry.enabled on",
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // Build a single-path patch, then push it through the same validator that
+  // loadSettings uses so CLI writes can never persist something the daemon
+  // would drop on read.
+  let raw: unknown;
+  const bool = parseBoolValue(value);
+  const num = value !== undefined && value !== "" ? Number(value) : NaN;
+  if (field === "enabled") {
+    if (bool === undefined) {
+      console.error(`${key} must be on|off, got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    raw = bool;
+  } else if (field === "rateHz") {
+    if (!Number.isFinite(num) || num < RECORDING_RATE_HZ_MIN || num > RECORDING_RATE_HZ_MAX) {
+      console.error(
+        `${key} must be a number in [${RECORDING_RATE_HZ_MIN}, ${RECORDING_RATE_HZ_MAX}], got '${value ?? ""}'`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    raw = num;
+  } else if (field === "segmentSeconds" || field === "maxBytes" || field === "minFreeBytes") {
+    if (!Number.isFinite(num) || num < 0) {
+      console.error(`${key} must be a non-negative number, got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    raw = num;
+  } else {
+    raw = value; // string fields (preset, mode) — validated below
+  }
+
+  const patch = parseRecordingSettings({ [section]: { [field]: raw } });
+  const patchedSection = patch?.[section as keyof RecordingSettings] as
+    | Record<string, unknown>
+    | undefined;
+  if (!patchedSection || !(field in patchedSection)) {
+    console.error(`unknown or invalid recording setting '${key}' = '${value ?? ""}'`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const settings: AgentSettings = { ...loadSettings() };
+  const current = settings.recording ?? {};
+  settings.recording = {
+    ...current,
+    [section]: { ...(current[section as keyof RecordingSettings] as object | undefined), ...patchedSection },
+  };
+  saveSettings(settings);
+  console.log(`✓ ${key} = ${JSON.stringify(patchedSection[field])} (persisted to settings.json)`);
+  console.log("  the agent applies recording changes live within ~5 s (no restart needed)");
+}
 
 export async function setCommand(rest: string[]): Promise<void> {
   const noRestart = rest.includes("--no-restart");
@@ -42,6 +136,12 @@ export async function setCommand(rest: string[]): Promise<void> {
   // WiFi is an OS-level runtime toggle: handle it before the settings.json path.
   if (key === "wifi") {
     await setWifiCommand(value, force);
+    return;
+  }
+
+  // Recording keys are applied live by the worker's settings poll — no restart.
+  if (key.startsWith("recording.")) {
+    setRecordingCommand(key, value);
     return;
   }
 
@@ -81,7 +181,9 @@ export async function setCommand(rest: string[]): Promise<void> {
     console.log("  the modem daemon applies it live within ~a minute (journalctl -u sim7600-lte)");
     return;
   } else {
-    console.error(`unknown setting '${key}' (supported: mode, media, gps-antenna, wifi)`);
+    console.error(
+      `unknown setting '${key}' (supported: mode, media, gps-antenna, wifi, recording.*)`,
+    );
     process.exitCode = 1;
     return;
   }

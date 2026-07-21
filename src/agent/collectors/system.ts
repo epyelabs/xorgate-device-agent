@@ -24,25 +24,51 @@ export function createSystemCollector(): Collector {
   // behavior as the IMU collector returning {}).
   let prev: CpuSample = sampleCpu();
 
+  async function compute(prevSample: CpuSample): Promise<{
+    fields: Record<string, unknown>;
+    curr: CpuSample;
+  }> {
+    const curr = sampleCpu();
+    const { overall } = computeCpuLoad(prevSample, curr);
+
+    const fields: Record<string, unknown> = {
+      cpu_usage: { value: round(overall, 1), unit: "%" },
+      ram_usage: { value: round(readMemory().usedPct, 1), unit: "%" },
+    };
+
+    const temp = await readCpuTemp();
+    if (temp !== null) fields.cpu_temp = { value: round(temp, 1), unit: "°C" };
+
+    const disk = await readDisk("/");
+    if (disk !== null) fields.disk_usage = { value: round(disk.usedPct, 1), unit: "%" };
+
+    return { fields, curr };
+  }
+
+  // Recorder-side cache with its OWN CpuSample chain: sharing `prev` with
+  // read() would split the CPU-delta window between two consumers and make
+  // both readings noise. Recomputes at most once per second (native cadence),
+  // so a 10–20 Hz recorder costs one extra df/meminfo read per second.
+  let recPrev: CpuSample | null = null;
+  let recCache: { fields: Record<string, unknown>; updatedMono: bigint } | null = null;
+  let recLastAt = 0;
+
   return {
     group: "system",
     async read() {
-      const curr = sampleCpu();
-      const { overall } = computeCpuLoad(prev, curr);
+      const { fields, curr } = await compute(prev);
       prev = curr;
-
-      const fields: Record<string, unknown> = {
-        cpu_usage: { value: round(overall, 1), unit: "%" },
-        ram_usage: { value: round(readMemory().usedPct, 1), unit: "%" },
-      };
-
-      const temp = await readCpuTemp();
-      if (temp !== null) fields.cpu_temp = { value: round(temp, 1), unit: "°C" };
-
-      const disk = await readDisk("/");
-      if (disk !== null) fields.disk_usage = { value: round(disk.usedPct, 1), unit: "%" };
-
       return fields;
+    },
+    async sample() {
+      const now = Date.now();
+      if (now - recLastAt >= 1000) {
+        recLastAt = now;
+        const { fields, curr } = await compute(recPrev ?? sampleCpu());
+        recPrev = curr;
+        recCache = { fields, updatedMono: process.hrtime.bigint() };
+      }
+      return recCache;
     },
   };
 }

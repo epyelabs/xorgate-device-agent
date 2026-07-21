@@ -89,6 +89,23 @@ export interface TelemetryReading {
   media: TelemetryMedia;
 }
 
+/**
+ * On-device recording status (offline recording plan, Phase 1). Lives in
+ * state.json only for now: the cloud/frontend telemetry schemas are strict and
+ * the matching `recording` payload block lands cloud-side in Phase 2 — do NOT
+ * add this to TelemetryPayload until the backend zod change is deployed.
+ * `uploading`/`lastUploadAt` are provisioned for Phase 2's uploader.
+ */
+export interface RecordingStatus {
+  enabled: boolean;
+  sessionId: string | null;
+  backlogBytes: number;
+  backlogSegments: number;
+  droppedSegments: number;
+  uploading: boolean;
+  lastUploadAt: number | null;
+}
+
 export type RunMode = "sim" | "real";
 
 export type ConnectionState =
@@ -135,4 +152,6 @@ export interface StateSnapshot {
   lastError: string | null;
   latest: TelemetryPayload | null;
   recentEvents: ActivityEvent[];
+  /** On-device recording status; absent on agents predating the recording feature. */
+  recording?: RecordingStatus;
 }

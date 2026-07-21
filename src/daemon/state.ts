@@ -9,6 +9,7 @@ import { atomicWriteJson } from "../lib/atomicWrite.js";
 import type {
   ActivityEvent,
   ConnectionState,
+  RecordingStatus,
   StateSnapshot,
   TelemetryPayload,
 } from "../agent/telemetry.js";
@@ -83,6 +84,10 @@ export class StateStore {
       this.snap.connection = connection;
       this.snap.connectionSince = now;
     }
+  }
+
+  setRecording(recording: RecordingStatus): void {
+    this.snap.recording = recording;
   }
 
   setLatest(payload: TelemetryPayload): void {

@@ -5,7 +5,7 @@
 import { accessSync, constants } from "node:fs";
 import { inspect, type DaemonStatus } from "../daemon/manager.js";
 import { logPath, runtimeHome } from "../daemon/runtime.js";
-import { ageLabel, uptimeLabel } from "../lib/format.js";
+import { ageLabel, formatBytes, uptimeLabel } from "../lib/format.js";
 
 const useColor = process.stdout.isTTY && process.env.NO_COLOR === undefined;
 const c = (code: string, s: string): string => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -83,6 +83,24 @@ function print(st: DaemonStatus, now: number): void {
     console.log(
       `  telemetry  seq ${state.seq}  published ${state.published}  errors ${state.publishErrors}  last ${last}  ${fresh}`,
     );
+    if (state.recording) {
+      const r = state.recording;
+      if (r.enabled) {
+        const session = r.sessionId ? `session ${r.sessionId.slice(0, 8)}…` : "";
+        const backlog = `backlog ${r.backlogSegments} seg / ${formatBytes(r.backlogBytes)}`;
+        const dropped = r.droppedSegments > 0 ? `  ${yellow(`dropped ${r.droppedSegments}`)}` : "";
+        console.log(`  recording  ${green("on")}   ${session}  ${backlog}${dropped}`);
+      } else if (r.backlogSegments > 0 || r.droppedSegments > 0) {
+        // Off but with a leftover backlog (awaiting Phase 2 upload) — still worth showing.
+        console.log(
+          `  recording  off  ${gray(
+            `backlog ${r.backlogSegments} seg / ${formatBytes(r.backlogBytes)}${
+              r.droppedSegments > 0 ? `, dropped ${r.droppedSegments}` : ""
+            }`,
+          )}`,
+        );
+      }
+    }
     if (state.lastError) console.log(`  last error ${yellow(state.lastError)}`);
   } else {
     console.log(gray("  (no state snapshot yet)"));

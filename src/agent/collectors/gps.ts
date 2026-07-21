@@ -43,6 +43,7 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
   let started = false;
   let latest: GpsFix | null = null;
   let lastFixAt = 0;
+  let lastFixMono = 0n;
   let warned = false;
   let handle: GpsStreamHandle | null = null;
   let openedAt = 0;
@@ -60,6 +61,7 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
         if (myGen !== gen) return;
         latest = fix;
         lastFixAt = Date.now();
+        lastFixMono = process.hrtime.bigint();
         warned = false; // streaming again — allow a fresh warning if it drops
       },
       onError: (msg) => {
@@ -78,47 +80,66 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
     });
   }
 
+  // Shared by read() and sample(): lazy open + the silent-fd watchdog. Either
+  // caller (live loop or recorder) keeps the stream alive — recording can run
+  // with the live loop idle (e.g. booted offline, MQTT never connects).
+  function ensureStreaming(): void {
+    if (!started) {
+      start();
+    } else if (Date.now() - Math.max(lastFixAt, openedAt) > reopenSilentMs) {
+      // Silent-fd watchdog: the stream is "open" but nothing has arrived for
+      // far too long — a dead tty from a modem USB re-enumeration. Destroy it
+      // and reopen on the next tick, picking up the fresh device node.
+      console.warn("[gps] NMEA silent too long — reopening the port");
+      handle?.stop();
+      handle = null;
+      started = false;
+    }
+  }
+
+  function mapLatest(fix: GpsFix): Record<string, unknown> {
+    const out: Record<string, unknown> = {
+      fix_quality: { value: typeof fix.fixQuality === "number" ? fix.fixQuality : 0 },
+    };
+    if (typeof fix.satellites === "number") out.satellites = { value: fix.satellites };
+    if (typeof fix.satellitesInView === "number") {
+      out.satellites_in_view = { value: fix.satellitesInView };
+    }
+    if (typeof fix.hdop === "number") out.hdop = { value: round(fix.hdop, 1) };
+    if (hasPosition(fix)) {
+      out.lat = { value: round(fix.latitude!, 6) };
+      out.lon = { value: round(fix.longitude!, 6) };
+      if (typeof fix.altitude === "number") out.alt = { value: round(fix.altitude, 1), unit: "m" };
+      if (typeof fix.speedKmh === "number") {
+        out.speed = { value: round(fix.speedKmh, 1), unit: "km/h" };
+      }
+      // Course over ground (direction of travel). Present only while moving;
+      // held from the last movement otherwise (the aggregator clears it on
+      // lock loss), so it's always tied to the current position.
+      if (typeof fix.course === "number") {
+        out.course = { value: round(fix.course, 1), unit: "°" };
+      }
+    }
+    return out;
+  }
+
+  // Require *fresh* NMEA: a stale stream means GNSS isn't actually emitting.
+  function freshFix(): GpsFix | null {
+    if (!latest || Date.now() - lastFixAt > NMEA_STALE_MS) return null;
+    return latest;
+  }
+
   return {
     group: "gps",
     async read() {
-      if (!started) {
-        start();
-      } else if (Date.now() - Math.max(lastFixAt, openedAt) > reopenSilentMs) {
-        // Silent-fd watchdog: the stream is "open" but nothing has arrived for
-        // far too long — a dead tty from a modem USB re-enumeration. Destroy it
-        // and reopen on the next tick, picking up the fresh device node.
-        console.warn("[gps] NMEA silent too long — reopening the port");
-        handle?.stop();
-        handle = null;
-        started = false;
-      }
-      // Require *fresh* NMEA: a stale stream means GNSS isn't actually emitting.
-      if (!latest || Date.now() - lastFixAt > NMEA_STALE_MS) return {};
-
-      const fix = latest;
-      const out: Record<string, unknown> = {
-        fix_quality: { value: typeof fix.fixQuality === "number" ? fix.fixQuality : 0 },
-      };
-      if (typeof fix.satellites === "number") out.satellites = { value: fix.satellites };
-      if (typeof fix.satellitesInView === "number") {
-        out.satellites_in_view = { value: fix.satellitesInView };
-      }
-      if (typeof fix.hdop === "number") out.hdop = { value: round(fix.hdop, 1) };
-      if (hasPosition(fix)) {
-        out.lat = { value: round(fix.latitude!, 6) };
-        out.lon = { value: round(fix.longitude!, 6) };
-        if (typeof fix.altitude === "number") out.alt = { value: round(fix.altitude, 1), unit: "m" };
-        if (typeof fix.speedKmh === "number") {
-          out.speed = { value: round(fix.speedKmh, 1), unit: "km/h" };
-        }
-        // Course over ground (direction of travel). Present only while moving;
-        // held from the last movement otherwise (the aggregator clears it on
-        // lock loss), so it's always tied to the current position.
-        if (typeof fix.course === "number") {
-          out.course = { value: round(fix.course, 1), unit: "°" };
-        }
-      }
-      return out;
+      ensureStreaming();
+      const fix = freshFix();
+      return fix ? mapLatest(fix) : {};
+    },
+    async sample() {
+      ensureStreaming();
+      const fix = freshFix();
+      return fix ? { fields: mapLatest(fix), updatedMono: lastFixMono } : null;
     },
   };
 }

@@ -27,6 +27,7 @@ import { loadManifest } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
 import { s3Put } from "./recording/s3-put.js";
 import { RecordingManager, type RecordingUploadOptions } from "./recording/manager.js";
+import { resolveBridgedCameras } from "./recording/video-capture.js";
 import type { StateSnapshot, TelemetryPayload, TelemetryReading } from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
 import { ensureHome, workerPath } from "./daemon/runtime.js";
@@ -49,6 +50,7 @@ const source: {
   read: () => Promise<TelemetryReading>;
   sampleGroups: () => Promise<Record<string, GroupSample>>;
   stop?: () => void;
+  restartMediaChannel?: (streamKey: string) => void;
 } =
   config.mode === "real"
     ? createCollector(
@@ -159,6 +161,20 @@ function buildUploadOptions(): RecordingUploadOptions | undefined {
 const recording = new RecordingManager({
   deviceId: config.deviceId,
   upload: buildUploadOptions(),
+  // Video capture (Phase 3): only bridged streams are eligible — a stream
+  // whose .gst still owns its camera directly is left to the KVS master
+  // (rollout safety; see `xorgate pipeline bridge`).
+  video: {
+    mediaEnabled: config.media.enabled,
+    cameras: () =>
+      resolveBridgedCameras(
+        config.media.pipelineDir,
+        loadManifest(config.media.manifestPath)?.channels ?? [],
+      ),
+    // A KVS master attached to a dead shm writer wedges instead of crashing
+    // (shmsrc shm_open loop, black stream) — bounce it onto the new socket.
+    onCaptureSpawned: (streamKey) => source.restartMediaChannel?.(streamKey),
+  },
   sampleGroups: () => source.sampleGroups(),
   onStatus: (status) => {
     store.setRecording(status);
@@ -388,13 +404,30 @@ client.on("connect", () => {
       const { metrics, media } = await source.read();
       if (shuttingDown) return; // shutdown happened during the await
       const ts = Date.now();
+      // Video capture state (Phase 3): the capture daemons — not the KVS
+      // masters — are what "recording" means; merge their state into the
+      // media block (flips the once-hardcoded media.recording placeholder).
+      const video = recording.videoStatus();
+      const activeCapture = new Set(
+        video.streams.filter((s) => s.recording).map((s) => s.streamKey),
+      );
       const payload: TelemetryPayload = {
         v: 1,
         deviceId: config.deviceId,
         ts,
         seq: seq++,
         metrics,
-        media,
+        media: {
+          ...media,
+          recording: { value: video.recording },
+          // Annotate streams under capture supervision (bridged) with their
+          // disk-recording state; untouched streams stay byte-identical.
+          streams: media.streams.map((s) =>
+            video.streams.some((v) => v.streamKey === s.streamKey)
+              ? { ...s, recording: activeCapture.has(s.streamKey) }
+              : s,
+          ),
+        },
         // Phase 2: recording/backlog status rides the live payload (cloud
         // schemas carry the matching optional block; D4 keys the live/batch
         // authority split off recording.enabled).

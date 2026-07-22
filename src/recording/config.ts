@@ -51,3 +51,22 @@ export function recordingsRoot(): string {
 export function telemetryRoot(root: string = recordingsRoot()): string {
   return join(root, "telemetry");
 }
+
+/** Video segment tree: recordings/video/<streamKey>/<sessionId>/%05d.mp4 + .json. */
+export function videoRoot(root: string = recordingsRoot()): string {
+  return join(root, "video");
+}
+
+/**
+ * Where capture daemons put their shm bridge sockets (Phase 3, D1). Outside the
+ * recordings tree on purpose: the disk manager must never scan/evict sockets.
+ * Both the capture pipeline and the bridged .gst embed this path, and the CLI
+ * (`xorgate pipeline bridge`) + agent resolve it the same way via XORGATE_HOME.
+ */
+export function shmDir(): string {
+  return join(runtimeHome(), "shm");
+}
+
+export function shmSocketPathFor(streamKey: string): string {
+  return join(shmDir(), `${streamKey}.sock`);
+}

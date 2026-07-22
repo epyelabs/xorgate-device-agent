@@ -54,6 +54,8 @@ export function createCollector(
   sampleGroups(): Promise<Record<string, GroupSample>>;
   /** Stop any supervised subprocesses (the media runtime). No-op otherwise. */
   stop(): void;
+  /** Bounce one KVS master (bridged capture respawned — see MediaSupervisor). */
+  restartMediaChannel(streamKey: string): void;
 } {
   const collectors: Collector[] = [];
   if (ioCapabilities.sensors?.imu) collectors.push(createImuCollector());
@@ -96,6 +98,9 @@ export function createCollector(
     },
     stop(): void {
       media?.stop();
+    },
+    restartMediaChannel(streamKey: string): void {
+      media?.restartChannel(streamKey);
     },
   };
 }

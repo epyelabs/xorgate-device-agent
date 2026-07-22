@@ -45,6 +45,15 @@ export interface MediaSupervisor {
   read(): TelemetryMedia;
   /** Stop every master (SIGINT) and cancel pending restarts — called on shutdown. */
   stop(): void;
+  /**
+   * Bounce one channel's master (offline recording plan, Phase 3): the shm
+   * capture daemon feeding a bridged stream was (re)spawned, and a master
+   * whose pipeline already attached to the OLD shm writer does NOT crash when
+   * that writer dies — its shmsrc wedges silently (`shm_open failed` loop,
+   * viewers see black; hardware-verified). SIGINT it; the supervisor's normal
+   * restart path brings it back against the new socket.
+   */
+  restartChannel(streamKey: string): void;
 }
 
 const IDLE: TelemetryMedia = {
@@ -151,6 +160,13 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
         onStderr: (line) => {
           if (line.trim()) console.error(`[media ${channelName}] ${line}`);
         },
+        // The SDK's own DLOG* output rides STDOUT. It MUST be consumed: with no
+        // listener the 64 KB pipe fills and BLOCKS the master mid-operation
+        // (near-silent at the default log level, fatal at verbose). Forwarding
+        // also makes AWS_KVS_LOG_LEVEL debugging actually observable.
+        onStdout: (line) => {
+          if (line.trim()) console.log(`[media ${channelName}] ${line}`);
+        },
       },
     );
 
@@ -234,6 +250,18 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
         return IDLE;
       }
       return snapshot();
+    },
+    restartChannel(streamKey: string): void {
+      if (stopped) return;
+      for (const c of channels.values()) {
+        if (c.streamKey !== streamKey) continue;
+        if (c.handle) {
+          console.log(`[media ${c.channelName}] restarting master (capture daemon respawned)`);
+          c.handle.stop("SIGINT"); // onExit schedules the respawn
+        }
+        // No handle (parked/retrying): the pending restart picks up the new
+        // socket by itself — nothing to do.
+      }
     },
     stop(): void {
       if (stopped) return;

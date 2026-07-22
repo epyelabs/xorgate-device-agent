@@ -20,8 +20,17 @@ import {
   writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
-import { pipelineFileFor } from "../media/pipeline.js";
+import {
+  cameraFileFor,
+  directBackupFor,
+  extractCameraName,
+  isBridgedPipeline,
+  pipelineFileFor,
+  resolveCameraName,
+} from "../media/pipeline.js";
 import { loadManifest } from "../media/manifest.js";
+import { bridgedKvsPipeline } from "../recording/video-capture.js";
+import { shmSocketPathFor } from "../recording/config.js";
 
 const DEFAULT_DIR = "/etc/xorgate/pipelines";
 const DEFAULT_MANIFEST = "/etc/xorgate/kvs.json";
@@ -42,6 +51,10 @@ export async function pipelineCommand(rest: string[]): Promise<void> {
       return set(dir, pos[1], pos[2]);
     case "clear":
       return clear(dir, pos[1]);
+    case "bridge":
+      return bridge(dir, pos[1]);
+    case "direct":
+      return direct(dir, pos[1]);
     default:
       console.error(`unknown subcommand '${sub}'`);
       usage();
@@ -81,7 +94,8 @@ function list(dir: string, manifestPath: string): void {
     console.log("channels:");
     for (const ch of manifest.channels) {
       const f = pipelineFileFor(dir, ch.streamKey);
-      const tag = existsSync(f) ? f : "(runtime default)";
+      const mode = isBridgedPipeline(dir, ch.streamKey) ? " [bridged]" : "";
+      const tag = existsSync(f) ? `${f}${mode}` : "(runtime default)";
       console.log(`  ${ch.streamKey.padEnd(8)} ${ch.channelName}  ←  ${tag}`);
     }
   } else {
@@ -144,13 +158,70 @@ function clear(dir: string, key: string | undefined): void {
   console.log(RESTART_HINT);
 }
 
+/**
+ * Switch a stream to BRIDGED mode (offline recording plan D1): the capture
+ * daemon owns the camera and the KVS master consumes low-res raw frames over
+ * shm. The current direct .gst is backed up to `<key>.gst.direct` and the
+ * camera-name preserved in `<key>.camera`, so `xorgate pipeline direct` can
+ * restore today's behavior exactly.
+ */
+function bridge(dir: string, key: string | undefined): void {
+  if (!validKey(key)) return;
+  const gst = pipelineFileFor(dir, key);
+  if (isBridgedPipeline(dir, key)) {
+    console.log(`${key}: already bridged (${gst})`);
+    return;
+  }
+  const cameraName = resolveCameraName(dir, key);
+  if (!cameraName) {
+    console.error(
+      `${key}: cannot determine the libcamera camera-name (no ${cameraFileFor(dir, key)} ` +
+        `and no camera-name= in the .gst). Write the camera name to that file and retry.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  mkdirSync(dir, { recursive: true });
+  if (existsSync(gst)) {
+    writeFileSync(directBackupFor(dir, key), readFileSync(gst, "utf8"));
+  }
+  writeFileSync(cameraFileFor(dir, key), `${cameraName}\n`);
+  writeFileSync(gst, `${bridgedKvsPipeline(shmSocketPathFor(key))}\n`);
+  console.log(`✓ ${key} bridged: capture daemon will own ${cameraName}`);
+  console.log(`  .gst → shmsrc consumer (direct pipeline saved to ${directBackupFor(dir, key)})`);
+  console.log("  NOTE: live streaming on this camera now requires the agent's capture");
+  console.log("  daemon (media on). Revert anytime with: xorgate pipeline direct " + key);
+  console.log(RESTART_HINT);
+}
+
+/** Restore a stream to DIRECT mode from the `.gst.direct` backup. */
+function direct(dir: string, key: string | undefined): void {
+  if (!validKey(key)) return;
+  const backup = directBackupFor(dir, key);
+  if (!existsSync(backup)) {
+    console.error(`${key}: no ${backup} to restore; use 'xorgate pipeline set' instead`);
+    process.exitCode = 1;
+    return;
+  }
+  writeFileSync(pipelineFileFor(dir, key), readFileSync(backup, "utf8"));
+  rmSync(backup);
+  console.log(`✓ ${key} restored to direct mode (KVS master owns the camera again)`);
+  console.log("  if recording.video.enabled is on, disable it or the capture daemon will");
+  console.log("  contend for the camera: xorgate set recording.video.enabled off");
+  console.log(RESTART_HINT);
+}
+
 function usage(): void {
-  console.log(`usage: xorgate pipeline <list|show|set|clear> [streamKey] [file]
+  console.log(`usage: xorgate pipeline <list|show|set|clear|bridge|direct> [streamKey] [file]
 
   list                      channels (from kvs.json) + which have a pipeline
   show  <streamKey>         print a stream's pipeline
   set   <streamKey> <file>  install a .gst pipeline for a stream (e.g. cam0)
   clear <streamKey>         remove a stream's pipeline (revert to default)
+  bridge <streamKey>        capture-daemon mode: agent owns the camera, KVS
+                            reads shm (required for recording.video; backs up
+                            the direct .gst)
+  direct <streamKey>        restore the backed-up direct pipeline
 
   --dir <path>       pipeline dir (default: $KVS_PIPELINE_DIR or ${DEFAULT_DIR})
   --manifest <path>  kvs.json for 'list' (default: $KVS_MANIFEST or ${DEFAULT_MANIFEST})`);

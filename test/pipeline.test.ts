@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pipelineFileFor, resolveChannelPipeline } from "../src/media/pipeline.js";
+import {
+  cameraFileFor,
+  directBackupFor,
+  extractCameraName,
+  isBridgedPipeline,
+  pipelineFileFor,
+  resolveCameraName,
+  resolveChannelPipeline,
+} from "../src/media/pipeline.js";
 import { pipelineCommand } from "../src/commands/pipeline.js";
 
 let dir: string;
@@ -60,6 +68,70 @@ describe("xorgate pipeline", () => {
 
   it("fails when the source file is missing", async () => {
     await pipelineCommand(["set", "cam0", join(dir, "nope.gst"), "--dir", join(dir, "p3")]);
+    expect(process.exitCode).toBe(1);
+  });
+});
+
+describe("bridged mode helpers", () => {
+  it("extractCameraName parses libcamerasrc pipelines", () => {
+    expect(extractCameraName("libcamerasrc camera-name=/base/i2c@88000/imx290@1a ! caps")).toBe(
+      "/base/i2c@88000/imx290@1a",
+    );
+    expect(extractCameraName("videotestsrc ! appsink")).toBeNull();
+  });
+
+  it("isBridgedPipeline keys off shmsrc in the .gst", () => {
+    writeFileSync(pipelineFileFor(dir, "cam0"), "shmsrc socket-path=/x ! appsink");
+    writeFileSync(pipelineFileFor(dir, "cam1"), "libcamerasrc camera-name=/c ! appsink");
+    expect(isBridgedPipeline(dir, "cam0")).toBe(true);
+    expect(isBridgedPipeline(dir, "cam1")).toBe(false);
+    expect(isBridgedPipeline(dir, "cam2")).toBe(false);
+  });
+
+  it("resolveCameraName prefers .camera, then backup, then .gst", () => {
+    writeFileSync(pipelineFileFor(dir, "camA"), "libcamerasrc camera-name=/from-gst ! x");
+    expect(resolveCameraName(dir, "camA")).toBe("/from-gst");
+    writeFileSync(directBackupFor(dir, "camA"), "libcamerasrc camera-name=/from-backup ! x");
+    expect(resolveCameraName(dir, "camA")).toBe("/from-backup");
+    writeFileSync(cameraFileFor(dir, "camA"), "/from-camera-file\n");
+    expect(resolveCameraName(dir, "camA")).toBe("/from-camera-file");
+    expect(resolveCameraName(dir, "nope")).toBeNull();
+  });
+});
+
+describe("xorgate pipeline bridge/direct", () => {
+  it("bridge backs up the direct .gst, writes .camera, installs shmsrc pipeline", async () => {
+    const pdir = join(dir, "pb");
+    const direct = "libcamerasrc camera-name=/base/cam0@1a ! video/x-raw ! appsink name=appsink-video\n";
+    writeFileSync(src, direct);
+    await pipelineCommand(["set", "cam0", src, "--dir", pdir]);
+
+    await pipelineCommand(["bridge", "cam0", "--dir", pdir]);
+    expect(readFileSync(pipelineFileFor(pdir, "cam0"), "utf8")).toContain("shmsrc");
+    expect(readFileSync(pipelineFileFor(pdir, "cam0"), "utf8")).toContain("name=sampleVideoEncoder");
+    expect(readFileSync(directBackupFor(pdir, "cam0"), "utf8")).toBe(direct);
+    expect(readFileSync(cameraFileFor(pdir, "cam0"), "utf8").trim()).toBe("/base/cam0@1a");
+
+    // Idempotent: bridging again is a no-op, not a double-backup of shmsrc.
+    await pipelineCommand(["bridge", "cam0", "--dir", pdir]);
+    expect(readFileSync(directBackupFor(pdir, "cam0"), "utf8")).toBe(direct);
+
+    await pipelineCommand(["direct", "cam0", "--dir", pdir]);
+    expect(readFileSync(pipelineFileFor(pdir, "cam0"), "utf8")).toBe(direct);
+    expect(existsSync(directBackupFor(pdir, "cam0"))).toBe(false);
+  });
+
+  it("bridge fails without a resolvable camera identity", async () => {
+    const pdir = join(dir, "pb2");
+    writeFileSync(src, "videotestsrc ! appsink name=appsink-video\n");
+    await pipelineCommand(["set", "cam0", src, "--dir", pdir]);
+    await pipelineCommand(["bridge", "cam0", "--dir", pdir]);
+    expect(process.exitCode).toBe(1);
+    expect(readFileSync(pipelineFileFor(pdir, "cam0"), "utf8")).not.toContain("shmsrc");
+  });
+
+  it("direct fails without a backup", async () => {
+    await pipelineCommand(["direct", "cam9", "--dir", join(dir, "pb3")]);
     expect(process.exitCode).toBe(1);
   });
 });

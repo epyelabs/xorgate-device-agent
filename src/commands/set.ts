@@ -33,6 +33,7 @@ import {
 } from "../daemon/settings.js";
 import { inspect, restart } from "../daemon/manager.js";
 import { setWifi } from "../daemon/radios.js";
+import { findVideoPreset, videoPresetNames } from "../recording/video-presets.js";
 import {
   detectWifi,
   ifaceForIp,
@@ -95,8 +96,20 @@ function setRecordingCommand(key: string, value: string | undefined): void {
       return;
     }
     raw = num;
+  } else if (field === "preset") {
+    // Presets are a closed table (bounded CPU on a Pi with software-only
+    // encoding); reject unknowns here with the list rather than letting the
+    // agent silently fall back to the default.
+    if (!value || !findVideoPreset(value)) {
+      console.error(
+        `${key} must be one of: ${videoPresetNames().join(", ")} (got '${value ?? ""}')`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    raw = value;
   } else {
-    raw = value; // string fields (preset, mode) — validated below
+    raw = value; // string fields (mode) — validated below
   }
 
   const patch = parseRecordingSettings({ [section]: { [field]: raw } });

@@ -1,0 +1,267 @@
+/**
+ * Video segment sidecars (plan D2/D6): splitmuxsink writes `%05d.mp4` fragments
+ * into `recordings/video/<streamKey>/<sessionId>/`; this module turns each
+ * CLOSED fragment into an upload-ready pair by writing the `.json` sidecar next
+ * to it. "mp4 + sidecar exist" IS the pending-upload state (no journal), same
+ * stance as telemetry segments.
+ *
+ * Timestamps (anchor method, recorded in the sidecar as `anchor`): the capture
+ * daemon stamps a wall/mono anchor at spawn and writes it to a per-session
+ * `session.json`; each segment's startTs comes from the mp4's birthtime (falling
+ * back to `anchor + seq × segmentSeconds` when the fs gives no birthtime) and
+ * durationMs from mtime − birthtime (last write ≈ fragment close). Accuracy is
+ * well inside the plan's ±1 s MVP bound — splitmuxsink opens the file at
+ * fragment start and last-writes it at finalize. startMono is derived from the
+ * anchor pair so cloud-side re-anchoring (D6) stays possible.
+ *
+ * Crash recovery: on startup, any `.mp4` without a sidecar in a non-active
+ * session gets a best-effort sidecar from `session.json` + file stats — playable
+ * footage is never discarded. A fragment splitmuxsink was mid-writing when the
+ * process died has no moov and may be unplayable; it still gets a sidecar and
+ * rides to the cloud (tagged `finalized:false`) rather than being deleted —
+ * remux salvage is possible offline, deletion isn't.
+ */
+import { readdirSync, statSync, unlinkSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { atomicWriteJson } from "../lib/atomicWrite.js";
+import type { TimeSource } from "./session.js";
+
+/** Per-session capture metadata, written once at capture-daemon spawn. */
+export interface VideoSessionManifest {
+  v: 1;
+  deviceId: string;
+  streamKey: string;
+  sessionId: string;
+  bootId: string;
+  timeSource: TimeSource;
+  preset: string;
+  width: number;
+  height: number;
+  fps: number;
+  bitrateKbps: number;
+  segmentSeconds: number;
+  /** Wall-clock epoch ms at capture-daemon spawn. */
+  anchorTs: number;
+  /** process.hrtime.bigint() ns at capture-daemon spawn (stringified bigint). */
+  anchorMono: string;
+}
+
+export const SESSION_MANIFEST_NAME = "session.json";
+
+/** README contract + `anchor`/`finalized` provenance fields. */
+export interface VideoSidecar {
+  v: 1;
+  deviceId: string;
+  streamKey: string;
+  sessionId: string;
+  seq: number;
+  startTs: number;
+  startMono: number;
+  durationMs: number;
+  sizeBytes: number;
+  timeSource: TimeSource;
+  codec: "h264";
+  width: number;
+  height: number;
+  fps: number;
+  bitrateKbps: number;
+  /** How startTs was derived: mp4 birthtime vs anchor+seq arithmetic. */
+  anchor: "fstat" | "computed";
+  /** False when the fragment was cut off by a crash (may lack its moov atom). */
+  finalized: boolean;
+}
+
+export function sidecarPathFor(mp4Path: string): string {
+  return mp4Path.replace(/\.mp4$/, ".json");
+}
+
+/** Parse splitmuxsink's fragment number out of `<dir>/00042.mp4`. */
+export function segmentSeq(name: string): number | null {
+  const m = /^(\d{5,})\.mp4$/.exec(name);
+  return m ? Number(m[1]) : null;
+}
+
+export function writeSessionManifest(dir: string, manifest: VideoSessionManifest): void {
+  atomicWriteJson(join(dir, SESSION_MANIFEST_NAME), manifest);
+}
+
+export function readSessionManifest(dir: string): VideoSessionManifest | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, SESSION_MANIFEST_NAME), "utf8")) as unknown;
+    if (!raw || typeof raw !== "object") return null;
+    const m = raw as VideoSessionManifest;
+    if (m.v !== 1 || typeof m.sessionId !== "string" || typeof m.anchorTs !== "number") return null;
+    return m;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the sidecar for one closed fragment from the session manifest + file
+ * stats. Pure given the stat result — unit-testable without a filesystem.
+ */
+export function buildSidecar(
+  manifest: VideoSessionManifest,
+  seq: number,
+  stat: { sizeBytes: number; birthtimeMs: number; mtimeMs: number },
+  opts: { finalized: boolean },
+): VideoSidecar {
+  // ext4 gives real birthtimes; a zero/bogus one (some tmpfs, copied trees)
+  // falls back to anchor arithmetic — that's exactly what `anchor` records.
+  const nominalStart = manifest.anchorTs + seq * manifest.segmentSeconds * 1000;
+  const haveBirth = stat.birthtimeMs > 1_000_000_000_000; // sanity: after 2001
+  const startTs = haveBirth ? Math.round(stat.birthtimeMs) : nominalStart;
+  const endTs = stat.mtimeMs > startTs ? stat.mtimeMs : startTs;
+  const durationMs = haveBirth
+    ? Math.round(endTs - startTs)
+    : manifest.segmentSeconds * 1000;
+  const anchorMonoMs = Number(BigInt(manifest.anchorMono) / 1_000_000n);
+  return {
+    v: 1,
+    deviceId: manifest.deviceId,
+    streamKey: manifest.streamKey,
+    sessionId: manifest.sessionId,
+    seq,
+    startTs,
+    startMono: anchorMonoMs + (startTs - manifest.anchorTs),
+    durationMs,
+    sizeBytes: stat.sizeBytes,
+    timeSource: manifest.timeSource,
+    codec: "h264",
+    width: manifest.width,
+    height: manifest.height,
+    fps: manifest.fps,
+    bitrateKbps: manifest.bitrateKbps,
+    anchor: haveBirth ? "fstat" : "computed",
+    finalized: opts.finalized,
+  };
+}
+
+export interface SweepResult {
+  /** Sidecars written this sweep (mp4 paths). */
+  closed: string[];
+  /** The newest (active) fragment path, or null when the dir has no mp4s. */
+  activePath: string | null;
+}
+
+/**
+ * One pass over a session dir: every `.mp4` except the newest is closed — write
+ * missing sidecars; the newest is the fragment splitmuxsink is still writing.
+ * With `includeNewest` (capture stopped: EOS finalized the last fragment, or
+ * orphan recovery of a dead session) the newest is closed too.
+ *
+ * Idempotent and cheap (one readdir + stats), so it doubles as the fs.watch
+ * fallback poll and the crash-recovery scan.
+ */
+export function sweepSessionDir(
+  dir: string,
+  manifest: VideoSessionManifest,
+  opts: { includeNewest: boolean; finalized?: boolean },
+): SweepResult {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return { closed: [], activePath: null };
+  }
+  const frags = names
+    .map((n) => ({ name: n, seq: segmentSeq(n) }))
+    .filter((f): f is { name: string; seq: number } => f.seq !== null)
+    .sort((a, b) => a.seq - b.seq);
+  if (frags.length === 0) return { closed: [], activePath: null };
+
+  const sidecars = new Set(names.filter((n) => n.endsWith(".json")));
+  const newest = frags[frags.length - 1];
+  const closed: string[] = [];
+
+  for (const f of frags) {
+    const isNewest = f.name === newest.name;
+    if (isNewest && !opts.includeNewest) continue;
+    const mp4Path = join(dir, f.name);
+    if (sidecars.has(f.name.replace(/\.mp4$/, ".json"))) continue;
+    let st;
+    try {
+      st = statSync(mp4Path);
+    } catch {
+      continue; // raced an eviction — skip
+    }
+    // A 0-byte fragment is a power-cut artifact (data died in page cache —
+    // observed on hardware); there is nothing to salvage and a sidecar would
+    // send garbage through the Phase 4 uploader. Only reap it when the
+    // session is closed (includeNewest) — live, the newest is still filling.
+    if (st.size === 0) {
+      if (opts.includeNewest) {
+        try {
+          unlinkSync(mp4Path);
+          console.warn(`[recording] dropped empty power-cut fragment ${mp4Path}`);
+        } catch {
+          /* best effort */
+        }
+      }
+      continue;
+    }
+    const sidecar = buildSidecar(
+      manifest,
+      f.seq,
+      { sizeBytes: st.size, birthtimeMs: st.birthtimeMs, mtimeMs: st.mtimeMs },
+      // The newest fragment of a dead session may have been cut mid-write; all
+      // others were finalized by splitmuxsink before it opened the next one.
+      { finalized: opts.finalized ?? !isNewest },
+    );
+    try {
+      atomicWriteJson(sidecarPathFor(mp4Path), sidecar);
+      closed.push(mp4Path);
+    } catch (err) {
+      console.error(`[recording] sidecar write failed for ${mp4Path}: ${(err as Error).message}`);
+    }
+  }
+  return {
+    closed,
+    activePath: opts.includeNewest ? null : join(dir, newest.name),
+  };
+}
+
+/**
+ * Startup crash recovery for the video tree: every session dir that isn't in
+ * `activeSessionIds` belongs to a previous run — sidecar-backfill all of its
+ * fragments (newest tagged `finalized:false`). Sessions without a readable
+ * session.json are left untouched (can't attribute metadata; the disk manager
+ * will age them out). Returns the number of sidecars written.
+ */
+export function recoverOrphanVideoSessions(
+  videoRoot: string,
+  activeSessionIds: ReadonlySet<string> = new Set(),
+): number {
+  let recovered = 0;
+  let streamKeys: string[];
+  try {
+    streamKeys = readdirSync(videoRoot);
+  } catch {
+    return 0; // no video tree yet
+  }
+  for (const streamKey of streamKeys) {
+    const streamDir = join(videoRoot, streamKey);
+    let sessions: string[];
+    try {
+      if (!statSync(streamDir).isDirectory()) continue;
+      sessions = readdirSync(streamDir);
+    } catch {
+      continue;
+    }
+    for (const sessionId of sessions) {
+      if (activeSessionIds.has(sessionId)) continue;
+      const dir = join(streamDir, sessionId);
+      try {
+        if (!statSync(dir).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      const manifest = readSessionManifest(dir);
+      if (!manifest) continue;
+      recovered += sweepSessionDir(dir, manifest, { includeNewest: true }).closed.length;
+    }
+  }
+  return recovered;
+}

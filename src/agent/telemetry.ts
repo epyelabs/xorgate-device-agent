@@ -65,6 +65,12 @@ export interface MediaStream {
   channelName: string;
   /** Supervisor lifecycle state for this channel's master process. */
   state: "starting" | "running" | "retrying" | "failed" | "stopped";
+  /**
+   * True while this stream's capture daemon is writing segments to disk
+   * (offline recording plan, Phase 3). Optional: absent on devices without
+   * video recording; cloud schemas tolerate (strip) it until Phase 5 mirrors it.
+   */
+  recording?: boolean;
 }
 
 export interface TelemetryMedia {

@@ -101,6 +101,12 @@ function print(st: DaemonStatus, now: number): void {
         );
       }
     }
+    // Video capture (Phase 3): per-stream daemon state rides the media block.
+    const capture = (state.latest?.media?.streams ?? []).filter((s) => s.recording !== undefined);
+    if (capture.length > 0) {
+      const parts = capture.map((s) => `${s.streamKey} ${s.recording ? green("recording") : gray("idle")}`);
+      console.log(`  video      ${parts.join("   ")}`);
+    }
     if (state.lastError) console.log(`  last error ${yellow(state.lastError)}`);
   } else {
     console.log(gray("  (no state snapshot yet)"));

@@ -18,13 +18,28 @@ import { join } from "node:path";
 import type { GroupSample } from "../agent/collectors/index.js";
 import { loadSettings } from "../daemon/settings.js";
 import type { RecordingStatus } from "../agent/telemetry.js";
-import { recordingsRoot, resolveRecordingConfig, telemetryRoot, type ResolvedRecordingConfig } from "./config.js";
+import {
+  recordingsRoot,
+  resolveRecordingConfig,
+  shmDir,
+  telemetryRoot,
+  videoRoot,
+  type ResolvedRecordingConfig,
+} from "./config.js";
 import { DiskManager } from "./disk.js";
 import { finalizeOrphanSegments } from "./segments.js";
 import { TelemetryRecorder } from "./telemetry-recorder.js";
 import { createTimeSourceTracker, mintSessionId, readBootId } from "./session.js";
 import { createTelemetrySource } from "./telemetry-source.js";
 import { Uploader, type PutFn, type SegmentSource } from "./uploader.js";
+import {
+  VideoCaptureSupervisor,
+  type CaptureCamera,
+  type CaptureSpawn,
+  type CaptureStatus,
+} from "./video-capture.js";
+import { resolveVideoPreset } from "./video-presets.js";
+import { recoverOrphanVideoSessions } from "./video-segments.js";
 
 /** How often settings.json is re-checked for recording changes. */
 const SETTINGS_POLL_MS = 5_000;
@@ -48,9 +63,38 @@ export interface RecordingUploadOptions {
   backoffMaxMs?: number;
 }
 
+/**
+ * Video capture plumbing injected by the worker (Phase 3). Absent on hosts
+ * without cameras/media. `cameras()` is re-resolved on every (re)start of the
+ * capture supervisor — it reads the pipeline dir, so a `xorgate pipeline
+ * bridge` still needs the usual agent restart to be picked up.
+ */
+export interface RecordingVideoOptions {
+  /** The worker's media-enabled snapshot; false = never spawn capture daemons. */
+  mediaEnabled: boolean;
+  /** Bridged streams with resolvable camera identity (see resolveBridgedCameras). */
+  cameras(): CaptureCamera[];
+  /** Bounce a stream's KVS master after its capture child (re)spawns. */
+  onCaptureSpawned?: (streamKey: string) => void;
+  /** Overrides for tests. */
+  shmDir?: string;
+  spawn?: CaptureSpawn;
+  stableMs?: number;
+  sweepPollMs?: number;
+}
+
+/** Video state for the payload/state.json media block. */
+export interface VideoRecordingStatus {
+  /** True while ≥1 camera is actively capturing to disk (media.recording flag). */
+  recording: boolean;
+  streams: CaptureStatus[];
+}
+
 export interface RecordingManagerOptions {
   deviceId: string;
   sampleGroups(): Promise<Record<string, GroupSample>>;
+  /** Video capture plumbing; omit to disable video entirely (telemetry-only). */
+  video?: RecordingVideoOptions;
   /** Called whenever recording status (enabled/session/backlog) may have changed. */
   onStatus?: (status: RecordingStatus) => void;
   /** Surface a notable transition into the worker's event trail. */
@@ -73,6 +117,10 @@ export class RecordingManager {
   private sessionId: string | null = null;
   private disk: DiskManager | null = null;
   private uploader: Uploader | null = null;
+  private videoCapture: VideoCaptureSupervisor | null = null;
+  private videoKey = "";
+  /** Serializes capture stop→start handovers (see applyVideo). */
+  private videoTransition: Promise<void> = Promise.resolve();
   private pollTimer: NodeJS.Timeout | null = null;
   private diskTimer: NodeJS.Timeout | null = null;
   private lastSettingsKey = "";
@@ -110,6 +158,12 @@ export class RecordingManager {
       const finalized = finalizeOrphanSegments(telemetryRoot(this.root));
       if (finalized > 0) {
         this.opts.onEvent?.("info", `recording: finalized ${finalized} orphan segment(s) from previous run`);
+      }
+      // Video crash recovery runs before any capture spawns, so every session
+      // on disk belongs to a previous run — sidecar-backfill all of them.
+      const recovered = recoverOrphanVideoSessions(videoRoot(this.root));
+      if (recovered > 0) {
+        this.opts.onEvent?.("info", `recording: backfilled ${recovered} video sidecar(s) from previous run`);
       }
       this.ensureDisk();
     }
@@ -149,6 +203,17 @@ export class RecordingManager {
     this.diskTimer = null;
     this.uploader?.stop();
     this.stopRecorder("agent shutdown");
+    this.videoCapture?.stop();
+    this.videoCapture = null;
+    this.videoKey = "";
+  }
+
+  /** Video state for the worker's media block + state.json. */
+  videoStatus(): VideoRecordingStatus {
+    return {
+      recording: this.videoCapture?.anyRecording() ?? false,
+      streams: this.videoCapture?.status() ?? [],
+    };
   }
 
   status(): RecordingStatus {
@@ -181,8 +246,87 @@ export class RecordingManager {
     }
     if (want && !this.recorder) this.startRecorder();
 
+    this.applyVideo();
+
     this.notifyStatus();
     this.uploader?.kick(); // upload.mode may have flipped to auto
+  }
+
+  /**
+   * (Re)start capture daemons to match config. Any change in the effective
+   * video tuple (cameras, record on/off, preset, segmentSeconds) replaces the
+   * whole supervisor — a config change is a new session by construction, and
+   * the KVS children crash-restart onto the new shm feed (brief stream blip,
+   * accepted by the plan).
+   */
+  private applyVideo(): void {
+    const vo = this.opts.video;
+    if (!vo) return;
+    const cameras = vo.mediaEnabled ? vo.cameras() : [];
+    const record = this.cfg.video.enabled;
+    const preset = resolveVideoPreset(this.cfg.video.preset);
+    const key = JSON.stringify({
+      cameras,
+      record,
+      preset: preset.name,
+      seg: this.cfg.video.segmentSeconds,
+    });
+    if (key === this.videoKey) return;
+    this.videoKey = key;
+
+    const prev = this.videoCapture;
+    this.videoCapture = null;
+    if (cameras.length === 0) {
+      if (prev) this.videoTransition = this.videoTransition.then(() => prev.stopAndWait());
+      if (record) {
+        this.opts.onEvent?.(
+          "warn",
+          "recording.video.enabled is on but no bridged camera is available " +
+            "(media off, or no `xorgate pipeline bridge <streamKey>` run) — video recording idle",
+        );
+      }
+      return;
+    }
+    if (record) this.ensureDisk();
+    // Serialize the handover: the old children MUST be gone before the new
+    // ones bind the shm sockets (an exiting shmsink unlinks its socket path,
+    // which would tear the fresh one down — hardware-verified race).
+    this.videoTransition = this.videoTransition.then(async () => {
+      if (prev) await prev.stopAndWait();
+      if (this.videoKey !== key) return; // superseded by a newer config change
+      this.startVideo(cameras, record, preset);
+    });
+  }
+
+  private startVideo(
+    cameras: CaptureCamera[],
+    record: boolean,
+    preset: ReturnType<typeof resolveVideoPreset>,
+  ): void {
+    const vo = this.opts.video!;
+    this.videoCapture = new VideoCaptureSupervisor({
+      deviceId: this.opts.deviceId,
+      cameras,
+      record,
+      preset,
+      segmentSeconds: this.cfg.video.segmentSeconds,
+      videoRoot: videoRoot(this.root),
+      shmDir: vo.shmDir ?? shmDir(),
+      timeSource: () => this.timeSource.current(),
+      onSegmentClosed: () => {
+        void this.runEnforce();
+      },
+      onActiveSegment: (streamKey, path) => {
+        this.disk?.setActivePath(`video:${streamKey}`, path);
+      },
+      onStatus: () => this.notifyStatus(),
+      onEvent: (level, msg) => this.opts.onEvent?.(level, msg),
+      onSpawned: (streamKey) => vo.onCaptureSpawned?.(streamKey),
+      spawn: vo.spawn,
+      stableMs: vo.stableMs,
+      sweepPollMs: vo.sweepPollMs,
+    });
+    this.videoCapture.start();
   }
 
   private activeRateHz: number | null = null;

@@ -9,15 +9,38 @@
  *
  * Payload shape (full config object, not a delta — idempotent by design):
  *   { "v": 1, "gnssAntBias": boolean,
- *     "imuMount": { enabled, rollDeg, pitchDeg, yawDeg }, "ts": <epoch ms> }
+ *     "imuMount": { enabled, rollDeg, pitchDeg, yawDeg },
+ *     "recording": { telemetry, video, upload, retention }, "ts": <epoch ms> }
  * Future cloud-configurable knobs slot in as additional keys.
+ *
+ * `recording` (offline recording plan, Phase 5 / D7) is REPLACE, not
+ * per-field merge: when the message carries the key, settings.json's whole
+ * `recording` namespace becomes exactly the cloud value (the cloud publishes
+ * its complete stored config, and it is authoritative once set — a local
+ * `xorgate set recording.*` tweak is expected to be overwritten on the next
+ * retained redelivery). When the key is absent (recording never configured
+ * from the cloud), local settings are left untouched. The worker re-reads
+ * settings after every apply (RecordingManager.reapply), so changes take
+ * effect live without a restart.
  */
-import { loadSettings, saveSettings, settingsPath } from "../daemon/settings.js";
+import {
+  loadSettings,
+  parseRecordingSettings,
+  saveSettings,
+  settingsPath,
+  type RecordingSettings,
+} from "../daemon/settings.js";
 import { parseImuMount, type ImuMount } from "../lib/orientation.js";
 
 export interface CloudConfig {
   gnssAntBias?: boolean;
   imuMount?: ImuMount;
+  /**
+   * null = the message carried a `recording` object with no valid fields
+   * ("cloud manages recording, all defaults") — applied by removing the local
+   * key. Absent (undefined) = message had no recording key; leave local alone.
+   */
+  recording?: RecordingSettings | null;
 }
 
 /**
@@ -39,6 +62,13 @@ export function parseCloudConfig(payload: Buffer | string): CloudConfig | null {
   if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
   const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
   if (imuMount) out.imuMount = imuMount;
+  const recording = (obj as { recording?: unknown }).recording;
+  if (recording && typeof recording === "object" && !Array.isArray(recording)) {
+    // parseRecordingSettings normalizes (clamps numbers, drops mistyped keys)
+    // exactly like a local settings.json read, so cloud and local values
+    // compare structurally equal. An all-invalid/empty object → null.
+    out.recording = parseRecordingSettings(recording) ?? null;
+  }
   return out;
 }
 
@@ -73,8 +103,23 @@ export function applyCloudConfig(
   if (config.imuMount !== undefined && !imuMountEqual(config.imuMount, current.imuMount)) {
     next.imuMount = config.imuMount;
   }
-  if (Object.keys(next).length === 0) return { changed: false };
-  saveSettings({ ...current, ...next }, path);
+  // Replace-whole-namespace semantics (see file header). Both sides are
+  // normalized by parseRecordingSettings (fixed key order), so JSON equality
+  // is a sound change check.
+  let recordingChange: "set" | "clear" | undefined;
+  if (config.recording !== undefined) {
+    const target = config.recording ?? undefined;
+    if (JSON.stringify(target) !== JSON.stringify(current.recording)) {
+      recordingChange = target ? "set" : "clear";
+    }
+  }
+  if (Object.keys(next).length === 0 && recordingChange === undefined) {
+    return { changed: false };
+  }
+  const merged = { ...current, ...next };
+  if (recordingChange === "set") merged.recording = config.recording as RecordingSettings;
+  else if (recordingChange === "clear") delete merged.recording;
+  saveSettings(merged, path);
   return { changed: true };
 }
 

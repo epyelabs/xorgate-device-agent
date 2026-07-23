@@ -38,6 +38,35 @@ describe("parseCloudConfig", () => {
       parseCloudConfig(JSON.stringify({ v: 1, imuMount: { enabled: true, rollDeg: "90" } })),
     ).toEqual({});
   });
+
+  it("parses a recording namespace (normalized like local settings)", () => {
+    const rec = {
+      telemetry: { enabled: true, rateHz: 10 },
+      video: { enabled: true, preset: "1080p15-2mbps", segmentSeconds: 60 },
+      upload: { mode: "auto" },
+      retention: { maxBytes: 10737418240, minFreeBytes: 2147483648 },
+    };
+    expect(parseCloudConfig(JSON.stringify({ v: 1, recording: rec }))).toEqual({
+      recording: rec,
+    });
+    // Out-of-range numbers clamp (device posture), mistyped fields drop.
+    expect(
+      parseCloudConfig(
+        JSON.stringify({ v: 1, recording: { telemetry: { rateHz: 99, enabled: "yes" } } }),
+      ),
+    ).toEqual({ recording: { telemetry: { rateHz: 20 } } });
+  });
+
+  it("maps an empty/all-invalid recording object to null (cloud-managed defaults)", () => {
+    expect(parseCloudConfig(JSON.stringify({ v: 1, recording: {} }))).toEqual({
+      recording: null,
+    });
+    // Absent key stays absent (not null) — leaves local settings alone.
+    expect(parseCloudConfig(JSON.stringify({ v: 1 }))).toEqual({});
+    // Non-object recording values are ignored entirely.
+    expect(parseCloudConfig(JSON.stringify({ v: 1, recording: "on" }))).toEqual({});
+    expect(parseCloudConfig(JSON.stringify({ v: 1, recording: [1] }))).toEqual({});
+  });
 });
 
 describe("applyCloudConfig", () => {
@@ -74,5 +103,35 @@ describe("applyCloudConfig", () => {
     expect(applyCloudConfig({ imuMount: { ...m } })).toEqual({ changed: false });
     expect(applyCloudConfig({ imuMount: { ...m, yawDeg: 180 } })).toEqual({ changed: true });
     expect(loadSettings().imuMount?.yawDeg).toBe(180);
+  });
+
+  it("replaces the whole recording namespace with the cloud value", () => {
+    // Local tweak (e.g. xorgate set) that the cloud config doesn't carry…
+    saveSettings({ mode: "real", recording: { telemetry: { enabled: true, rateHz: 20 } } });
+    const cloud = { video: { enabled: true, preset: "720p30-2mbps" } };
+    expect(applyCloudConfig({ recording: cloud })).toEqual({ changed: true });
+    // …is gone after apply: cloud is authoritative for the full namespace.
+    expect(loadSettings()).toEqual({ mode: "real", recording: cloud });
+  });
+
+  it("no-ops on an identical recording re-delivery (retained replay)", () => {
+    const cloud = { telemetry: { enabled: true, rateHz: 10 } };
+    expect(applyCloudConfig({ recording: cloud })).toEqual({ changed: true });
+    expect(applyCloudConfig({ recording: { telemetry: { enabled: true, rateHz: 10 } } })).toEqual(
+      { changed: false },
+    );
+    expect(loadSettings().recording).toEqual(cloud);
+  });
+
+  it("recording: null clears the local namespace; absent leaves it alone", () => {
+    saveSettings({ recording: { video: { enabled: true } }, gnssAntBias: true });
+    // Absent key: untouched (cloud never configured recording).
+    expect(applyCloudConfig({ gnssAntBias: true })).toEqual({ changed: false });
+    expect(loadSettings().recording).toEqual({ video: { enabled: true } });
+    // null (empty cloud object): local key removed → device defaults.
+    expect(applyCloudConfig({ recording: null })).toEqual({ changed: true });
+    expect(loadSettings().recording).toBeUndefined();
+    // …and clearing again is a no-op.
+    expect(applyCloudConfig({ recording: null })).toEqual({ changed: false });
   });
 });

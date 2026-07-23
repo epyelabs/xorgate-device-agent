@@ -31,6 +31,7 @@ import { finalizeOrphanSegments } from "./segments.js";
 import { TelemetryRecorder } from "./telemetry-recorder.js";
 import { createTimeSourceTracker, mintSessionId, readBootId } from "./session.js";
 import { createTelemetrySource } from "./telemetry-source.js";
+import { createVideoSource } from "./video-source.js";
 import { Uploader, type PutFn, type SegmentSource } from "./uploader.js";
 import {
   VideoCaptureSupervisor,
@@ -133,6 +134,13 @@ export class RecordingManager {
       this.uploader = new Uploader({
         sources: [
           createTelemetrySource(opts.deviceId, telemetryRoot(this.root)),
+          // Video pairs (Phase 4). Registered even on camera-less hosts — with
+          // no video tree it lists nothing, and it still drains leftovers if
+          // video is later disabled/unbridged.
+          createVideoSource(opts.deviceId, videoRoot(this.root), {
+            isSessionActive: (sessionId) =>
+              this.videoCapture?.activeSessionIds().has(sessionId) ?? false,
+          }),
           ...(opts.upload.extraSources ?? []),
         ],
         put: opts.upload.put,

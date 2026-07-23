@@ -21,6 +21,13 @@ export interface UploadSegment {
   path: string;
   /** Basename, e.g. seg-1753000000000-00003.jsonl.gz. */
   name: string;
+  /**
+   * Companion object PUT immediately BEFORE the main file and deleted with it
+   * only after the main PUT succeeds (Phase 4 video sidecars: the mp4's cloud
+   * ingest event must always find its sidecar already in S3). A failure between
+   * the two PUTs re-PUTs the sidecar on retry — S3 PUTs are idempotent.
+   */
+  sidecar?: { path: string; s3Key: string; contentType: string };
 }
 
 export interface SegmentSource {
@@ -143,17 +150,29 @@ export class Uploader {
           }
 
           let body: Buffer;
+          let sidecarBody: Buffer | null = null;
           try {
             body = readFileSync(seg.path);
+            if (seg.sidecar) sidecarBody = readFileSync(seg.sidecar.path);
           } catch {
             // Evicted or already gone — not an error, just move on.
             this.skipped.add(seg.path);
             continue;
           }
 
+          // One controller covers the whole segment unit (sidecar + main PUT)
+          // so pause() aborts whichever transfer is in flight.
           this.aborter = new AbortController();
           this.setUploading(true);
           try {
+            if (seg.sidecar && sidecarBody) {
+              await this.opts.put(
+                seg.sidecar.s3Key,
+                sidecarBody,
+                seg.sidecar.contentType,
+                this.aborter.signal,
+              );
+            }
             await this.opts.put(key, body, source.contentType, this.aborter.signal);
           } finally {
             this.aborter = null;
@@ -163,6 +182,13 @@ export class Uploader {
             unlinkSync(seg.path);
           } catch {
             /* deleted concurrently (eviction) — S3 copy exists, fine */
+          }
+          if (seg.sidecar) {
+            try {
+              unlinkSync(seg.sidecar.path);
+            } catch {
+              /* same */
+            }
           }
           this.lastUploadAt = Date.now();
           this.backoffMs = this.opts.backoffMinMs ?? BACKOFF_MIN_MS;

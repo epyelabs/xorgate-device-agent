@@ -23,7 +23,7 @@ import {
 import { connect } from "./agent/mqtt.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector, type GroupSample } from "./agent/collectors/index.js";
-import { loadManifest } from "./media/manifest.js";
+import { loadManifest, persistUploadBucket } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
 import { s3Put } from "./recording/s3-put.js";
 import { RecordingManager, type RecordingUploadOptions } from "./recording/manager.js";
@@ -223,6 +223,25 @@ function handleConfigMessage(payload: Buffer): void {
     store.event("warn", "ignoring malformed cloud config message", now);
     store.flush(now, true);
     return;
+  }
+  // uploadBucket backfill (Phase 6.2): devices fielded before Phase 2 have no
+  // uploadBucket in kvs.json and silently cannot upload; the retained config
+  // message now carries it. Persist + re-arm the uploader live (the retained
+  // redelivery on every reconnect returns "unchanged" and no-ops).
+  if (parsed.uploadBucket && !config.offline) {
+    try {
+      const res = persistUploadBucket(config.media.manifestPath, parsed.uploadBucket);
+      if (res === "applied") {
+        console.log(`[agent] uploadBucket persisted into kvs.json: ${parsed.uploadBucket}`);
+        store.event("info", `uploadBucket backfilled: ${parsed.uploadBucket}`, now);
+        store.flush(now, true);
+        recording.setUpload(buildUploadOptions());
+      }
+    } catch (err) {
+      console.error("[agent] uploadBucket persist failed", (err as Error).message);
+      store.event("warn", `uploadBucket persist failed: ${(err as Error).message}`, now);
+      store.flush(now, true);
+    }
   }
   try {
     const { changed } = applyCloudConfig(parsed);
@@ -509,3 +528,20 @@ function shutdown(sig: string): void {
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// SIGHUP: the GNSS tty (/dev/ttyUSB1) is opened without O_NOCTTY by a session
+// leader (systemd service), so it becomes our controlling terminal — when the
+// SIM7600 drops off the USB bus the tty hangup delivers SIGHUP here. The
+// default disposition is instant death with zero logging, which systemd counts
+// as a CLEAN exit ("Deactivated successfully" — HUP is in its default
+// SuccessExitStatus), so every modem bounce looked like a silent exit-0
+// (observed 2026-07-20 bench AT+CRESET, 2026-07-23 spontaneously mid-drill).
+// Ignore it: the GPS collector reopens the port on its own when the modem
+// re-enumerates (onEnd → reopen next tick + a silent-fd watchdog), so nothing
+// needs restarting and recording/telemetry continue uninterrupted.
+process.on("SIGHUP", () => {
+  const now = Date.now();
+  console.warn("[agent] SIGHUP ignored (tty hangup — likely modem USB drop/re-enumeration)");
+  store.event("warn", "SIGHUP ignored (likely modem USB re-enumeration)", now);
+  store.flush(now, true);
+});

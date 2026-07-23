@@ -14,6 +14,7 @@
  * one rather than crashing the daemon.
  */
 import { readFileSync } from "node:fs";
+import { atomicWriteJson } from "../lib/atomicWrite.js";
 
 export interface KvsChannel {
   streamKey: string;
@@ -80,4 +81,35 @@ export function loadManifest(path: string): KvsManifest | null {
     channels,
     ...(nonEmptyString(o.uploadBucket) ? { uploadBucket: o.uploadBucket } : {}),
   };
+}
+
+/**
+ * Persist the cloud-delivered `uploadBucket` into kvs.json (offline recording
+ * plan, Phase 6.2 backfill): devices fielded before Phase 2 provisioning have
+ * no `uploadBucket` in their manifest and silently cannot upload. The retained
+ * config message now carries the bucket, and this writes it in place — the
+ * cloud value is authoritative, so an existing different value is overwritten.
+ * All other manifest fields (including unknown ones) are preserved verbatim.
+ *
+ * Returns "applied" when the file changed, "unchanged" when the bucket already
+ * matches (the retained message redelivers on every reconnect — must no-op),
+ * and "no-manifest" when kvs.json is absent/unreadable (nothing to backfill
+ * into: without credentialEndpoint etc. the uploader couldn't run anyway).
+ */
+export function persistUploadBucket(
+  path: string,
+  bucket: string,
+): "applied" | "unchanged" | "no-manifest" {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return "no-manifest";
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "no-manifest";
+  const o = raw as Record<string, unknown>;
+  if (o.uploadBucket === bucket) return "unchanged";
+  o.uploadBucket = bucket;
+  atomicWriteJson(path, o);
+  return "applied";
 }

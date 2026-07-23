@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadManifest } from "../src/media/manifest.js";
+import { readFileSync } from "node:fs";
+import { loadManifest, persistUploadBucket } from "../src/media/manifest.js";
 
 let dir: string;
 let path: string;
@@ -71,5 +72,38 @@ describe("loadManifest", () => {
     expect(loadManifest(path)?.channels).toEqual([
       { streamKey: "cam0", channelName: "dev-1-cam0" },
     ]);
+  });
+});
+
+describe("persistUploadBucket", () => {
+  it("backfills a manifest without an uploadBucket", () => {
+    writeFileSync(path, JSON.stringify(valid));
+    expect(persistUploadBucket(path, "core-bucket")).toBe("applied");
+    expect(loadManifest(path)?.uploadBucket).toBe("core-bucket");
+  });
+
+  it("no-ops when the bucket already matches (retained redelivery)", () => {
+    writeFileSync(path, JSON.stringify({ ...valid, uploadBucket: "core-bucket" }));
+    expect(persistUploadBucket(path, "core-bucket")).toBe("unchanged");
+  });
+
+  it("overwrites a different existing bucket (cloud is authoritative)", () => {
+    writeFileSync(path, JSON.stringify({ ...valid, uploadBucket: "old-bucket" }));
+    expect(persistUploadBucket(path, "new-bucket")).toBe("applied");
+    expect(loadManifest(path)?.uploadBucket).toBe("new-bucket");
+  });
+
+  it("preserves every other field verbatim, including unknown ones", () => {
+    writeFileSync(path, JSON.stringify({ ...valid, futureKey: { nested: true } }));
+    persistUploadBucket(path, "core-bucket");
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    expect(raw.futureKey).toEqual({ nested: true });
+    expect(raw.channels).toEqual(valid.channels);
+  });
+
+  it("returns no-manifest when kvs.json is absent or unparseable", () => {
+    expect(persistUploadBucket(join(dir, "nope.json"), "b")).toBe("no-manifest");
+    writeFileSync(path, "not json");
+    expect(persistUploadBucket(path, "b")).toBe("no-manifest");
   });
 });

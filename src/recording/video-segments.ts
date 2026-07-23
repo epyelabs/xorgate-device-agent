@@ -66,8 +66,15 @@ export interface VideoSidecar {
   height: number;
   fps: number;
   bitrateKbps: number;
-  /** How startTs was derived: mp4 birthtime vs anchor+seq arithmetic. */
-  anchor: "fstat" | "computed";
+  /**
+   * How startTs was derived: mp4 birthtime ("fstat"), anchor+seq arithmetic
+   * ("computed"), or — for a session's fragment 0 — the NEXT fragment's
+   * birthtime minus the nominal segment length ("boundary", Phase 6.6):
+   * fragment 0's own birthtime is the capture-process spawn (~2 s before real
+   * frames), while the 0→1 rotation boundary is media-accurate (soak-measured
+   * rotation jitter ≈ ±25 ms), so walking back from it is the honest anchor.
+   */
+  anchor: "fstat" | "computed" | "boundary";
   /** False when the fragment was cut off by a crash (may lack its moov atom). */
   finalized: boolean;
 }
@@ -106,17 +113,41 @@ export function buildSidecar(
   manifest: VideoSessionManifest,
   seq: number,
   stat: { sizeBytes: number; birthtimeMs: number; mtimeMs: number },
-  opts: { finalized: boolean },
+  opts: {
+    finalized: boolean;
+    /**
+     * Birthtime of the NEXT fragment (the seq→seq+1 rotation point), passed by
+     * the sweep for fragment 0 only. Fragment 0's own birthtime is the file
+     * open at capture spawn — ~2 s of pipeline startup before real frames — so
+     * anchoring to the boundary and walking back one nominal segment is far
+     * closer to the first real frame (Phase 6.6).
+     */
+    boundaryEndMs?: number;
+  },
 ): VideoSidecar {
   // ext4 gives real birthtimes; a zero/bogus one (some tmpfs, copied trees)
   // falls back to anchor arithmetic — that's exactly what `anchor` records.
   const nominalStart = manifest.anchorTs + seq * manifest.segmentSeconds * 1000;
   const haveBirth = stat.birthtimeMs > 1_000_000_000_000; // sanity: after 2001
-  const startTs = haveBirth ? Math.round(stat.birthtimeMs) : nominalStart;
-  const endTs = stat.mtimeMs > startTs ? stat.mtimeMs : startTs;
-  const durationMs = haveBirth
-    ? Math.round(endTs - startTs)
-    : manifest.segmentSeconds * 1000;
+  const haveBoundary =
+    opts.boundaryEndMs !== undefined && opts.boundaryEndMs > 1_000_000_000_000;
+  let startTs: number;
+  let durationMs: number;
+  let anchor: VideoSidecar["anchor"];
+  if (haveBoundary) {
+    durationMs = manifest.segmentSeconds * 1000;
+    startTs = Math.round(opts.boundaryEndMs! - durationMs);
+    anchor = "boundary";
+  } else if (haveBirth) {
+    startTs = Math.round(stat.birthtimeMs);
+    const endTs = stat.mtimeMs > startTs ? stat.mtimeMs : startTs;
+    durationMs = Math.round(endTs - startTs);
+    anchor = "fstat";
+  } else {
+    startTs = nominalStart;
+    durationMs = manifest.segmentSeconds * 1000;
+    anchor = "computed";
+  }
   const anchorMonoMs = Number(BigInt(manifest.anchorMono) / 1_000_000n);
   return {
     v: 1,
@@ -134,7 +165,7 @@ export function buildSidecar(
     height: manifest.height,
     fps: manifest.fps,
     bitrateKbps: manifest.bitrateKbps,
-    anchor: haveBirth ? "fstat" : "computed",
+    anchor,
     finalized: opts.finalized,
   };
 }
@@ -176,7 +207,8 @@ export function sweepSessionDir(
   const newest = frags[frags.length - 1];
   const closed: string[] = [];
 
-  for (const f of frags) {
+  for (let i = 0; i < frags.length; i++) {
+    const f = frags[i];
     const isNewest = f.name === newest.name;
     if (isNewest && !opts.includeNewest) continue;
     const mp4Path = join(dir, f.name);
@@ -186,6 +218,18 @@ export function sweepSessionDir(
       st = statSync(mp4Path);
     } catch {
       continue; // raced an eviction — skip
+    }
+    // Fragment 0's boundary anchor (Phase 6.6): its own birthtime is the file
+    // open at capture spawn (~2 s before real frames), but the 0→1 rotation
+    // point — the NEXT fragment's birthtime — is media-accurate. Only seq 0
+    // suffers the spawn skew; later fragments' birthtimes ARE rotation points.
+    let boundaryEndMs: number | undefined;
+    if (f.seq === 0 && i + 1 < frags.length) {
+      try {
+        boundaryEndMs = statSync(join(dir, frags[i + 1].name)).birthtimeMs;
+      } catch {
+        /* next fragment raced an eviction — fall back to fstat anchoring */
+      }
     }
     // A 0-byte fragment is a power-cut artifact (data died in page cache —
     // observed on hardware); there is nothing to salvage and a sidecar would
@@ -208,7 +252,7 @@ export function sweepSessionDir(
       { sizeBytes: st.size, birthtimeMs: st.birthtimeMs, mtimeMs: st.mtimeMs },
       // The newest fragment of a dead session may have been cut mid-write; all
       // others were finalized by splitmuxsink before it opened the next one.
-      { finalized: opts.finalized ?? !isNewest },
+      { finalized: opts.finalized ?? !isNewest, boundaryEndMs },
     );
     try {
       atomicWriteJson(sidecarPathFor(mp4Path), sidecar);

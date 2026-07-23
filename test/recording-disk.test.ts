@@ -92,6 +92,26 @@ describe("DiskManager", () => {
     expect(dm2.stats().droppedSegments).toBe(1); // reloaded from counters.json
   });
 
+  it("reflects an external counter reset without a restart (Phase 6.5)", async () => {
+    seg("s1", "seg-1-00000.jsonl.gz", 1000, 100);
+    const dm = new DiskManager({
+      root,
+      retention: { maxBytes: 100, minFreeBytes: 0 },
+      freeBytes: async () => 10_000_000,
+    });
+    await dm.enforce();
+    expect(dm.stats().droppedSegments).toBe(1);
+
+    // `xorgate recording reset-counters` writes this from a separate process.
+    writeFileSync(join(root, "counters.json"), JSON.stringify({ v: 1, droppedSegments: 0 }));
+    expect(dm.stats().droppedSegments).toBe(0);
+
+    // The next eviction counts up from the reset value, not the old memory.
+    seg("s2", "seg-2-00000.jsonl.gz", 1000, 200);
+    await dm.enforce();
+    expect(dm.stats().droppedSegments).toBe(1);
+  });
+
   it("respects setActivePath registration", async () => {
     const protectedGz = seg("s1", "seg-1-00000.jsonl.gz", 1000, 100);
     const other = seg("s1", "seg-2-00001.jsonl.gz", 1000, 200);

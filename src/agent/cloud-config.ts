@@ -41,6 +41,13 @@ export interface CloudConfig {
    * key. Absent (undefined) = message had no recording key; leave local alone.
    */
   recording?: RecordingSettings | null;
+  /**
+   * Segment-upload S3 bucket (Phase 6.2 backfill for devices fielded before
+   * Phase 2 provisioning). Persisted into kvs.json — NOT settings.json — by
+   * the worker (see persistUploadBucket); carried here so parsing stays in
+   * one place.
+   */
+  uploadBucket?: string;
 }
 
 /**
@@ -62,6 +69,10 @@ export function parseCloudConfig(payload: Buffer | string): CloudConfig | null {
   if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
   const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
   if (imuMount) out.imuMount = imuMount;
+  const uploadBucket = (obj as { uploadBucket?: unknown }).uploadBucket;
+  if (typeof uploadBucket === "string" && uploadBucket.length > 0) {
+    out.uploadBucket = uploadBucket;
+  }
   const recording = (obj as { recording?: unknown }).recording;
   if (recording && typeof recording === "object" && !Array.isArray(recording)) {
     // parseRecordingSettings normalizes (clamps numbers, drops mistyped keys)

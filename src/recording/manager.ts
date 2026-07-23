@@ -130,32 +130,48 @@ export class RecordingManager {
     this.opts = opts;
     this.root = opts.root ?? recordingsRoot();
     this.cfg = resolveRecordingConfig(loadSettings().recording);
-    if (opts.upload) {
-      this.uploader = new Uploader({
-        sources: [
-          createTelemetrySource(opts.deviceId, telemetryRoot(this.root)),
-          // Video pairs (Phase 4). Registered even on camera-less hosts — with
-          // no video tree it lists nothing, and it still drains leftovers if
-          // video is later disabled/unbridged.
-          createVideoSource(opts.deviceId, videoRoot(this.root), {
-            isSessionActive: (sessionId) =>
-              this.videoCapture?.activeSessionIds().has(sessionId) ?? false,
-          }),
-          ...(opts.upload.extraSources ?? []),
-        ],
-        put: opts.upload.put,
-        isOnline: opts.upload.isOnline,
-        mode: () => this.cfg.upload.mode,
-        backoffMinMs: opts.upload.backoffMinMs,
-        backoffMaxMs: opts.upload.backoffMaxMs,
-        onStatus: () => this.notifyStatus(),
-        onEvent: (level, msg) => this.opts.onEvent?.(level, msg),
-        onUploaded: () => {
-          // Refresh backlog gauges (and let eviction see the freed space).
-          void this.runEnforce();
-        },
-      });
-    }
+    if (opts.upload) this.uploader = this.buildUploader(opts.upload);
+  }
+
+  private buildUploader(upload: RecordingUploadOptions): Uploader {
+    return new Uploader({
+      sources: [
+        createTelemetrySource(this.opts.deviceId, telemetryRoot(this.root)),
+        // Video pairs (Phase 4). Registered even on camera-less hosts — with
+        // no video tree it lists nothing, and it still drains leftovers if
+        // video is later disabled/unbridged.
+        createVideoSource(this.opts.deviceId, videoRoot(this.root), {
+          isSessionActive: (sessionId) =>
+            this.videoCapture?.activeSessionIds().has(sessionId) ?? false,
+        }),
+        ...(upload.extraSources ?? []),
+      ],
+      put: upload.put,
+      isOnline: upload.isOnline,
+      mode: () => this.cfg.upload.mode,
+      backoffMinMs: upload.backoffMinMs,
+      backoffMaxMs: upload.backoffMaxMs,
+      onStatus: () => this.notifyStatus(),
+      onEvent: (level, msg) => this.opts.onEvent?.(level, msg),
+      onUploaded: () => {
+        // Refresh backlog gauges (and let eviction see the freed space).
+        void this.runEnforce();
+      },
+    });
+  }
+
+  /**
+   * Arm (or re-arm) segment uploads live — the Phase 6.2 uploadBucket backfill:
+   * a device that booted without a bucket in kvs.json gets one over the
+   * retained config message and must start uploading without a restart. A
+   * previously armed uploader is stopped and replaced (its PUT closure captured
+   * the old bucket). No-op when the worker still has no upload target.
+   */
+  setUpload(upload: RecordingUploadOptions | undefined): void {
+    if (!upload) return;
+    this.uploader?.stop();
+    this.uploader = this.buildUploader(upload);
+    this.uploader.kick();
   }
 
   /** Startup: crash-recover any earlier run's segments, then apply current settings. */

@@ -57,6 +57,14 @@ describe("parseCloudConfig", () => {
     ).toEqual({ recording: { telemetry: { rateHz: 20 } } });
   });
 
+  it("parses uploadBucket and drops empty/mistyped values", () => {
+    expect(
+      parseCloudConfig(JSON.stringify({ v: 1, uploadBucket: "core-bucket" })),
+    ).toEqual({ uploadBucket: "core-bucket" });
+    expect(parseCloudConfig(JSON.stringify({ v: 1, uploadBucket: "" }))).toEqual({});
+    expect(parseCloudConfig(JSON.stringify({ v: 1, uploadBucket: 42 }))).toEqual({});
+  });
+
   it("maps an empty/all-invalid recording object to null (cloud-managed defaults)", () => {
     expect(parseCloudConfig(JSON.stringify({ v: 1, recording: {} }))).toEqual({
       recording: null,

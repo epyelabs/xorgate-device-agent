@@ -16,6 +16,7 @@ import { logsCommand } from "./commands/logs.js";
 import { updateCommand } from "./commands/update.js";
 import { setCommand } from "./commands/set.js";
 import { pipelineCommand } from "./commands/pipeline.js";
+import { recordingCommand } from "./commands/recording.js";
 
 const VERSION = "0.2.0";
 /** Flags that take a value — skipped when locating the subcommand token. */
@@ -83,6 +84,9 @@ async function main(): Promise<void> {
     case "pipeline":
       await pipelineCommand(rest);
       break;
+    case "recording":
+      await recordingCommand(rest);
+      break;
     case "monitor": // deprecated alias for `manage`, kept working for one release
     case "manage": {
       if (cmd === "monitor") console.error("[xorgate] 'monitor' is deprecated; use 'manage'");
@@ -117,6 +121,8 @@ Commands:
              'set recording.<section>.<field> <value>' (on-device recording, applied live —
              e.g. 'set recording.telemetry.enabled on', 'set recording.telemetry.rateHz 10')
   pipeline   Manage per-stream KVS pipelines: 'pipeline list|show|set|clear <streamKey> [file]'
+  recording  On-device recording maintenance: 'recording reset-counters' zeroes the
+             cumulative droppedSegments counter (applied live, no restart)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)

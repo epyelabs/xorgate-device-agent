@@ -114,6 +114,35 @@ describe("buildSidecar", () => {
       finalized: false,
     });
   });
+
+  it("anchors fragment 0 to the next fragment's birthtime (anchor=boundary, Phase 6.6)", () => {
+    // Fragment 0's own birthtime is the capture spawn — ~2 s before real
+    // frames. The 0→1 rotation happened at T0+62 s; walking back one nominal
+    // segment puts startTs at T0+2 s, not the spawn-time T0.
+    const sc = buildSidecar(
+      manifest(),
+      0,
+      { sizeBytes: 9, birthtimeMs: T0, mtimeMs: T0 + 62_000 },
+      { finalized: true, boundaryEndMs: T0 + 62_000 },
+    );
+    expect(sc).toMatchObject({
+      startTs: T0 + 2_000,
+      durationMs: 60_000,
+      anchor: "boundary",
+    });
+    expect(sc.startMono).toBe(500_000 + 2_000);
+  });
+
+  it("ignores a bogus boundary and falls back to fstat", () => {
+    const sc = buildSidecar(
+      manifest(),
+      0,
+      { sizeBytes: 9, birthtimeMs: T0, mtimeMs: T0 + 60_000 },
+      { finalized: true, boundaryEndMs: 0 },
+    );
+    expect(sc.anchor).toBe("fstat");
+    expect(sc.startTs).toBe(T0);
+  });
 });
 
 describe("sweepSessionDir", () => {
@@ -125,6 +154,22 @@ describe("sweepSessionDir", () => {
     expect(existsSync(join(dir, "00000.json"))).toBe(true);
     expect(existsSync(join(dir, "00001.json"))).toBe(true);
     expect(existsSync(join(dir, "00002.json"))).toBe(false);
+  });
+
+  it("gives fragment 0 a boundary anchor when fragment 1 exists (Phase 6.6)", () => {
+    const dir = sessionDir("cam0", "sess-b", 3);
+    sweepSessionDir(dir, manifest(), { includeNewest: false });
+    const sc0 = JSON.parse(readFileSync(join(dir, "00000.json"), "utf8")) as {
+      anchor: string;
+      startTs: number;
+      durationMs: number;
+    };
+    expect(sc0.anchor).toBe("boundary");
+    // startTs + durationMs lands exactly on fragment 1's birthtime.
+    const sc1 = JSON.parse(readFileSync(join(dir, "00001.json"), "utf8")) as {
+      startTs: number;
+    };
+    expect(Math.abs(sc0.startTs + sc0.durationMs - sc1.startTs)).toBeLessThanOrEqual(1);
   });
 
   it("is idempotent — a second sweep writes nothing new", () => {

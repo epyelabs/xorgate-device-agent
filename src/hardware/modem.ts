@@ -41,6 +41,8 @@ export interface ModemTelemetry {
   status: string;
   iface: string;
   ip: string | null;
+  /** Modem PMU temperature in °C (AT+CPMUTEMP), or null/absent when never read. */
+  modem_temp?: number | null;
 }
 
 /**

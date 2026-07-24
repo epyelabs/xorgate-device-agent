@@ -48,12 +48,23 @@ export interface TelemetryMetrics {
     /** Horizontal dilution of precision (GSA) — fix confidence, lower is better. */
     hdop?: MetricLeaf;
   };
-  lte: { rssi: MetricLeaf; quality: MetricLeaf };
+  lte: {
+    rssi: MetricLeaf;
+    quality: MetricLeaf;
+    /** Modem PMU temperature (°C) from the daemon's AT+CPMUTEMP poll. */
+    modem_temp?: MetricLeaf;
+  };
   system: {
     cpu_usage: MetricLeaf;
     cpu_temp: MetricLeaf;
     ram_usage: MetricLeaf;
     disk_usage: MetricLeaf;
+    /** Throttle bits 0–3, CURRENT state: 1 undervoltage, 2 freq capped, 4 throttled, 8 soft temp limit. */
+    throttled?: MetricLeaf;
+    /** EXT5V input rail voltage (V), Pi 5 family only. */
+    rail_5v?: MetricLeaf;
+    /** PSU max current negotiated at boot (mA): 5000 on a 5V/5A PD supply, 3000 otherwise. */
+    psu_max_current?: MetricLeaf;
   };
 }
 

@@ -82,6 +82,10 @@ CSQ_INTERVAL_WEAK=5          # signal weak / recovering (CSQ < MIN_CSQ)
 CSQ_INTERVAL_STABLE=30       # signal stable and connected
 CSQ_RAPID_DELTA=3            # CSQ change threshold to trigger fast polling
 
+# Modem temperature poll (AT+CPMUTEMP) — temperature moves slowly, so this
+# rides its own fixed interval instead of the adaptive CSQ cadence.
+MODEM_TEMP_INTERVAL="${SIM7600_MODEM_TEMP_INTERVAL:-30}"
+
 # GPS / GNSS
 ENABLE_GPS="${SIM7600_ENABLE_GPS:-1}"   # set 0 to skip enabling GNSS
 # Constellations on top of GPS (AT+CGNSSMODE bitmask): 1 GLONASS, 2 BeiDou,
@@ -147,6 +151,8 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a /var/log/sim7
 #   "ip":           current IP string, or null
 #   "xtra_valid_min": minutes of GNSS XTRA assistance validity left, or null
 #   "gnss_ant_bias": 0|1 last-applied antenna bias state, or null before first apply
+#   "modem_temp":   modem PMU temperature in °C (AT+CPMUTEMP), or null if
+#                   never read / unsupported by this firmware
 # }
 write_telemetry() {
     local csq="$1"
@@ -188,7 +194,8 @@ write_telemetry() {
   "iface": "$IFACE",
   "ip": $ip,
   "xtra_valid_min": ${XTRA_VALID_MIN:-null},
-  "gnss_ant_bias": ${GNSS_BIAS_APPLIED:-null}
+  "gnss_ant_bias": ${GNSS_BIAS_APPLIED:-null},
+  "modem_temp": ${MODEM_TEMP:-null}
 }
 EOF
 
@@ -323,6 +330,31 @@ adaptive_interval() {
         # Signal stable — back off to conserve AT bus bandwidth
         echo "$CSQ_INTERVAL_STABLE"
     fi
+}
+
+# --- Modem temperature --------------------------------------------------------
+# PMU temperature via AT+CPMUTEMP, published in telemetry as "modem_temp".
+# Empty until the first successful read; an ERROR/empty response leaves the
+# last good value in place (a lost AT response is not a temperature change).
+MODEM_TEMP=""
+MODEM_TEMP_AT=-9999   # negative so the first maybe_update fires immediately
+
+get_modem_temp() {
+    # Updates MODEM_TEMP in the CURRENT shell (same subshell pitfall update_reg
+    # documents — command substitution would discard the value).
+    local val
+    val=$(at_query "AT+CPMUTEMP" | sed -n 's/.*+CPMUTEMP:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' | head -1)
+    if [[ -n "$val" ]]; then
+        MODEM_TEMP="$val"
+    fi
+}
+
+# Self-throttled wrapper — call next to get_csq in the poll loops; the daemon
+# is single-threaded and sole owner of the AT port, so sequencing is safe.
+maybe_update_modem_temp() {
+    (( SECONDS - MODEM_TEMP_AT >= MODEM_TEMP_INTERVAL )) || return 0
+    MODEM_TEMP_AT=$SECONDS
+    get_modem_temp
 }
 
 # --- GPS / GNSS --------------------------------------------------------------
@@ -809,6 +841,7 @@ wait_for_stable_signal() {
     while true; do
         local csq dbm
         csq=$(get_csq)
+        maybe_update_modem_temp
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
 
@@ -885,6 +918,7 @@ monitor_connection() {
 
         local csq dbm interval
         csq=$(get_csq)
+        maybe_update_modem_temp
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
         prev_csq="$csq"

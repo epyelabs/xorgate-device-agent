@@ -82,6 +82,21 @@ describe("createLteCollector", () => {
     await rm(join(file, ".."), { recursive: true, force: true });
   });
 
+  it("emits modem_temp (°C) when the daemon reports one", async () => {
+    const { collector, file } = await collectorFor({ ...SAMPLE, modem_temp: 39 });
+    const fields = (await collector.read()) as Record<string, { value: number; unit?: string }>;
+    expect(fields.modem_temp).toEqual({ value: 39, unit: "°C" });
+    await rm(join(file, ".."), { recursive: true, force: true });
+  });
+
+  it("omits modem_temp when the daemon reports null (never read / unsupported)", async () => {
+    const { collector, file } = await collectorFor({ ...SAMPLE, modem_temp: null });
+    const fields = (await collector.read()) as Record<string, unknown>;
+    expect(fields.modem_temp).toBeUndefined();
+    expect(fields.quality).toBeDefined();
+    await rm(join(file, ".."), { recursive: true, force: true });
+  });
+
   it("omits the group when the signal is unknown (csq 99)", async () => {
     const { collector, file } = await collectorFor({ ...SAMPLE, csq: 99, rssi_dbm: null });
     expect(await collector.read()).toEqual({});

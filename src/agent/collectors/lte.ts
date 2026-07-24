@@ -27,6 +27,8 @@ export function createLteCollector(): Collector {
     if (typeof t.csq !== "number" || t.csq === 99) return null; // unknown signal
     const out: Record<string, unknown> = { quality: { value: t.csq, unit: "asu" } };
     if (typeof t.rssi_dbm === "number") out.rssi = { value: t.rssi_dbm, unit: "dBm" };
+    if (typeof t.modem_temp === "number" && Number.isFinite(t.modem_temp))
+      out.modem_temp = { value: t.modem_temp, unit: "°C" };
     return out;
   }
 

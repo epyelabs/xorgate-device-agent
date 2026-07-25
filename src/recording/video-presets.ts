@@ -7,8 +7,15 @@
  * Measured on the test Pi (README hardware facts, 2026-07-21):
  *   1080p30 @ 4 Mbps x264 veryfast ≈ 69 % of one core per camera
  *   720p15  @ 1.5 Mbps            ≈ 23 % of one core per camera
- * Default stays mid-range (1080p15) so dual-camera record + live stream keeps
- * comfortable headroom on 4 cores.
+ * Dual-camera on the shipped pipeline (ultrafast/zerolatency), static bench
+ * scene, 30 s segments (2026-07-25):
+ *   720p30 @ 2 Mbps ≈ 38 % of one core per camera — 7.2 MB/segment
+ *   720p15 @ 2 Mbps ≈ 24 %                        — 7.1 MB/segment
+ *   720p15 @ 1 Mbps ≈ 21 %                        — 3.4 MB/segment
+ * i.e. halving fps at the same bitrate buys CPU, not disk; the 1 Mbps rung is
+ * the one that halves bytes on disk and the upload backlog. Default stays
+ * mid-range (1080p15) so dual-camera record + live stream keeps comfortable
+ * headroom on 4 cores.
  */
 
 export interface VideoPreset {
@@ -25,6 +32,8 @@ export const VIDEO_PRESETS: readonly VideoPreset[] = [
   { name: "1080p30-4mbps", width: 1920, height: 1080, fps: 30, bitrateKbps: 4000 },
   { name: "1080p15-2mbps", width: 1920, height: 1080, fps: 15, bitrateKbps: 2000 },
   { name: "720p30-2mbps", width: 1280, height: 720, fps: 30, bitrateKbps: 2000 },
+  { name: "720p15-2mbps", width: 1280, height: 720, fps: 15, bitrateKbps: 2000 },
+  { name: "720p15-1mbps", width: 1280, height: 720, fps: 15, bitrateKbps: 1000 },
 ];
 
 /** Default preset name — must exist in VIDEO_PRESETS (see RECORDING_DEFAULTS). */

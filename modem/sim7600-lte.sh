@@ -67,6 +67,16 @@ AT_SETTING_RETRY_DELAY=1     # pause between attempts
 # exactly where the daemon's startup reads fall. Apparent drift must
 # therefore hold across a re-read this far apart before it may be repaired.
 DRIFT_CONFIRM_DELAY=15       # secs between the two reads that confirm drift
+# GNSS engine start sequencing (F4, verified on-device 2026-07-25): the
+# SUPL-assisted start AT+CGPS=1,2 is rejected ("explicit mode not accepted")
+# when issued too soon after AT+CGPS=0 or a modem reboot; the same command is
+# accepted after a ~4-5 s settle. Sequencing bug, not a firmware limitation.
+GNSS_START_SETTLE_SECS=5     # min settle before an explicit-mode engine start
+# Post-reset quiet period (F10/F11): for ~10 s after re-enumeration the modem
+# answers config queries with well-formed boot DEFAULTS (NV not yet loaded)
+# and auto-restarts the GNSS engine itself as plain "1,1". Post-reset recovery
+# must sit out this window before trusting or touching GNSS state.
+GNSS_RESET_SETTLE_SECS=15    # wait after modem reboot before GNSS recovery acts
 
 # Recovery ladder / wedge detection (seconds unless noted)
 # After consecutive failed connect cycles the ladder escalates:
@@ -455,23 +465,38 @@ gps_stop() {
     fi
 }
 
+# Start the GNSS engine, SUPL-assisted when a SUPL server is configured.
+# Callers reach here only with the engine off ("found off" or post-reset via
+# gnss_recover_after_reset) — never to re-start a running engine (F5 non-goal).
+# F5: mode 2 is non-sticky — when the SUPL session fails the engine
+# auto-reverts and AT+CGPS? later reads 1,1. That is the documented fallback,
+# NOT a failed start; nothing may flap the engine to force mode 2 back
+# (gnss_reassert's "any 1,x = on" check depends on this).
 gps_start() {
     if gps_engine_on; then
         return
     fi
-    if [[ -n "$SUPL_URL" ]]; then
-        log "Starting GNSS in UE-based AGPS mode (AT+CGPS=1,2; falls back to standalone)..."
-        at_cmd "AT+CGPS=1,2" 2
-    else
-        log "Starting GNSS in standalone mode (AT+CGPS=1,1)..."
-        at_cmd "AT+CGPS=1,1" 2
+    local mode="1,2" desc="UE-based AGPS (SUPL; auto-falls back to standalone)"
+    if [[ -z "$SUPL_URL" ]]; then
+        mode="1,1" desc="standalone"
     fi
-    # Some firmware rejects the mode argument when a previous session is still
-    # winding down — a plain start is better than no GNSS at all.
-    if ! gps_engine_on; then
-        warn "GNSS start with explicit mode not accepted; retrying plain AT+CGPS=1."
-        at_cmd "AT+CGPS=1" 2
+    # F4: the explicit-mode start is rejected when it lands too close to the
+    # last AT+CGPS=0 / modem reboot; this settle is what turns the historical
+    # "not accepted" fallback into a first-try acceptance.
+    sleep "$GNSS_START_SETTLE_SECS"
+    log "Starting GNSS engine in $desc mode (AT+CGPS=$mode)..."
+    local resp
+    resp=$(at_query "AT+CGPS=$mode" 6)
+    if ! grep -q "OK" <<< "$resp"; then
+        warn "AT+CGPS=$mode not accepted — retrying once after another ${GNSS_START_SETTLE_SECS}s settle."
+        sleep "$GNSS_START_SETTLE_SECS"
+        resp=$(at_query "AT+CGPS=$mode" 6)
     fi
+    if grep -q "OK" <<< "$resp"; then
+        return 0
+    fi
+    warn "GNSS explicit-mode start failed twice — falling back to plain AT+CGPS=1 (running standalone: SUPL assist unavailable this session)."
+    at_cmd "AT+CGPS=1" 2
 }
 
 # Read a "+PREFIX: value" style current setting; prints the raw value part.
@@ -530,8 +555,9 @@ drift_is_stable() {
 # One-time (idempotent) GNSS configuration. Compares each persisted setting
 # and only writes on drift, so a normal boot makes no config writes and no
 # modem reset. Settings that need the engine stopped stop it first; settings
-# that only apply after a module restart set need_reset, and we AT+CRESET
-# once at the end (values persist in NV, so the post-reset pass is a no-op).
+# that only apply after a module restart set need_reset, and we AT+CRESET once
+# at the end (values persist in NV) — exiting through gnss_recover_after_reset
+# like every other reset path.
 configure_gnss() {
     if [[ "$ENABLE_GPS" != "1" ]]; then
         log "GNSS setup skipped (SIM7600_ENABLE_GPS=$ENABLE_GPS)."
@@ -612,11 +638,13 @@ configure_gnss() {
     if [[ "$need_reset" -eq 1 ]]; then
         log "GNSS settings changed — resetting modem (AT+CRESET) to apply..."
         at_cmd "AT+CRESET" 2
-        wait_for_modem_reboot || return 1
-        log "Modem back after GNSS config reset."
+        # The shared routine owns everything after a reset (engine start,
+        # XTRA verify, bias re-assert) — nothing more to do here.
+        gnss_recover_after_reset || return 1
+        return 0
     fi
 
-    # XTRA auto-inject at GPS start. Must run AFTER the reset: the command is
+    # No-reset path only. XTRA auto-inject at GPS start: the command is
     # rejected with "+CME ERROR: XTRA Disabled" until CGPSXE=1 is in effect.
     if [[ "$GNSS_XTRA" == "1" ]]; then
         at_cmd "AT+CGPSXDAUTO=1" 1
@@ -755,6 +783,58 @@ wait_for_modem_reboot() {
     wait_for_modem_ready || return 1
 }
 
+# --- Unified post-reset GNSS recovery ----------------------------------------
+# The ONLY way back from an AT+CRESET. Every reset site (configure_gnss's
+# apply-reset tail, recover_modem_reset — which the dead-zone nudge reuses —
+# and any future rung) must exit through here so no path can forget a step.
+# Contract: call immediately after issuing AT+CRESET. Returns 0 with the GNSS
+# engine started (SUPL mode attempted per F4), XTRA validity verified (stale ->
+# xtra_maintain throttle cleared), antenna bias re-asserted from settings, and
+# the engine/bias check throttles zeroed. Returns 1 only if the modem never
+# came back on USB — the caller decides what that means for its path.
+gnss_recover_after_reset() {
+    wait_for_modem_reboot || return 1
+    log "Modem back after reset — running unified GNSS recovery."
+    if [[ "$ENABLE_GPS" != "1" ]]; then
+        log "GNSS recovery skipped (SIM7600_ENABLE_GPS=$ENABLE_GPS)."
+        return 0
+    fi
+    # F10/F11: right after re-enumeration the modem serves boot-default config
+    # answers and auto-restarts the GNSS engine on its own (~10 s in). Sit that
+    # window out so we act on the engine's true state instead of racing it.
+    log "Settling ${GNSS_RESET_SETTLE_SECS}s for NV load + GNSS auto-restart (F10/F11)..."
+    sleep "$GNSS_RESET_SETTLE_SECS"
+    # XTRA auto-inject re-assert. Must follow the settle: the command is
+    # rejected with "+CME ERROR: XTRA Disabled" until CGPSXE=1 is in effect.
+    if [[ "$GNSS_XTRA" == "1" ]]; then
+        at_cmd "AT+CGPSXDAUTO=1" 1
+    fi
+    # F11: the auto-restarted engine runs plain (1,1) — the reset already cost
+    # us its acquisition, and no SUPL start was ever issued. One stop followed
+    # by a settled gps_start is the sanctioned post-reset SUPL-mode start.
+    # (NOT the F5 flapping non-goal: that forbids restarting a healthy running
+    # session because AT+CGPS? read 1,1 after a SUPL auto-fallback.)
+    gps_stop
+    gps_start
+    # Verify XTRA assistance survived the reset (file lives in module flash).
+    local valid
+    valid=$(at_setting_confirmed "AT+CGPSXTRADATA?" "CGPSXTRADATA" | cut -d, -f1 | tr -d ' ')
+    [[ -n "$valid" ]] && XTRA_VALID_MIN=$valid
+    if [[ -n "$valid" && "$valid" -ge "$XTRA_MIN_VALID_MIN" ]]; then
+        log "XTRA assistance intact after reset (valid ${valid} min)."
+    else
+        warn "XTRA validity ${valid:-unknown} min after reset — clearing throttle so xtra_maintain re-downloads on the next healthy tick."
+        LAST_XTRA_CHECK=0
+    fi
+    # The reset reverted the antenna bias LDO; re-assert from settings NOW
+    # rather than waiting for a healthy link (dead-zone resets may not see one
+    # for a long time). Zero the throttles so the health loop re-checks soon.
+    gnss_bias_apply "$(gnss_bias_desired)"
+    LAST_BIAS_CHECK=0
+    LAST_GNSS_CHECK=0
+    log "Unified GNSS recovery complete."
+}
+
 # --- Recovery ladder ----------------------------------------------------------
 # Escalating interventions for connect cycles that keep failing. A plain
 # NETOPEN+dhclient retry cannot fix a wedged data call: the DHCP lease comes
@@ -805,13 +885,11 @@ recover_modem_reset() {
     LAST_MODEM_RESET=$now
     err "Recovery L3: full modem reset (AT+CRESET)..."
     at_query "AT+CRESET" 5 >/dev/null
-    wait_for_modem_reboot || return 1
-    log "Modem back after recovery reset."
-    # Modem rebooted: GNSS engine and antenna bias reverted; reassert them.
-    GNSS_BIAS_APPLIED=""
-    LAST_BIAS_CHECK=0
-    LAST_GNSS_CHECK=0
-    configure_gnss || warn "GNSS reconfiguration after recovery reset failed; continuing with LTE only."
+    # The shared routine owns the reset exit: engine restart (SUPL mode), XTRA
+    # verify, bias re-assert. GNSS NV config survives the reset, so a full
+    # configure_gnss re-read pass is not needed (and would land its reads in
+    # the F10 boot-default window for nothing).
+    gnss_recover_after_reset || return 1
 }
 
 # Consecutive failed connect cycles (reset by the health monitor on the first

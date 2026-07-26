@@ -17,12 +17,15 @@
 #   - Signal-aware reconnect: distinguishes dead zone vs network failure
 #   - Registration-aware: good RSSI alone never triggers a connect attempt;
 #     the modem must also be attached to the network (AT+CEREG)
-#   - Escalating recovery ladder for failures a plain retry can't fix:
-#     PS re-attach (AT+CGATT/AT+COPS) -> radio cycle (AT+CFUN) -> full modem
-#     reset (AT+CRESET, the same cure a host reboot provides)
+#   - Escalating recovery ladder for failures a plain retry can't fix,
+#     ordered by blast radius (GNSS-free tools first): PS re-attach
+#     (AT+CGATT/AT+COPS) -> PDP bounce (AT+CGACT) -> radio cycle (AT+CFUN,
+#     GNSS-safe) -> full modem reset (AT+CRESET — GNSS-destructive, so it is
+#     gated: cooldown + earned radio cycles + GNSS-fix policy + daily budget)
 #   - Wedge detection in dead-zone wait: no service for too long nudges the
-#     radio, then resets the modem (firmware can stop cell-searching after a
-#     prolonged outage)
+#     radio on an exponential backoff (firmware can stop cell-searching after
+#     a prolonged outage); a reset only after repeated radio cycles provably
+#     didn't help, and only through the same gate
 #   - Atomic JSON telemetry output for consumption by other processes
 #   - Automatic reconnect on link failure
 #
@@ -43,6 +46,12 @@
 SERIAL="${SIM7600_SERIAL:-/dev/ttyUSB2}"
 IFACE="${SIM7600_IFACE:-usb0}"
 PING_HOST="${SIM7600_PING_HOST:-8.8.8.8}"
+# Second opinion for the end-to-end WAN verdict: "down" requires BOTH hosts to
+# fail, so a one-target anomaly (anycast outage, route filter) can't walk the
+# recovery ladder toward a modem reset for nothing. Empty disables it.
+# NOTE for fault injection: blackholing PING_HOST alone no longer fails the
+# health check — override BOTH hosts (e.g. 192.0.2.1 / 192.0.2.2).
+PING_HOST2="${SIM7600_PING_HOST2:-1.1.1.1}"
 
 # Signal thresholds (AT+CSQ returns RSSI 0–31; 99 = unknown)
 # 10 = ~-93dBm (marginal), 15 = ~-83dBm (good)
@@ -79,11 +88,35 @@ GNSS_START_SETTLE_SECS=5     # min settle before an explicit-mode engine start
 GNSS_RESET_SETTLE_SECS=15    # wait after modem reboot before GNSS recovery acts
 
 # Recovery ladder / wedge detection (seconds unless noted)
-# After consecutive failed connect cycles the ladder escalates:
-#   fail 1: plain retry, fail 2: PS re-attach, fail 3: radio cycle,
-#   fail 4: modem reset (AT+CRESET) — then the ladder repeats.
-DEADZONE_NUDGE_SECS="${SIM7600_DEADZONE_NUDGE_SECS:-600}"  # no service this long -> nudge radio
+# After consecutive failed connect cycles the ladder escalates in blast-radius
+# order (F1/F2: re-attach, PDP bounce and radio cycle are GNSS-free; F3: only
+# AT+CRESET destroys GNSS acquisition):
+#   fail 2: L1 re-attach, fail 3: L1 + PDP bounce, fails 4-5: L2 radio cycle,
+#   fail 6: L3 modem reset (gated, below) — then the cycle repeats from L2
+#   (this deep, re-attaches have proven useless).
 RECONNECT_DELAY_MAX=60       # cap for backed-off reconnect delay
+# Dead-zone nudge pacing comes from the lteRecovery.deadZoneProfile policy
+# preset in settings.json (see deadzone_profile_params for the bundles). These
+# env knobs, when set, override the active profile's raw values — dev tuning
+# only, never the user surface (R8: presets are policy, numbers are not).
+DEADZONE_NUDGE_BASE_OVERRIDE="${SIM7600_DEADZONE_NUDGE_SECS:-}"        # first nudge after this long without service
+DEADZONE_NUDGE_CAP_OVERRIDE="${SIM7600_DEADZONE_NUDGE_CAP_SECS:-}"     # backoff ceiling
+DEADZONE_CYCLES_OVERRIDE="${SIM7600_DEADZONE_CYCLES_BEFORE_RESET:-}"   # failed radio cycles before a reset may be tried; -1 = never
+# Global CRESET gate (R3): beyond the cooldown, a reset must be *earned* — at
+# least this many radio cycles must have actually fired since the last
+# verified-healthy connection. The GNSS-free tools go first, always.
+CRESET_MIN_RADIO_CYCLES="${SIM7600_CRESET_MIN_RADIO_CYCLES:-2}"
+# GNSS-fix gate (policy lteRecovery.gpsFixResetPolicy, default "defer"): with
+# a live fix, a reset is allowed only once LTE has been unusable this long —
+# position continuity outranks upload immediacy for a dashcam; uploads buffer.
+CRESET_FIX_DEFER_SECS="${SIM7600_CRESET_FIX_DEFER_SECS:-1800}"
+# Rolling reset budget: each CRESET is a modem boot + full re-attach — the
+# worst ~2A TX burst profile the modem has (field-crash power theory says be
+# stingy). A modem that needs a 7th daily reset has a problem resets don't
+# fix. Window state is in-memory: a daemon restart forgets earlier spend
+# (accepted — restarts are rare and the cooldown still bounds the burst rate).
+CRESET_BUDGET_MAX="${SIM7600_CRESET_BUDGET_MAX:-6}"
+CRESET_BUDGET_WINDOW_SECS="${SIM7600_CRESET_BUDGET_WINDOW_SECS:-86400}"
 # Power-aware cooldowns: a radio cycle and especially a modem reset force a
 # full re-registration, during which the SIM7600 pulls TX bursts up to ~2A.
 # On a marginal vehicle supply, clustering those events risks browning out the
@@ -437,6 +470,62 @@ gnss_bias_apply() {
     GNSS_BIAS_APPLIED="$desired"
 }
 
+# --- Recovery policy from settings.json (R8) ---------------------------------
+# Two cloud-delivered *policy* knobs ride the same conduit as gnssAntBias
+# (web device settings -> retained MQTT -> settings.json -> live re-read here).
+# Shape: {"lteRecovery": {"gpsFixResetPolicy": "...", "deadZoneProfile": "..."}}
+# Failure posture matches gnss_bias_desired: missing/unreadable file, bad
+# JSON, missing key, unknown value, no python3 — all resolve to the safe
+# default. Read at decision time (gate check / nudge), so a cloud change
+# applies without a daemon restart; both decisions are minutes apart at their
+# fastest, so the read is not hot.
+lte_recovery_setting() {
+    local key="$1"
+    python3 - "$SETTINGS_FILE" "$key" 2>/dev/null <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        v = json.load(f).get("lteRecovery")
+    v = (v or {}).get(sys.argv[2]) if isinstance(v, dict) else None
+    print(v if isinstance(v, str) else "")
+except Exception:
+    print("")
+PYEOF
+}
+
+# lteRecovery.gpsFixResetPolicy — what a live GNSS fix means for CRESET:
+#   "defer" (default): reset allowed only once LTE has been unusable
+#     >= CRESET_FIX_DEFER_SECS (both ladder and dead-zone paths).
+#   "veto-deadzone": a fix fully vetoes dead-zone-path resets; ladder-path
+#     resets still follow the defer timing.
+gps_fix_reset_policy() {
+    case "$(lte_recovery_setting gpsFixResetPolicy)" in
+        veto-deadzone) echo "veto-deadzone" ;;
+        *)             echo "defer" ;;
+    esac
+}
+
+# lteRecovery.deadZoneProfile — dead-zone nudge preset bundle. Prints
+# "name base_secs cap_secs cycles_before_reset" (cycles -1 = never reset in a
+# dead zone). The nudge interval doubles from base to cap. Bundles (the
+# Phase 5 settings UI describes these to the user):
+#   conservative: 900 -> 1800 -> 3600 -> cap 7200; never auto-resets
+#   balanced:     600 -> 1200 -> 2400 -> cap 3600; reset after 3 failed cycles
+#   aggressive:   600 -> cap 1200; reset after 1 failed cycle (~legacy cadence
+#                 but radio-cycle-first; the global CRESET gate still applies)
+deadzone_profile_params() {
+    local name base cap cycles
+    case "$(lte_recovery_setting deadZoneProfile)" in
+        conservative) name=conservative base=900 cap=7200 cycles=-1 ;;
+        aggressive)   name=aggressive   base=600 cap=1200 cycles=1 ;;
+        *)            name=balanced     base=600 cap=3600 cycles=3 ;;
+    esac
+    [[ -n "$DEADZONE_NUDGE_BASE_OVERRIDE" ]] && base="$DEADZONE_NUDGE_BASE_OVERRIDE"
+    [[ -n "$DEADZONE_NUDGE_CAP_OVERRIDE" ]] && cap="$DEADZONE_NUDGE_CAP_OVERRIDE"
+    [[ -n "$DEADZONE_CYCLES_OVERRIDE" ]] && cycles="$DEADZONE_CYCLES_OVERRIDE"
+    echo "$name $base $cap $cycles"
+}
+
 # Live re-apply: re-read settings.json (self-throttled) and only touch the AT
 # port when the desired state differs from what was last applied.
 gnss_bias_maintain() {
@@ -456,6 +545,19 @@ gps_engine_on() {
     local state
     state=$(at_query "AT+CGPS?" | sed -n 's/.*+CGPS: \([01]\).*/\1/p')
     [[ "$state" == "1" ]]
+}
+
+# Live-fix probe on the AT port (F6): AT+CGNSSINFO answers all-empty fields
+# ("+CGNSSINFO: ,,,,,...") without a fix and leads with the fix-mode digit
+# with one. The daemon cannot read the NMEA port (the agent owns it), so this
+# is its only view of fix state. Failure posture: a lost/failed read counts
+# as NO fix — an unreadable probe must not block LTE recovery (the fix gate
+# exists to protect a fix we can SEE, not to wedge the ladder).
+gnss_fix_present() {
+    [[ "$ENABLE_GPS" == "1" ]] || return 1
+    local info
+    info=$(at_query "AT+CGNSSINFO" 6 | sed -n 's/.*+CGNSSINFO: *//p' | head -1)
+    [[ "$info" == [0-9]* ]]
 }
 
 gps_stop() {
@@ -637,6 +739,11 @@ configure_gnss() {
 
     if [[ "$need_reset" -eq 1 ]]; then
         log "GNSS settings changed — resetting modem (AT+CRESET) to apply..."
+        # Config-apply resets are ungated (Q5: confirmed drift must be
+        # repaired) but still spend the shared cooldown + rolling budget —
+        # a recovery reset shortly after one of these is exactly the power
+        # clustering the gate exists to prevent.
+        creset_note_fired
         at_cmd "AT+CRESET" 2
         # The shared routine owns everything after a reset (engine start,
         # XTRA verify, bias re-assert) — nothing more to do here.
@@ -853,37 +960,119 @@ recover_reattach() {
     at_query "AT+COPS=0" 20 >/dev/null
 }
 
+# L1+ — PDP context bounce. Deactivate/reactivate context 1: still cheap,
+# WAN-level and GNSS-free; clears a wedged data call that survives a plain
+# re-attach (the network re-grants the context from scratch).
+recover_pdp_bounce() {
+    warn "Recovery L1+: PDP context bounce (AT+CGACT=0,1 -> AT+CGACT=1,1)..."
+    at_query "AT+CGACT=0,1" 15 >/dev/null
+    sleep 2
+    at_query "AT+CGACT=1,1" 30 >/dev/null
+}
+
 # L2 — radio cycle (airplane-mode bounce). Forces a full cell reselection and
-# fresh registration; recovers a radio that stopped cell-searching.
+# fresh registration; recovers a radio that stopped cell-searching. Verified
+# GNSS-safe (F1): the engine keeps streaming NMEA through the whole cycle, so
+# the ladder and the dead-zone nudge lean on this rung hard.
+# Returns 0 when the cycle fired, 2 when skipped on cooldown.
 LAST_RADIO_CYCLE=0
+# Radio cycles actually fired since the last verified-healthy link (either
+# path — ladder or dead-zone). Gates L3 (R3): a reset must be earned by
+# cheaper tools having provably failed. Healed in monitor_connection.
+RADIO_CYCLES_SINCE_OK=0
 recover_radio_cycle() {
     local now
     now=$(date +%s)
     if (( now - LAST_RADIO_CYCLE < RADIO_CYCLE_COOLDOWN )); then
         warn "Recovery L2 skipped — radio cycle on cooldown ($(( RADIO_CYCLE_COOLDOWN - (now - LAST_RADIO_CYCLE) ))s left; re-registration TX bursts are power-expensive)."
-        return 0
+        return 2
     fi
     LAST_RADIO_CYCLE=$now
-    warn "Recovery L2: radio cycle (AT+CFUN=0 -> AT+CFUN=1)..."
+    (( RADIO_CYCLES_SINCE_OK += 1 ))
+    warn "Recovery L2: radio cycle (AT+CFUN=0 -> AT+CFUN=1) (#$RADIO_CYCLES_SINCE_OK since last healthy link)..."
     at_query "AT+CFUN=0" 15 >/dev/null
     sleep 5
     at_query "AT+CFUN=1" 20 >/dev/null
     sleep 5
 }
 
-# L3 — full modem reboot. The nuclear option: equivalent to power-cycling the
-# module. The modem drops off USB and re-enumerates, so we must re-wait for
-# the serial port and re-assert GNSS state afterwards.
+# --- The global CRESET gate ---------------------------------------------------
+# AT+CRESET is the one GNSS-destructive tool (F3): it destroys acquisition at
+# exactly the moment a fast fix matters, and its boot + full re-attach is the
+# modem's worst ~2A power profile. Both recovery reset sites (ladder L3 and
+# the dead-zone nudge) go through recover_modem_reset below, where four gates
+# must ALL clear; every verdict — fired, or skipped and why — is one log
+# line (R7). configure_gnss's config-apply reset is deliberately ungated (Q5:
+# confirmed NV drift must be repaired), but it reports here so its reset
+# still spends cooldown + budget.
+
+# Epochs of fired CRESETs inside the rolling budget window, plus the pruned
+# count. In-memory only (daemon restart forgets prior spend — accepted).
+CRESET_TIMES=()
+CRESET_BUDGET_USED=0
+
+# Recount CRESET_BUDGET_USED, pruning entries older than the window. Mutates
+# globals, so callers must NOT command-substitute it (subshell would lose the
+# prune — same pitfall update_reg documents).
+creset_budget_recount() {
+    local now cutoff t kept=()
+    now=$(date +%s)
+    cutoff=$(( now - CRESET_BUDGET_WINDOW_SECS ))
+    for t in "${CRESET_TIMES[@]}"; do
+        (( t > cutoff )) && kept+=("$t")
+    done
+    CRESET_TIMES=("${kept[@]}")
+    CRESET_BUDGET_USED=${#CRESET_TIMES[@]}
+}
+
+# Record a fired CRESET (any site) into the cooldown clock + budget window.
+creset_note_fired() {
+    LAST_MODEM_RESET=$(date +%s)
+    CRESET_TIMES+=("$LAST_MODEM_RESET")
+}
+
+# L3 — full modem reboot, gated. Equivalent to power-cycling the module; the
+# modem drops off USB and re-enumerates, so the Phase-2 shared routine
+# re-waits for the port and re-establishes GNSS afterwards.
+# $1 = calling path, "ladder" (default) or "deadzone" — the fix policy
+# distinguishes them. Returns: 0 = reset fired and GNSS recovery completed,
+# 1 = reset fired but the modem never re-enumerated (caller decides),
+# 2 = gate said no (verdict logged; caller should keep radio-cycling).
 LAST_MODEM_RESET=0
+LAST_LTE_OK=$(date +%s)   # last verified-healthy end-to-end link (seeded at daemon start)
 recover_modem_reset() {
-    local now
+    local context="${1:-ladder}" now
     now=$(date +%s)
     if (( now - LAST_MODEM_RESET < MODEM_RESET_COOLDOWN )); then
-        warn "Recovery L3 skipped — modem reset on cooldown ($(( MODEM_RESET_COOLDOWN - (now - LAST_MODEM_RESET) ))s left; a reset's boot + attach draws ~2A bursts)."
-        return 0
+        warn "CRESET gate [$context]: skipped — cooldown ($(( MODEM_RESET_COOLDOWN - (now - LAST_MODEM_RESET) ))s left; a reset's boot + attach draws ~2A bursts)."
+        return 2
     fi
-    LAST_MODEM_RESET=$now
-    err "Recovery L3: full modem reset (AT+CRESET)..."
+    if (( RADIO_CYCLES_SINCE_OK < CRESET_MIN_RADIO_CYCLES )); then
+        warn "CRESET gate [$context]: skipped — only $RADIO_CYCLES_SINCE_OK/$CRESET_MIN_RADIO_CYCLES radio cycles since last healthy link; the GNSS-free rungs must prove useless first (R3)."
+        return 2
+    fi
+    local fix_state="no-fix"
+    if gnss_fix_present; then
+        fix_state="fix"
+        local policy down_secs
+        policy=$(gps_fix_reset_policy)
+        down_secs=$(( now - LAST_LTE_OK ))
+        if [[ "$policy" == "veto-deadzone" && "$context" == "deadzone" ]]; then
+            warn "CRESET gate [$context]: skipped — live GNSS fix vetoes dead-zone resets (policy=veto-deadzone; a dead zone with a fix is an environment, not a modem fault)."
+            return 2
+        fi
+        if (( down_secs < CRESET_FIX_DEFER_SECS )); then
+            warn "CRESET gate [$context]: skipped — live GNSS fix and LTE unusable only ${down_secs}s < ${CRESET_FIX_DEFER_SECS}s (policy=$policy; position outranks upload immediacy — uploads buffer)."
+            return 2
+        fi
+    fi
+    creset_budget_recount
+    if (( CRESET_BUDGET_USED >= CRESET_BUDGET_MAX )); then
+        err "CRESET gate [$context]: skipped — reset budget exhausted ($CRESET_BUDGET_USED/$CRESET_BUDGET_MAX in the last $(( CRESET_BUDGET_WINDOW_SECS / 3600 ))h; a modem needing more resets has a problem resets don't fix). Continuing with radio cycles only."
+        return 2
+    fi
+    err "Recovery L3 [$context]: full modem reset (AT+CRESET) — gate passed (cooldown clear, radio cycles since healthy: $RADIO_CYCLES_SINCE_OK, gnss=$fix_state, budget $(( CRESET_BUDGET_USED + 1 ))/$CRESET_BUDGET_MAX with this one)."
+    creset_note_fired
     at_query "AT+CRESET" 5 >/dev/null
     # The shared routine owns the reset exit: engine restart (SUPL mode), XTRA
     # verify, bias re-assert. GNSS NV config survives the reset, so a full
@@ -892,16 +1081,27 @@ recover_modem_reset() {
     gnss_recover_after_reset || return 1
 }
 
-# Consecutive failed connect cycles (reset by the health monitor on the first
-# successful ping). Drives the ladder: 1 plain retry, 2 re-attach, 3 radio
-# cycle, 4 modem reset — then the ladder repeats while failures continue.
+# Consecutive failed connect cycles (healed by the health monitor on the first
+# verified-healthy ping). Radio-cycle-first ladder in blast-radius order:
+#   fail 2: L1, fail 3: L1 + PDP bounce, fails 4-5: L2, fail 6: L3 (gated) —
+# then the cycle repeats from L2 (re-attaches have proven useless this deep).
+# A gate-skipped L3 radio-cycles instead, so recovery pressure never stops
+# and the earned-cycles precondition eventually satisfies itself.
 CONNECT_FAILS=0
 escalate_recovery() {
     (( CONNECT_FAILS >= 2 )) || return 0
-    case $(( (CONNECT_FAILS - 2) % 3 )) in
-        0) recover_reattach ;;
-        1) recover_radio_cycle ;;
-        2) recover_modem_reset || warn "Modem reset recovery failed; ladder will retry." ;;
+    local rung=$CONNECT_FAILS
+    (( rung > 6 )) && rung=$(( 4 + (rung - 7) % 3 ))
+    case "$rung" in
+        2) recover_reattach ;;
+        3) recover_reattach
+           recover_pdp_bounce ;;
+        4|5) recover_radio_cycle ;;
+        6) recover_modem_reset ladder
+           case $? in
+               1) warn "Modem reset recovery failed (modem never re-enumerated); ladder will retry." ;;
+               2) recover_radio_cycle ;;
+           esac ;;
     esac
 }
 
@@ -917,6 +1117,17 @@ teardown_interface() {
         ip link set "$IFACE" down 2>/dev/null || true
     fi
     at_cmd "AT+NETCLOSE" 2
+}
+
+# End-to-end WAN probe ($1 = pings per target, default 2). Success on either
+# target; "down" therefore means BOTH failed. A single host's outage must not
+# read as a dead WAN and walk the recovery ladder — this hardens the gauge
+# while the ladder reshapes the response.
+wan_ping_ok() {
+    local count="${1:-2}"
+    ping -c "$count" -W 4 -I "$IFACE" "$PING_HOST" &>/dev/null && return 0
+    [[ -n "$PING_HOST2" ]] || return 1
+    ping -c "$count" -W 4 -I "$IFACE" "$PING_HOST2" &>/dev/null
 }
 
 bring_up_interface() {
@@ -974,7 +1185,7 @@ bring_up_interface() {
     # is granted by the modem's own NAT and proves nothing about the WAN.
     local i
     for i in 1 2 3; do
-        if ping -c 1 -W 4 -I "$IFACE" "$PING_HOST" &>/dev/null; then
+        if wan_ping_ok 1; then
             return 0
         fi
         sleep 3
@@ -989,10 +1200,19 @@ wait_for_stable_signal() {
     local stable_count=0
     local prev_csq=99
     local interval=$CSQ_INTERVAL_WEAK
-    # Wedge detection: if the modem has had no usable service (signal +
-    # registration) for DEADZONE_NUDGE_SECS, it may have stopped searching —
-    # nudge the radio, then escalate to a full modem reset.
-    local no_service_since nudge_level=0
+    # Wedge detection with backoff: no usable service (signal + registration)
+    # for the nudge interval may mean the firmware stopped cell-searching —
+    # nudge with a radio cycle (GNSS-free, F1). But a dead zone is an
+    # environment, not a modem fault: the interval backs off exponentially
+    # (profile base -> cap) so overnight garage parking is not a nudge
+    # treadmill, and a reset is tried only after the profile's quota of radio
+    # cycles provably restored nothing — and then only through the global
+    # CRESET gate. Profile params re-read from settings.json at each nudge,
+    # so a cloud policy change applies mid-wait without a restart (R8).
+    local no_service_since nudge_level=0 dz_cycles=0
+    local dz_profile dz_base dz_cap dz_cycles_max nudge_interval
+    read -r dz_profile dz_base dz_cap dz_cycles_max <<< "$(deadzone_profile_params)"
+    nudge_interval=$dz_base
     no_service_since=$(date +%s)
 
     while true; do
@@ -1016,6 +1236,8 @@ wait_for_stable_signal() {
             if is_registered; then
                 no_service_since=$(date +%s)
                 nudge_level=0
+                dz_cycles=0
+                nudge_interval=$dz_base
                 (( stable_count++ ))
                 # We are actively trying to connect — poll fast regardless of
                 # what the adaptive backoff says, so reconnects aren't delayed
@@ -1044,14 +1266,27 @@ wait_for_stable_signal() {
 
         local now
         now=$(date +%s)
-        if (( now - no_service_since > DEADZONE_NUDGE_SECS )); then
+        if (( now - no_service_since > nudge_interval )); then
             (( nudge_level++ ))
-            warn "No usable service for ${DEADZONE_NUDGE_SECS}s (nudge #$nudge_level) — modem may be wedged."
-            if (( nudge_level == 1 )); then
-                recover_radio_cycle
-            else
-                recover_modem_reset || warn "Modem reset during dead-zone wait failed; will retry."
+            read -r dz_profile dz_base dz_cap dz_cycles_max <<< "$(deadzone_profile_params)"
+            warn "No usable service for ${nudge_interval}s (nudge #$nudge_level, profile=$dz_profile, cycles since last reset: $dz_cycles) — modem may be wedged."
+            local did_reset=0
+            if (( dz_cycles_max >= 0 && dz_cycles >= dz_cycles_max )); then
+                recover_modem_reset deadzone
+                case $? in
+                    0) did_reset=1
+                       dz_cycles=0 ;;
+                    1) did_reset=1
+                       dz_cycles=0
+                       warn "Modem reset during dead-zone wait failed; will retry." ;;
+                    2) : ;;   # gate said no — fall through to a radio cycle
+                esac
             fi
+            if (( ! did_reset )); then
+                recover_radio_cycle && (( dz_cycles += 1 ))
+            fi
+            nudge_interval=$(( nudge_interval * 2 ))
+            (( nudge_interval > dz_cap )) && nudge_interval=$dz_cap
             no_service_since=$(date +%s)
             stable_count=0
         fi
@@ -1066,7 +1301,7 @@ wait_for_stable_signal() {
 #   1 — reconnect needed (ping failed, signal OK → network/carrier issue)
 #   2 — dead zone (ping failed, signal weak → wait for signal recovery)
 monitor_connection() {
-    log "Connection monitor started. Pinging $PING_HOST every ${HEALTH_CHECK_INTERVAL}s."
+    log "Connection monitor started. Pinging $PING_HOST${PING_HOST2:+ (2nd opinion: $PING_HOST2)} every ${HEALTH_CHECK_INTERVAL}s."
     local fail_count=0
     local prev_csq=99
 
@@ -1080,10 +1315,14 @@ monitor_connection() {
         interval=$(adaptive_interval "$csq" "$prev_csq")
         prev_csq="$csq"
 
-        if ping -c 2 -W 4 -I "$IFACE" "$PING_HOST" &>/dev/null; then
+        if wan_ping_ok 2; then
             fail_count=0
-            # A verified-healthy link heals the recovery ladder.
+            # A verified-healthy link heals the recovery ladder: the failure
+            # streak, the earned-radio-cycles gate counter (R3: "since the
+            # last healthy connection"), and the fix-gate's outage clock.
             CONNECT_FAILS=0
+            RADIO_CYCLES_SINCE_OK=0
+            LAST_LTE_OK=$(date +%s)
             write_telemetry "$csq" "connected" "$interval"
             log "Health OK — CSQ=$csq ($dbm) [poll=${interval}s]"
             # GNSS upkeep while the link is healthy (all self-throttle).

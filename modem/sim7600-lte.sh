@@ -56,6 +56,17 @@ HEALTH_FAIL_THRESHOLD=3      # consecutive ping failures before reconnect
 RECONNECT_DELAY=5            # base wait before attempting reconnect (backs off)
 AT_CMD_DELAY=1               # pause between AT commands
 MODEM_BOOT_WAIT=8            # initial wait for modem USB enumeration
+# Config-read retries (at_setting_confirmed): AT reads of persisted settings
+# intermittently return nothing at daemon start even on a healthy modem (the
+# F7 flake). A lost read must never be mistaken for config drift.
+AT_SETTING_ATTEMPTS=3        # read attempts before giving up ("unknown")
+AT_SETTING_RETRY_DELAY=1     # pause between attempts
+# For ~10 s after a modem (re)boot, GNSS config queries answer well-formed
+# boot-DEFAULT values before NV state is loaded (measured 3/3 reboots:
+# +CGPSXE reads 0 until ~11 s post-enumeration, then the true 1) — landing
+# exactly where the daemon's startup reads fall. Apparent drift must
+# therefore hold across a re-read this far apart before it may be repaired.
+DRIFT_CONFIRM_DELAY=15       # secs between the two reads that confirm drift
 
 # Recovery ladder / wedge detection (seconds unless noted)
 # After consecutive failed connect cycles the ladder escalates:
@@ -469,6 +480,53 @@ at_setting() {
     at_query "$cmd" | sed -n "s/.*+${prefix}: *//p" | head -1
 }
 
+# Confirmed read of a "+PREFIX: value" setting, for decisions that must not
+# act on a lost response. Retries up to AT_SETTING_ATTEMPTS times and prints
+# the value as soon as a response line carrying the expected prefix arrives.
+# The value may legitimately be empty-looking (an unset AT+CGPSURL answers
+# +CGPSURL: "") — presence of the prefix line, not the value, is what marks
+# the read confirmed, so callers must branch on the return code, not on -z.
+# Returns: 0 = confirmed read (output is authoritative), 2 = firmware
+# rejected the command (ERROR seen, no value on any attempt), 1 = no usable
+# response at all — the setting is UNKNOWN and must be left alone.
+at_setting_confirmed() {
+    local cmd="$1" prefix="$2" attempt raw saw_error=0
+    for (( attempt = 1; attempt <= AT_SETTING_ATTEMPTS; attempt++ )); do
+        (( attempt > 1 )) && sleep "$AT_SETTING_RETRY_DELAY"
+        raw=$(at_query "$cmd")
+        if grep -qF -- "+${prefix}:" <<< "$raw"; then
+            # F7 visibility: callers capture stdout, so log via stderr only.
+            (( attempt > 1 )) && log "AT read of +${prefix} needed attempt $attempt/$AT_SETTING_ATTEMPTS (flaky AT port)." >&2
+            sed -n "s/.*+${prefix}: *//p" <<< "$raw" | head -1
+            return 0
+        fi
+        grep -q "ERROR" <<< "$raw" && saw_error=1
+    done
+    (( saw_error )) && return 2
+    return 1
+}
+
+# Second half of the drift invariant: a confirmed read that differs from the
+# target may still be a modem-boot transient (see DRIFT_CONFIRM_DELAY). Waits,
+# re-reads, and returns 0 only when the same non-target value is read again —
+# only then is the drift real and repair (write/reset) allowed. Logs its
+# verdict; callers keep their first read's value on success.
+drift_is_stable() {
+    local cmd="$1" prefix="$2" first="$3" again rc
+    log "Apparent GNSS config drift (+${prefix}: '$first') — re-reading in ${DRIFT_CONFIRM_DELAY}s to rule out a modem-boot transient..."
+    sleep "$DRIFT_CONFIRM_DELAY"
+    again=$(at_setting_confirmed "$cmd" "$prefix"); rc=$?
+    again=${again//\"/}; again=${again// /}
+    if (( rc != 0 )); then
+        warn "+${prefix} re-read failed — drift unconfirmed, leaving as-is (no write, no reset)."
+        return 1
+    elif [[ "$again" != "$first" ]]; then
+        log "+${prefix} settled to '$again' on re-read — boot transient, not drift; leaving as-is."
+        return 1
+    fi
+    return 0
+}
+
 # One-time (idempotent) GNSS configuration. Compares each persisted setting
 # and only writes on drift, so a normal boot makes no config writes and no
 # modem reset. Settings that need the engine stopped stop it first; settings
@@ -480,13 +538,23 @@ configure_gnss() {
         return
     fi
 
-    local need_reset=0 cur
+    # INVARIANT: need_reset=1 (and any config write) requires CONFIRMED drift:
+    # an at_setting_confirmed rc-0 read that differs from the target AND holds
+    # on a drift_is_stable re-read. A failed read (rc 1/2) means UNKNOWN: warn
+    # and leave the setting alone. Acting on lost reads — or on the well-formed
+    # boot-default answers the modem serves for ~10 s after (re)boot — is what
+    # fired spurious AT+CRESETs on healthy modems and wedged the GNSS engine
+    # (the 2026-07 TTFF field regression).
+    local need_reset=0 cur rc
 
     # Constellations + DPO (persists in NV; module restart to take effect).
-    cur=$(at_setting "AT+CGNSSMODE?" "CGNSSMODE" | tr -d ' ')
-    if [[ -z "$cur" ]]; then
-        warn "AT+CGNSSMODE not supported (old firmware?) — staying on firmware default constellations."
-    elif [[ "$cur" != "$GNSS_MODE,$GNSS_DPO" ]]; then
+    cur=$(at_setting_confirmed "AT+CGNSSMODE?" "CGNSSMODE"); rc=$?
+    cur=${cur// /}
+    if (( rc == 2 )); then
+        warn "AT+CGNSSMODE rejected by firmware (old firmware?) — staying on firmware default constellations."
+    elif (( rc != 0 )); then
+        warn "AT+CGNSSMODE read failed after $AT_SETTING_ATTEMPTS attempts — constellation config unknown, leaving as-is (no write, no reset)."
+    elif [[ "$cur" != "$GNSS_MODE,$GNSS_DPO" ]] && drift_is_stable "AT+CGNSSMODE?" "CGNSSMODE" "$cur"; then
         log "GNSS constellations: $cur -> $GNSS_MODE,$GNSS_DPO (AT+CGNSSMODE)."
         gps_stop
         at_cmd "AT+CGNSSMODE=$GNSS_MODE,$GNSS_DPO" 2
@@ -494,18 +562,26 @@ configure_gnss() {
     fi
 
     # XTRA enable (module restart to take effect).
-    cur=$(at_setting "AT+CGPSXE?" "CGPSXE" | tr -d ' ')
-    if [[ -n "$cur" && "$cur" != "$GNSS_XTRA" ]]; then
+    cur=$(at_setting_confirmed "AT+CGPSXE?" "CGPSXE"); rc=$?
+    cur=${cur// /}
+    if (( rc != 0 )); then
+        warn "AT+CGPSXE read failed after $AT_SETTING_ATTEMPTS attempts — XTRA-enable state unknown, leaving as-is (no write, no reset)."
+    elif [[ "$cur" != "$GNSS_XTRA" ]] && drift_is_stable "AT+CGPSXE?" "CGPSXE" "$cur"; then
         log "GNSS XTRA: $cur -> $GNSS_XTRA (AT+CGPSXE)."
         gps_stop
         at_cmd "AT+CGPSXE=$GNSS_XTRA" 2
         need_reset=1
     fi
 
-    # SUPL server for UE-based AGPS (module restart to take effect).
+    # SUPL server for UE-based AGPS (module restart to take effect). A truly
+    # unset URL still reads confirmed (+CGPSURL: "" -> rc 0, empty value) and
+    # is repaired; only a LOST read skips.
     if [[ -n "$SUPL_URL" ]]; then
-        cur=$(at_setting "AT+CGPSURL?" "CGPSURL" | tr -d '"')
-        if [[ "$cur" != "$SUPL_URL" ]]; then
+        cur=$(at_setting_confirmed "AT+CGPSURL?" "CGPSURL"); rc=$?
+        cur=${cur//\"/}
+        if (( rc != 0 )); then
+            warn "AT+CGPSURL read failed after $AT_SETTING_ATTEMPTS attempts — SUPL server unknown, leaving as-is (no write, no reset)."
+        elif [[ "$cur" != "$SUPL_URL" ]] && drift_is_stable "AT+CGPSURL?" "CGPSURL" "$cur"; then
             log "AGPS SUPL server: '${cur:-unset}' -> $SUPL_URL (AT+CGPSURL)."
             gps_stop
             at_cmd "AT+CGPSURL=\"$SUPL_URL\"" 1
@@ -515,8 +591,11 @@ configure_gnss() {
     fi
 
     # NMEA sentence mask (needs the engine stopped, no restart).
-    cur=$(at_setting "AT+CGPSNMEA?" "CGPSNMEA" | tr -d ' ')
-    if [[ -n "$cur" && "$cur" != "$NMEA_MASK" ]]; then
+    cur=$(at_setting_confirmed "AT+CGPSNMEA?" "CGPSNMEA"); rc=$?
+    cur=${cur// /}
+    if (( rc != 0 )); then
+        warn "AT+CGPSNMEA read failed after $AT_SETTING_ATTEMPTS attempts — NMEA mask unknown, leaving as-is (no write)."
+    elif [[ "$cur" != "$NMEA_MASK" ]] && drift_is_stable "AT+CGPSNMEA?" "CGPSNMEA" "$cur"; then
         log "NMEA sentence mask: $cur -> $NMEA_MASK (AT+CGPSNMEA)."
         gps_stop
         at_cmd "AT+CGPSNMEA=$NMEA_MASK" 1
@@ -559,7 +638,7 @@ xtra_maintain() {
     LAST_XTRA_CHECK=$now
 
     local valid
-    valid=$(at_setting "AT+CGPSXTRADATA?" "CGPSXTRADATA" | cut -d, -f1 | tr -d ' ')
+    valid=$(at_setting_confirmed "AT+CGPSXTRADATA?" "CGPSXTRADATA" | cut -d, -f1 | tr -d ' ')
     if [[ -n "$valid" && "$valid" -ge "$XTRA_MIN_VALID_MIN" ]]; then
         XTRA_VALID_MIN=$valid
         log "XTRA assistance valid for ${valid} min — no download needed."
@@ -582,7 +661,7 @@ xtra_maintain() {
     # Trigger the download, then trust a re-query of the stored file over the
     # URC — the +CGPSXD result can slip between two reads of the AT port.
     at_wait_urc "AT+CGPSXD=0" 60 '\+CGPSXD:' >/dev/null
-    valid=$(at_setting "AT+CGPSXTRADATA?" "CGPSXTRADATA" | cut -d, -f1 | tr -d ' ')
+    valid=$(at_setting_confirmed "AT+CGPSXTRADATA?" "CGPSXTRADATA" | cut -d, -f1 | tr -d ' ')
     if [[ -n "$valid" && "$valid" -ge "$XTRA_MIN_VALID_MIN" ]]; then
         XTRA_VALID_MIN=$valid
         log "XTRA assistance downloaded OK (valid ${valid} min)."

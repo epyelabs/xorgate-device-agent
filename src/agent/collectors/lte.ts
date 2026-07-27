@@ -1,5 +1,18 @@
 import type { Collector } from "./index.js";
-import { readModemTelemetry } from "../../hardware/modem.js";
+import { readModemTelemetry, type GnssHealth } from "../../hardware/modem.js";
+
+/**
+ * Numeric coding for the daemon's coarse GNSS health (cloud telemetry leaves
+ * are numbers-only — backend telemetry schema rejects string values). Ordered
+ * by severity so dashboard thresholds ("alert when >= 2") stay meaningful.
+ * The web app (telemetry-meta) and the monitor decode with the same table.
+ */
+export const GNSS_HEALTH_CODES: Record<GnssHealth, number> = {
+  ok: 0,
+  acquiring: 1,
+  degraded: 2,
+  unhealthy: 3,
+};
 
 /**
  * LTE signal collector (rssi / quality).
@@ -7,6 +20,9 @@ import { readModemTelemetry } from "../../hardware/modem.js";
  * Reads the connection-manager daemon's atomic telemetry JSON each tick (the
  * daemon owns the AT port and polls AT+CSQ; see hardware/modem.ts). Maps the
  * CSQ 0–31 value to `quality` (ASU) and the daemon-derived dBm to `rssi`.
+ * Since the lte_gnss_recovery plan (Phase 5) it also surfaces the daemon's
+ * GNSS/recovery observability: `gnss_health` (coded per GNSS_HEALTH_CODES)
+ * and `resets_24h`, so an unhealthy GNSS engine is visible from the cloud.
  * Self-gates: returns {} when the daemon hasn't published yet or the signal is
  * unknown (CSQ 99), so the worker omits the `lte` group.
  */
@@ -29,6 +45,16 @@ export function createLteCollector(): Collector {
     if (typeof t.rssi_dbm === "number") out.rssi = { value: t.rssi_dbm, unit: "dBm" };
     if (typeof t.modem_temp === "number" && Number.isFinite(t.modem_temp))
       out.modem_temp = { value: t.modem_temp, unit: "°C" };
+    // GNSS/recovery observability — absent until the daemon has knowledge
+    // (nulls in the file) or on daemons predating the gnss/recovery blocks.
+    const health = t.gnss?.health;
+    if (typeof health === "string" && health in GNSS_HEALTH_CODES) {
+      out.gnss_health = { value: GNSS_HEALTH_CODES[health as GnssHealth] };
+    }
+    const resets = t.recovery?.resets_24h;
+    if (typeof resets === "number" && Number.isFinite(resets)) {
+      out.resets_24h = { value: resets };
+    }
     return out;
   }
 

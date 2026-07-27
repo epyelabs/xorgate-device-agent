@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,8 +49,55 @@ describe("createGpsCollector", () => {
     expect(fields.fix_quality.value).toBe(1);
     expect(fields.hdop).toEqual({ value: 1.3 });
     expect(fields.satellites_in_view).toEqual({ value: 19 }); // 11 GPS + 8 GLONASS
+    // Started under a fix: the acquiring state was never observed, so no TTFF.
+    expect(fields.ttff_s).toBeUndefined();
 
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it("measures ttff_s across the fix-quality 0→nonzero transition", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xorgate-gps-"));
+    const fifo = join(dir, "nmea.fifo");
+    // A FIFO delivers the acquiring and locked states as separate chunks, the
+    // way a real 1 Hz tty does — a plain file would arrive as one aggregate
+    // and hide the transition.
+    execFileSync("mkfifo", [fifo]);
+
+    vi.stubEnv("GPS_NMEA_PORT", fifo);
+    vi.resetModules();
+    const { createGpsCollector } = await import("../src/agent/collectors/gps.js");
+    const collector = createGpsCollector();
+    expect(await collector.read()).toEqual({}); // opens the stream (reader side)
+
+    // Async open: a FIFO writer open blocks at the syscall until the reader
+    // side is open — the promises API keeps the event loop free for that.
+    const fh = await open(fifo, "w");
+    try {
+      // Acquiring: GGA quality 0 arms the TTFF clock.
+      await fh.write("$GPGGA,083740.000,,,,,0,00,,,M,,M,,\n");
+      let fields: Record<string, Leaf> = {};
+      for (let i = 0; i < 50; i++) {
+        fields = (await collector.read()) as Record<string, Leaf>;
+        if (fields.fix_quality?.value === 0) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(fields.fix_quality).toEqual({ value: 0 });
+
+      // Lock lands in a later chunk: the clock stops at the transition.
+      await fh.write(NMEA);
+      for (let i = 0; i < 50; i++) {
+        fields = (await collector.read()) as Record<string, Leaf>;
+        if (fields.lat !== undefined) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(fields.fix_quality.value).toBe(1);
+      expect(fields.ttff_s?.unit).toBe("s");
+      expect(fields.ttff_s!.value).toBeGreaterThanOrEqual(0);
+      expect(fields.ttff_s!.value).toBeLessThan(10);
+    } finally {
+      await fh.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("drops the stale position (not the group) after the lock is lost", async () => {

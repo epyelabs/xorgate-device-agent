@@ -41,6 +41,28 @@ describe("settings persistence", () => {
     expect(loadSettings()).toEqual({ mode: "real" });
   });
 
+  it("round-trips the lteRecovery policy namespace (loadSettings must not drop it)", () => {
+    const lteRecovery = {
+      gpsFixResetPolicy: "veto-deadzone" as const,
+      deadZoneProfile: "aggressive" as const,
+    };
+    saveSettings({ mode: "real", lteRecovery });
+    expect(loadSettings()).toEqual({ mode: "real", lteRecovery });
+  });
+
+  it("drops mistyped/unknown lteRecovery values but keeps the valid ones", () => {
+    writeFileSync(
+      settingsPath(),
+      JSON.stringify({ lteRecovery: { gpsFixResetPolicy: "sometimes", deadZoneProfile: 3 } }),
+    );
+    expect(loadSettings()).toEqual({});
+    writeFileSync(
+      settingsPath(),
+      JSON.stringify({ lteRecovery: { deadZoneProfile: "conservative", gpsFixResetPolicy: 1 } }),
+    );
+    expect(loadSettings()).toEqual({ lteRecovery: { deadZoneProfile: "conservative" } });
+  });
+
   it("returns {} when the file is missing", () => {
     expect(loadSettings()).toEqual({});
   });

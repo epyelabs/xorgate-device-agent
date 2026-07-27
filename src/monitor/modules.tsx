@@ -62,6 +62,13 @@ const LINK_COLOR: Record<string, string> = {
   disconnected: "yellow",
   dead_zone: "red",
 };
+/** Daemon gnss.health → text color (taxonomy: lte_gnss_recovery Phase 5). */
+const GNSS_HEALTH_COLOR: Record<string, string> = {
+  ok: "green",
+  acquiring: "yellow",
+  degraded: "yellow",
+  unhealthy: "red",
+};
 
 function DetailTitle({ children }: { children: React.ReactNode }) {
   return (
@@ -196,6 +203,7 @@ const gps: Module = {
             <Text color="gray">
               sats {leaf(m?.satellites, 0)}/{leaf(m?.satellites_in_view, 0)} in view · hdop{" "}
               {leaf(m?.hdop, 1)} · fix {fixLabel(m?.fix_quality)}
+              {val(m?.ttff_s) !== undefined ? ` · ttff ${leaf(m?.ttff_s, 1)}s` : ""}
             </Text>
           </Box>
         ) : m ? (
@@ -305,6 +313,28 @@ function LteDetail({ snapshot }: DetailProps) {
         <Text color="gray">
           {link.iface} · ip {link.ip ?? "—"} · {link.timestamp}
         </Text>
+      ) : null}
+      {link?.gnss || link?.recovery ? (
+        // GNSS/recovery observability from the daemon file (lte_gnss_recovery
+        // Phase 5). health is last-knowledge — stale while LTE is down.
+        <Box flexDirection="column" marginTop={1}>
+          <Text>
+            <Text color="gray">gnss </Text>
+            <Text color={GNSS_HEALTH_COLOR[link.gnss?.health ?? ""] ?? "gray"}>
+              {link.gnss?.health ?? "unknown"}
+            </Text>
+            <Text color="gray">
+              {typeof link.gnss?.ttff_s === "number" ? ` · ttff ${link.gnss.ttff_s}s` : ""}
+              {link.gnss?.standalone_fallback ? " · standalone fallback" : ""}
+            </Text>
+          </Text>
+          <Text color="gray">
+            resets 24h {link.recovery?.resets_24h ?? 0}
+            {link.recovery?.last_reset
+              ? ` · last ${link.recovery.last_reset.path} @ ${link.recovery.last_reset.ts}`
+              : " · no reset this run"}
+          </Text>
+        </Box>
       ) : null}
     </Box>
   );

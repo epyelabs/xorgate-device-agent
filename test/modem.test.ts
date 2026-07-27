@@ -97,6 +97,48 @@ describe("createLteCollector", () => {
     await rm(join(file, ".."), { recursive: true, force: true });
   });
 
+  it("maps the daemon's gnss.health + recovery.resets_24h to numeric leaves", async () => {
+    const { collector, file } = await collectorFor({
+      ...SAMPLE,
+      gnss: { engine_on: 1, has_fix: 0, health: "degraded" },
+      recovery: { connect_fails: 0, resets_24h: 2 },
+    });
+    const fields = (await collector.read()) as Record<string, { value: number }>;
+    expect(fields.gnss_health).toEqual({ value: 2 }); // degraded, per GNSS_HEALTH_CODES
+    expect(fields.resets_24h).toEqual({ value: 2 });
+    await rm(join(file, ".."), { recursive: true, force: true });
+  });
+
+  it("codes every gnss health state by severity (0 ok … 3 unhealthy)", async () => {
+    for (const [health, code] of [
+      ["ok", 0],
+      ["acquiring", 1],
+      ["degraded", 2],
+      ["unhealthy", 3],
+    ] as const) {
+      const { collector, file } = await collectorFor({ ...SAMPLE, gnss: { health } });
+      const fields = (await collector.read()) as Record<string, { value: number }>;
+      expect(fields.gnss_health).toEqual({ value: code });
+      await rm(join(file, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("omits gnss_health/resets_24h before first daemon knowledge or on old daemons", async () => {
+    // New daemon, no knowledge yet: health null, recovery block without counters.
+    let made = await collectorFor({ ...SAMPLE, gnss: { health: null }, recovery: {} });
+    let fields = (await made.collector.read()) as Record<string, unknown>;
+    expect(fields.gnss_health).toBeUndefined();
+    expect(fields.resets_24h).toBeUndefined();
+    expect(fields.quality).toBeDefined();
+    await rm(join(made.file, ".."), { recursive: true, force: true });
+    // Old daemon: no gnss/recovery blocks at all.
+    made = await collectorFor(SAMPLE);
+    fields = (await made.collector.read()) as Record<string, unknown>;
+    expect(fields.gnss_health).toBeUndefined();
+    expect(fields.resets_24h).toBeUndefined();
+    await rm(join(made.file, ".."), { recursive: true, force: true });
+  });
+
   it("omits the group when the signal is unknown (csq 99)", async () => {
     const { collector, file } = await collectorFor({ ...SAMPLE, csq: 99, rssi_dbm: null });
     expect(await collector.read()).toEqual({});

@@ -47,12 +47,28 @@ export interface TelemetryMetrics {
     satellites_in_view?: MetricLeaf;
     /** Horizontal dilution of precision (GSA) — fix confidence, lower is better. */
     hdop?: MetricLeaf;
+    /**
+     * Time-to-first-fix in seconds: NMEA fix-quality 0→nonzero transition
+     * measured by the gps collector (the accurate TTFF; the daemon's
+     * telemetry `gnss.ttff_s` is the coarse self-contained one). Present only
+     * once a fix has been acquired after an observed acquiring period.
+     */
+    ttff_s?: MetricLeaf;
   };
   lte: {
     rssi: MetricLeaf;
     quality: MetricLeaf;
     /** Modem PMU temperature (°C) from the daemon's AT+CPMUTEMP poll. */
     modem_temp?: MetricLeaf;
+    /**
+     * Coarse GNSS health from the daemon (lte_gnss_recovery Phase 5, R9),
+     * coded numerically because cloud telemetry leaves are numbers-only:
+     * 0 ok · 1 acquiring · 2 degraded (standalone fallback) · 3 unhealthy
+     * (engine off / wedge). Absent while the daemon has no knowledge yet.
+     */
+    gnss_health?: MetricLeaf;
+    /** CRESETs fired in the daemon's rolling 24 h budget window. */
+    resets_24h?: MetricLeaf;
   };
   system: {
     cpu_usage: MetricLeaf;

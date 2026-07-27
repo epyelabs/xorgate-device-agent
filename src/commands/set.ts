@@ -2,7 +2,12 @@
  * `xorgate set <key> <value>` — persist an agent setting and apply it.
  *
  * Supported keys: `mode` (<sim|real>), `media` (<on|off>, the KVS WebRTC
- * runtime toggle), and `gps-antenna` (<active|passive>, the GNSS antenna bias).
+ * runtime toggle), `gps-antenna` (<active|passive>, the GNSS antenna bias),
+ * `gps-fix-reset-policy` (<defer|veto-deadzone>) and `deadzone-profile`
+ * (<conservative|balanced|aggressive>) — the two lteRecovery policy knobs
+ * (lte_gnss_recovery plan R8), applied live by the sim7600-lte daemon at its
+ * next recovery decision (no restart). Note: cloud-delivered lteRecovery
+ * config overwrites local edits on the next retained config delivery.
  * The value is merged into settings.json (read by loadConfig with precedence
  * flag > settings > env), then the daemon is restarted to apply — reusing its
  * recorded launch flags so creds / --offline are preserved. `--no-restart`
@@ -42,7 +47,7 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, wifi <on|off> [--force], recording.<group>.<field> <value>)";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, wifi <on|off> [--force], recording.<group>.<field> <value>)";
 
 /** Parse an on/off/true/false/1/0 CLI value; undefined when unrecognizable. */
 function parseBoolValue(v: string | undefined): boolean | undefined {
@@ -193,9 +198,35 @@ export async function setCommand(rest: string[]): Promise<void> {
     );
     console.log("  the modem daemon applies it live within ~a minute (journalctl -u sim7600-lte)");
     return;
+  } else if (key === "gps-fix-reset-policy") {
+    if (value !== "defer" && value !== "veto-deadzone") {
+      console.error(`gps-fix-reset-policy must be 'defer' or 'veto-deadzone', got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    next.lteRecovery = { ...next.lteRecovery, gpsFixResetPolicy: value };
+    saveSettings(next);
+    // No restart: the sim7600-lte daemon re-reads settings.json at each
+    // recovery decision (CRESET gate / dead-zone nudge).
+    console.log(`✓ GPS fix reset policy set to ${value} (persisted to settings.json)`);
+    console.log("  the modem daemon reads it live at its next recovery decision (journalctl -u sim7600-lte)");
+    return;
+  } else if (key === "deadzone-profile") {
+    if (value !== "conservative" && value !== "balanced" && value !== "aggressive") {
+      console.error(
+        `deadzone-profile must be 'conservative', 'balanced' or 'aggressive', got '${value ?? ""}'`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    next.lteRecovery = { ...next.lteRecovery, deadZoneProfile: value };
+    saveSettings(next);
+    console.log(`✓ Dead-zone profile set to ${value} (persisted to settings.json)`);
+    console.log("  the modem daemon reads it live at its next dead-zone nudge (journalctl -u sim7600-lte)");
+    return;
   } else {
     console.error(
-      `unknown setting '${key}' (supported: mode, media, gps-antenna, wifi, recording.*)`,
+      `unknown setting '${key}' (supported: mode, media, gps-antenna, gps-fix-reset-policy, deadzone-profile, wifi, recording.*)`,
     );
     process.exitCode = 1;
     return;

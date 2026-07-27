@@ -203,8 +203,87 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a /var/log/sim7
 # Writes an atomic JSON snapshot to TELEMETRY_FILE.
 # Other processes (GPS, IMU, cloud uploader) can read this at any time
 # without risk of reading a half-written file.
-#
-# Schema:
+
+# Observability state (R6/R9). Recorded where the decisions already happen
+# (gps_start, gnss_fix_present, the CRESET gate, gnss_health) — telemetry-only,
+# never an input to recovery logic. All "last knowledge" semantics: the daemon
+# probes GNSS only on healthy-LTE health ticks and at the CRESET gate, so while
+# LTE is down these hold the most recent verdict, not live truth — readers must
+# judge freshness by the paired timestamps, never assume "no change = healthy".
+GNSS_ENGINE_ON=""            # 0|1 last definite AT+CGPS? parse ("" = never seen)
+GNSS_LAST_FIX=""             # 0|1 verdict of the last AT+CGNSSINFO probe ("" = never probed)
+GNSS_FIX_CHECKED_AT=0        # epoch of that probe
+GNSS_LAST_ENGINE_START=0     # epoch of the last engine start THIS daemon issued
+GNSS_TTFF_S=""               # coarse TTFF (Q6): engine start -> first fix-probe success.
+                             # Null until the first post-start fix probe lands; only
+                             # measurable within one daemon lifetime (a warm-boot engine
+                             # that was already running never arms the clock).
+GNSS_STANDALONE_FALLBACK=0   # 1 while the session runs the plain AT+CGPS=1 fallback
+GNSS_LAST_RESTART_AT=0       # epoch of the last engine restart
+GNSS_LAST_RESTART_REASON=""  # off | wedge | post-reset
+CRESET_LAST_PATH=""          # origin of the last fired CRESET: ladder | deadzone | config-drift
+LAST_GATE_SKIP_AT=0          # last CRESET gate refusal (mirrors the R7 verdict log line)
+LAST_GATE_SKIP_CONTEXT=""    # ladder | deadzone
+LAST_GATE_SKIP_REASON=""     # cooldown | radio-cycles | fix-veto | fix-defer | budget
+
+# ISO-8601 UTC JSON value for an epoch: quoted string, or null for 0/empty.
+iso_or_null() {
+    local epoch="$1"
+    if [[ -n "$epoch" && "$epoch" -gt 0 ]]; then
+        echo "\"$(date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ')\""
+    else
+        echo "null"
+    fi
+}
+
+# Derived coarse GNSS health for the UI badge (R9) — prints a JSON value.
+# Taxonomy (final, recorded in PROGRESS.md Cross-phase state):
+#   "ok"         engine on, last fix probe saw a fix
+#   "acquiring"  engine on, last probe fixless, wedge window not yet expired
+#   "degraded"   engine on but running the standalone fallback (SUPL start
+#                failed twice — assist unavailable this session)
+#   "unhealthy"  engine off at last knowledge, or fixless past the wedge
+#                window (restart pending or cap-suppressed), or a wedge
+#                restart fired <1 h ago with no fix seen since
+#   null         nothing known yet (engine never read / fix never probed /
+#                GPS disabled)
+gnss_health_state() {
+    if [[ "$ENABLE_GPS" != "1" || -z "$GNSS_ENGINE_ON" ]]; then
+        echo "null"
+        return
+    fi
+    if [[ "$GNSS_ENGINE_ON" == "0" ]]; then
+        echo '"unhealthy"'
+        return
+    fi
+    local now
+    now=$(date +%s)
+    if (( NO_FIX_SINCE > 0 && now - NO_FIX_SINCE >= GNSS_WEDGE_RESTART_SECS )); then
+        echo '"unhealthy"'
+        return
+    fi
+    if [[ "$GNSS_LAST_RESTART_REASON" == "wedge" ]] && (( now - GNSS_LAST_RESTART_AT < 3600 )); then
+        # A wedge restart is "recent" for the cap window; a fix probe success
+        # AFTER the restart clears the suspicion (the restart worked).
+        if ! { [[ "$GNSS_LAST_FIX" == "1" ]] && (( GNSS_FIX_CHECKED_AT > GNSS_LAST_RESTART_AT )); }; then
+            echo '"unhealthy"'
+            return
+        fi
+    fi
+    if (( GNSS_STANDALONE_FALLBACK )); then
+        echo '"degraded"'
+        return
+    fi
+    case "$GNSS_LAST_FIX" in
+        1) echo '"ok"' ;;
+        0) echo '"acquiring"' ;;
+        *) echo "null" ;;
+    esac
+}
+
+# Schema (top-level keys pre-date this plan; `gnss` + `recovery` are the
+# Phase 5 additions — ADDITIVE ONLY, existing readers must keep working;
+# every sub-field is null before first knowledge, the modem_temp pattern):
 # {
 #   "timestamp":    ISO-8601 UTC string
 #   "csq":          integer 0-31, or 99 if unknown
@@ -219,6 +298,45 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a /var/log/sim7
 #   "gnss_ant_bias": 0|1 last-applied antenna bias state, or null before first apply
 #   "modem_temp":   modem PMU temperature in °C (AT+CPMUTEMP), or null if
 #                   never read / unsupported by this firmware
+#   "gnss": {      GNSS engine observability. LAST-KNOWLEDGE values: the fix
+#                  probe runs only on healthy-LTE health ticks (10 min) and at
+#                  the CRESET gate — while LTE is down these go stale rather
+#                  than null; check fix_checked_at before trusting has_fix.
+#     "engine_on":       0|1 last definite AT+CGPS? parse, null before first
+#     "has_fix":         0|1 last AT+CGNSSINFO verdict (lost read counts as 0,
+#                        matching the gate's posture), null before first probe
+#     "fix_checked_at":  ISO ts of that verdict, or null
+#     "ttff_s":          coarse TTFF secs (engine start -> first fix-probe
+#                        success; ceiling ~= the 10-min probe cadence). Null
+#                        until measured; resets on every engine start; only
+#                        measurable within one daemon lifetime. The accurate
+#                        TTFF is the agent's gps.ttff_s (NMEA transition).
+#     "last_engine_start":   ISO ts of the last start this daemon issued, or null
+#     "last_engine_restart": {"ts": ISO, "reason": "off"|"wedge"|"post-reset"}
+#                            or null (reason names the restart path: engine
+#                            found off / wedge detector / post-CRESET recovery)
+#     "standalone_fallback": 0|1 — 1 while the engine session runs plain
+#                            AT+CGPS=1 (SUPL start failed twice, R9 "degraded")
+#     "no_fix_since":    ISO ts the current fixless streak started (Phase 4
+#                        clock; advances only while LTE-healthy ticks run), or null
+#     "wedge_restarts_1h": wedge restarts in the rolling hour (cap window)
+#     "health":          "ok"|"acquiring"|"degraded"|"unhealthy"|null — the
+#                        derived coarse state (taxonomy at gnss_health_state)
+#   }
+#   "recovery": {  LTE recovery-machinery observability (R6).
+#     "connect_fails":         current consecutive failed connect cycles
+#     "radio_cycles_since_ok": radio cycles fired since last verified-healthy link
+#     "resets_24h":            CRESETs fired in the rolling budget window
+#                              (in-memory: a daemon restart forgets prior spend)
+#     "last_reset":     {"ts": ISO, "path": "ladder"|"deadzone"|"config-drift"}
+#                       or null — the last FIRED CRESET and which path fired it
+#     "last_gate_skip": {"ts": ISO, "context": "ladder"|"deadzone", "reason":
+#                       "cooldown"|"radio-cycles"|"fix-veto"|"fix-defer"|
+#                       "budget"} or null — last CRESET gate refusal (mirrors
+#                       the R7 verdict log line)
+#     "last_lte_ok":    ISO ts of the last verified-healthy end-to-end link
+#                       (seeded at daemon start — the fix-gate outage clock)
+#   }
 # }
 write_telemetry() {
     local csq="$1"
@@ -245,6 +363,28 @@ write_telemetry() {
     local timestamp
     timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
+    # Rolling counters pruned at write time so readers see current values.
+    # creset_budget_recount mutates globals — direct call, never substituted.
+    creset_budget_recount
+    local now_epoch t wedge_restarts_1h=0
+    now_epoch=$(date +%s)
+    for t in "${GNSS_WEDGE_RESTARTS[@]}"; do
+        (( t > now_epoch - 3600 )) && (( wedge_restarts_1h++ ))
+    done
+
+    local last_engine_restart="null"
+    if [[ -n "$GNSS_LAST_RESTART_REASON" ]]; then
+        last_engine_restart="{\"ts\": $(iso_or_null "$GNSS_LAST_RESTART_AT"), \"reason\": \"$GNSS_LAST_RESTART_REASON\"}"
+    fi
+    local last_reset="null"
+    if [[ -n "$CRESET_LAST_PATH" ]]; then
+        last_reset="{\"ts\": $(iso_or_null "$LAST_MODEM_RESET"), \"path\": \"$CRESET_LAST_PATH\"}"
+    fi
+    local last_gate_skip="null"
+    if [[ -n "$LAST_GATE_SKIP_REASON" ]]; then
+        last_gate_skip="{\"ts\": $(iso_or_null "$LAST_GATE_SKIP_AT"), \"context\": \"$LAST_GATE_SKIP_CONTEXT\", \"reason\": \"$LAST_GATE_SKIP_REASON\"}"
+    fi
+
     # Write to temp file first, then atomically move into place
     # so readers never see a partial file
     local tmp="${TELEMETRY_FILE}.tmp"
@@ -261,7 +401,27 @@ write_telemetry() {
   "ip": $ip,
   "xtra_valid_min": ${XTRA_VALID_MIN:-null},
   "gnss_ant_bias": ${GNSS_BIAS_APPLIED:-null},
-  "modem_temp": ${MODEM_TEMP:-null}
+  "modem_temp": ${MODEM_TEMP:-null},
+  "gnss": {
+    "engine_on": ${GNSS_ENGINE_ON:-null},
+    "has_fix": ${GNSS_LAST_FIX:-null},
+    "fix_checked_at": $(iso_or_null "$GNSS_FIX_CHECKED_AT"),
+    "ttff_s": ${GNSS_TTFF_S:-null},
+    "last_engine_start": $(iso_or_null "$GNSS_LAST_ENGINE_START"),
+    "last_engine_restart": $last_engine_restart,
+    "standalone_fallback": $GNSS_STANDALONE_FALLBACK,
+    "no_fix_since": $(iso_or_null "$NO_FIX_SINCE"),
+    "wedge_restarts_1h": $wedge_restarts_1h,
+    "health": $(gnss_health_state)
+  },
+  "recovery": {
+    "connect_fails": ${CONNECT_FAILS:-0},
+    "radio_cycles_since_ok": ${RADIO_CYCLES_SINCE_OK:-0},
+    "resets_24h": ${CRESET_BUDGET_USED:-0},
+    "last_reset": $last_reset,
+    "last_gate_skip": $last_gate_skip,
+    "last_lte_ok": $(iso_or_null "$LAST_LTE_OK")
+  }
 }
 EOF
 
@@ -556,6 +716,11 @@ gnss_bias_maintain() {
 gps_engine_on() {
     local state
     state=$(at_query "AT+CGPS?" | sed -n 's/.*+CGPS: \([01]\).*/\1/p')
+    # Telemetry: record definite knowledge only — a lost read (empty state)
+    # returns "not on" below but must not overwrite the last-known value.
+    # Callers invoke this directly (never command-substituted), so the global
+    # sticks (same subshell pitfall update_reg documents).
+    [[ "$state" == "0" || "$state" == "1" ]] && GNSS_ENGINE_ON="$state"
     [[ "$state" == "1" ]]
 }
 
@@ -569,13 +734,29 @@ gnss_fix_present() {
     [[ "$ENABLE_GPS" == "1" ]] || return 1
     local info
     info=$(at_query "AT+CGNSSINFO" 6 | sed -n 's/.*+CGNSSINFO: *//p' | head -1)
-    [[ "$info" == [0-9]* ]]
+    # Telemetry: every probe verdict is recorded (callers invoke this directly,
+    # never command-substituted). The lost-read = no-fix posture applies to the
+    # recorded verdict too — has_fix mirrors what the daemon ACTS on.
+    GNSS_FIX_CHECKED_AT=$(date +%s)
+    if [[ "$info" == [0-9]* ]]; then
+        GNSS_LAST_FIX=1
+        # Coarse daemon-side TTFF (Q6): first fix-probe success after an
+        # engine start observed by this daemon. Probe cadence bounds the
+        # precision; the agent's NMEA-transition ttff_s is the accurate one.
+        if [[ -z "$GNSS_TTFF_S" && "$GNSS_LAST_ENGINE_START" -gt 0 ]]; then
+            GNSS_TTFF_S=$(( GNSS_FIX_CHECKED_AT - GNSS_LAST_ENGINE_START ))
+        fi
+        return 0
+    fi
+    GNSS_LAST_FIX=0
+    return 1
 }
 
 gps_stop() {
     if gps_engine_on; then
         log "Stopping GNSS engine for reconfiguration (AT+CGPS=0)..."
         at_cmd "AT+CGPS=0" 3
+        GNSS_ENGINE_ON=0
     fi
 }
 
@@ -600,6 +781,9 @@ gps_start() {
     # "not accepted" fallback into a first-try acceptance.
     sleep "$GNSS_START_SETTLE_SECS"
     log "Starting GNSS engine in $desc mode (AT+CGPS=$mode)..."
+    # Telemetry: every start attempt re-arms the coarse TTFF clock.
+    GNSS_LAST_ENGINE_START=$(date +%s)
+    GNSS_TTFF_S=""
     local resp
     resp=$(at_query "AT+CGPS=$mode" 6)
     if ! grep -q "OK" <<< "$resp"; then
@@ -608,10 +792,14 @@ gps_start() {
         resp=$(at_query "AT+CGPS=$mode" 6)
     fi
     if grep -q "OK" <<< "$resp"; then
+        GNSS_ENGINE_ON=1
+        GNSS_STANDALONE_FALLBACK=0
         return 0
     fi
     warn "GNSS explicit-mode start failed twice — falling back to plain AT+CGPS=1 (running standalone: SUPL assist unavailable this session)."
     at_cmd "AT+CGPS=1" 2
+    GNSS_ENGINE_ON=1
+    GNSS_STANDALONE_FALLBACK=1
 }
 
 # Read a "+PREFIX: value" style current setting; prints the raw value part.
@@ -756,7 +944,7 @@ configure_gnss() {
         # repaired) but still spend the shared cooldown + rolling budget —
         # a recovery reset shortly after one of these is exactly the power
         # clustering the gate exists to prevent.
-        creset_note_fired
+        creset_note_fired config-drift
         at_cmd "AT+CRESET" 2
         # The shared routine owns everything after a reset (engine start,
         # XTRA verify, bias re-assert) — nothing more to do here.
@@ -843,6 +1031,8 @@ gnss_health() {
     LAST_GNSS_CHECK=$now
     if ! gps_engine_on; then
         warn "GNSS engine found off (modem reset?) — restarting it."
+        GNSS_LAST_RESTART_AT=$now
+        GNSS_LAST_RESTART_REASON="off"
         gps_start
         NO_FIX_SINCE=0
         # An engine found off usually means the modem reset underneath us, which
@@ -887,6 +1077,8 @@ gnss_health() {
     fi
     GNSS_WEDGE_RESTARTS+=("$now")
     warn "GNSS health: engine on but fixless for ${fixless}s (>= ${GNSS_WEDGE_RESTART_SECS}s) — wedge suspected; clean engine restart (${#GNSS_WEDGE_RESTARTS[@]}/$GNSS_WEDGE_RESTART_MAX_PER_HOUR this hour; engine-only, never CRESET)."
+    GNSS_LAST_RESTART_AT=$now
+    GNSS_LAST_RESTART_REASON="wedge"
     gps_stop
     gps_start
     NO_FIX_SINCE=0
@@ -987,6 +1179,8 @@ gnss_recover_after_reset() {
     # by a settled gps_start is the sanctioned post-reset SUPL-mode start.
     # (NOT the F5 flapping non-goal: that forbids restarting a healthy running
     # session because AT+CGPS? read 1,1 after a SUPL auto-fallback.)
+    GNSS_LAST_RESTART_AT=$(date +%s)
+    GNSS_LAST_RESTART_REASON="post-reset"
     gps_stop
     gps_start
     # Verify XTRA assistance survived the reset (file lives in module flash).
@@ -1092,9 +1286,19 @@ creset_budget_recount() {
 }
 
 # Record a fired CRESET (any site) into the cooldown clock + budget window.
+# $1 = originating path for telemetry: ladder | deadzone | config-drift.
 creset_note_fired() {
     LAST_MODEM_RESET=$(date +%s)
     CRESET_TIMES+=("$LAST_MODEM_RESET")
+    CRESET_LAST_PATH="${1:-unknown}"
+}
+
+# Record a CRESET gate refusal for telemetry (the R7 log line is the primary
+# record; this mirrors it into recovery.last_gate_skip).
+gate_skip_note() {
+    LAST_GATE_SKIP_AT=$(date +%s)
+    LAST_GATE_SKIP_CONTEXT="$1"
+    LAST_GATE_SKIP_REASON="$2"
 }
 
 # L3 — full modem reboot, gated. Equivalent to power-cycling the module; the
@@ -1111,10 +1315,12 @@ recover_modem_reset() {
     now=$(date +%s)
     if (( now - LAST_MODEM_RESET < MODEM_RESET_COOLDOWN )); then
         warn "CRESET gate [$context]: skipped — cooldown ($(( MODEM_RESET_COOLDOWN - (now - LAST_MODEM_RESET) ))s left; a reset's boot + attach draws ~2A bursts)."
+        gate_skip_note "$context" cooldown
         return 2
     fi
     if (( RADIO_CYCLES_SINCE_OK < CRESET_MIN_RADIO_CYCLES )); then
         warn "CRESET gate [$context]: skipped — only $RADIO_CYCLES_SINCE_OK/$CRESET_MIN_RADIO_CYCLES radio cycles since last healthy link; the GNSS-free rungs must prove useless first (R3)."
+        gate_skip_note "$context" radio-cycles
         return 2
     fi
     local fix_state="no-fix"
@@ -1125,20 +1331,23 @@ recover_modem_reset() {
         down_secs=$(( now - LAST_LTE_OK ))
         if [[ "$policy" == "veto-deadzone" && "$context" == "deadzone" ]]; then
             warn "CRESET gate [$context]: skipped — live GNSS fix vetoes dead-zone resets (policy=veto-deadzone; a dead zone with a fix is an environment, not a modem fault)."
+            gate_skip_note "$context" fix-veto
             return 2
         fi
         if (( down_secs < CRESET_FIX_DEFER_SECS )); then
             warn "CRESET gate [$context]: skipped — live GNSS fix and LTE unusable only ${down_secs}s < ${CRESET_FIX_DEFER_SECS}s (policy=$policy; position outranks upload immediacy — uploads buffer)."
+            gate_skip_note "$context" fix-defer
             return 2
         fi
     fi
     creset_budget_recount
     if (( CRESET_BUDGET_USED >= CRESET_BUDGET_MAX )); then
         err "CRESET gate [$context]: skipped — reset budget exhausted ($CRESET_BUDGET_USED/$CRESET_BUDGET_MAX in the last $(( CRESET_BUDGET_WINDOW_SECS / 3600 ))h; a modem needing more resets has a problem resets don't fix). Continuing with radio cycles only."
+        gate_skip_note "$context" budget
         return 2
     fi
     err "Recovery L3 [$context]: full modem reset (AT+CRESET) — gate passed (cooldown clear, radio cycles since healthy: $RADIO_CYCLES_SINCE_OK, gnss=$fix_state, budget $(( CRESET_BUDGET_USED + 1 ))/$CRESET_BUDGET_MAX with this one)."
-    creset_note_fired
+    creset_note_fired "$context"
     at_query "AT+CRESET" 5 >/dev/null
     # The shared routine owns the reset exit: engine restart (SUPL mode), XTRA
     # verify, bias re-assert. GNSS NV config survives the reset, so a full

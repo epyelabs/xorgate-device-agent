@@ -34,6 +34,40 @@ export interface RecordingSettings {
   retention?: { maxBytes?: number; minFreeBytes?: number };
 }
 
+/**
+ * LTE recovery policy (lte_gnss_recovery plan, R8) — the `lteRecovery`
+ * namespace in settings.json, read LIVE by the sim7600-lte daemon at each
+ * recovery decision (no restart needed). Both keys optional; the daemon
+ * resolves anything missing/unknown to the safe default (defer / balanced).
+ * CRITICAL: this must stay in AgentSettings parse+persist — loadSettings
+ * drops unknown keys on every rewrite, so omitting it here would silently
+ * delete cloud-delivered policy on the next agent-side settings write.
+ */
+export interface LteRecoverySettings {
+  /** What a live GNSS fix means for a modem reset: defer (default) or fully veto dead-zone resets. */
+  gpsFixResetPolicy?: "defer" | "veto-deadzone";
+  /** Dead-zone nudge pacing preset (default balanced). */
+  deadZoneProfile?: "conservative" | "balanced" | "aggressive";
+}
+
+/**
+ * Validate an untrusted `lteRecovery` value, dropping unknown/mistyped keys
+ * (same forgiving philosophy as parseRecordingSettings). Returns undefined
+ * when nothing valid remains.
+ */
+export function parseLteRecoverySettings(v: unknown): LteRecoverySettings | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const src = v as Record<string, unknown>;
+  const out: LteRecoverySettings = {};
+  const policy = src.gpsFixResetPolicy;
+  if (policy === "defer" || policy === "veto-deadzone") out.gpsFixResetPolicy = policy;
+  const profile = src.deadZoneProfile;
+  if (profile === "conservative" || profile === "balanced" || profile === "aggressive") {
+    out.deadZoneProfile = profile;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface AgentSettings {
   mode?: RunMode;
   /** Operator toggle for the KVS WebRTC media runtime (off unless explicitly enabled). */
@@ -55,6 +89,13 @@ export interface AgentSettings {
   imuMount?: ImuMount;
   /** On-device recording config (see RecordingSettings); absent = all defaults (off). */
   recording?: RecordingSettings;
+  /**
+   * LTE recovery policy (see LteRecoverySettings). Set from the web device
+   * settings page (retained MQTT config -> worker) or `xorgate set`; read
+   * LIVE by the sim7600-lte daemon at each recovery decision. Absent = the
+   * daemon's safe defaults (gpsFixResetPolicy defer, deadZoneProfile balanced).
+   */
+  lteRecovery?: LteRecoverySettings;
 }
 
 /** Clamp `rateHz` to what the collectors can produce (IMU caps at 20 Hz). */
@@ -142,6 +183,8 @@ export function loadSettings(path: string = settingsPath()): AgentSettings {
       if (imuMount) out.imuMount = imuMount;
       const recording = parseRecordingSettings((obj as { recording?: unknown }).recording);
       if (recording) out.recording = recording;
+      const lteRecovery = parseLteRecoverySettings((obj as { lteRecovery?: unknown }).lteRecovery);
+      if (lteRecovery) out.lteRecovery = lteRecovery;
       return out;
     }
   } catch {

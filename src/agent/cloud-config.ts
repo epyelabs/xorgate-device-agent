@@ -10,8 +10,14 @@
  * Payload shape (full config object, not a delta — idempotent by design):
  *   { "v": 1, "gnssAntBias": boolean,
  *     "imuMount": { enabled, rollDeg, pitchDeg, yawDeg },
- *     "recording": { telemetry, video, upload, retention }, "ts": <epoch ms> }
+ *     "recording": { telemetry, video, upload, retention },
+ *     "lteRecovery": { gpsFixResetPolicy, deadZoneProfile }, "ts": <epoch ms> }
  * Future cloud-configurable knobs slot in as additional keys.
+ *
+ * `lteRecovery` (lte_gnss_recovery plan, R8) follows the same REPLACE
+ * semantics as `recording`: present → settings.json's `lteRecovery` becomes
+ * exactly the cloud value (the sim7600-lte daemon re-reads it at each
+ * recovery decision, no restart); absent → local settings untouched.
  *
  * `recording` (offline recording plan, Phase 5 / D7) is REPLACE, not
  * per-field merge: when the message carries the key, settings.json's whole
@@ -25,9 +31,11 @@
  */
 import {
   loadSettings,
+  parseLteRecoverySettings,
   parseRecordingSettings,
   saveSettings,
   settingsPath,
+  type LteRecoverySettings,
   type RecordingSettings,
 } from "../daemon/settings.js";
 import { parseImuMount, type ImuMount } from "../lib/orientation.js";
@@ -41,6 +49,13 @@ export interface CloudConfig {
    * key. Absent (undefined) = message had no recording key; leave local alone.
    */
   recording?: RecordingSettings | null;
+  /**
+   * LTE recovery policy (lte_gnss_recovery plan, R8). Same replace-whole-
+   * namespace semantics as `recording`: null = carried but nothing valid →
+   * remove the local key (daemon falls back to defaults); absent = never
+   * cloud-configured, leave local settings alone.
+   */
+  lteRecovery?: LteRecoverySettings | null;
   /**
    * Segment-upload S3 bucket (Phase 6.2 backfill for devices fielded before
    * Phase 2 provisioning). Persisted into kvs.json — NOT settings.json — by
@@ -79,6 +94,10 @@ export function parseCloudConfig(payload: Buffer | string): CloudConfig | null {
     // exactly like a local settings.json read, so cloud and local values
     // compare structurally equal. An all-invalid/empty object → null.
     out.recording = parseRecordingSettings(recording) ?? null;
+  }
+  const lteRecovery = (obj as { lteRecovery?: unknown }).lteRecovery;
+  if (lteRecovery && typeof lteRecovery === "object" && !Array.isArray(lteRecovery)) {
+    out.lteRecovery = parseLteRecoverySettings(lteRecovery) ?? null;
   }
   return out;
 }
@@ -124,12 +143,26 @@ export function applyCloudConfig(
       recordingChange = target ? "set" : "clear";
     }
   }
-  if (Object.keys(next).length === 0 && recordingChange === undefined) {
+  // Same replace semantics for the LTE recovery policy namespace.
+  let lteRecoveryChange: "set" | "clear" | undefined;
+  if (config.lteRecovery !== undefined) {
+    const target = config.lteRecovery ?? undefined;
+    if (JSON.stringify(target) !== JSON.stringify(current.lteRecovery)) {
+      lteRecoveryChange = target ? "set" : "clear";
+    }
+  }
+  if (
+    Object.keys(next).length === 0 &&
+    recordingChange === undefined &&
+    lteRecoveryChange === undefined
+  ) {
     return { changed: false };
   }
   const merged = { ...current, ...next };
   if (recordingChange === "set") merged.recording = config.recording as RecordingSettings;
   else if (recordingChange === "clear") delete merged.recording;
+  if (lteRecoveryChange === "set") merged.lteRecovery = config.lteRecovery as LteRecoverySettings;
+  else if (lteRecoveryChange === "clear") delete merged.lteRecovery;
   saveSettings(merged, path);
   return { changed: true };
 }

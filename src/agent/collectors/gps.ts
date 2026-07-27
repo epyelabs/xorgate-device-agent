@@ -38,6 +38,15 @@ const REOPEN_SILENT_MS = 30_000;
  * `satellites_in_view` (GSV) vs `satellites` used (GGA) separates "bad sky
  * view / antenna" from "seeing plenty, geometry still converging"; `hdop`
  * (GSA) is the fix-confidence number (lower is better, <2 is good).
+ *
+ * `ttff_s` (lte_gnss_recovery plan, Phase 5 / Q6): time-to-first-fix measured
+ * at the NMEA fix-quality 0→nonzero transition — the accurate TTFF (the
+ * daemon publishes a coarse probe-cadence-bound one in its own telemetry).
+ * The clock arms when quality-0 sentences appear (acquisition observed) and
+ * publishes from lock until the next acquisition begins. It never spans a
+ * silent-stream gap: a reopen re-arms on the first quality-0 sentence, so an
+ * engine restart's dead air isn't billed as acquisition time. Null when the
+ * collector never saw the acquiring state (e.g. agent started under a fix).
  */
 export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): Collector {
   let started = false;
@@ -51,10 +60,30 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
   // stream's close event can land after the reopen) must not touch the state
   // of its successor.
   let gen = 0;
+  // TTFF clock: epoch when the current acquiring (quality 0) streak started,
+  // and the measured seconds for the current lock (see doc comment above).
+  let acquiringSince: number | null = null;
+  let ttffS: number | null = null;
+
+  function noteFixQuality(fix: GpsFix, now: number): void {
+    const q = fix.fixQuality;
+    if (typeof q !== "number") return; // no GGA yet — no quality knowledge
+    if (q === 0) {
+      if (acquiringSince === null) {
+        acquiringSince = now;
+        ttffS = null; // a new acquisition cycle invalidates the old measurement
+      }
+    } else if (acquiringSince !== null) {
+      ttffS = (now - acquiringSince) / 1000;
+      acquiringSince = null;
+    }
+  }
 
   function start(): void {
     started = true; // set before opening so reads don't double-start
     openedAt = Date.now();
+    // Fresh stream = fresh acquisition observation; never bill the silent gap.
+    acquiringSince = null;
     const myGen = ++gen;
     handle = streamGps(GPS_NMEA_PORT, {
       onFix: (fix) => {
@@ -62,6 +91,7 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
         latest = fix;
         lastFixAt = Date.now();
         lastFixMono = process.hrtime.bigint();
+        noteFixQuality(fix, lastFixAt);
         warned = false; // streaming again — allow a fresh warning if it drops
       },
       onError: (msg) => {
@@ -118,6 +148,10 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
       // lock loss), so it's always tied to the current position.
       if (typeof fix.course === "number") {
         out.course = { value: round(fix.course, 1), unit: "°" };
+      }
+      // TTFF of the current lock; absent when acquisition was never observed.
+      if (ttffS !== null) {
+        out.ttff_s = { value: round(ttffS, 1), unit: "s" };
       }
     }
     return out;

@@ -57,6 +57,21 @@ describe("parseCloudConfig", () => {
     ).toEqual({ recording: { telemetry: { rateHz: 20 } } });
   });
 
+  it("parses an lteRecovery namespace (all-invalid → null, mistyped → ignored)", () => {
+    expect(
+      parseCloudConfig(
+        JSON.stringify({ v: 1, lteRecovery: { gpsFixResetPolicy: "veto-deadzone" } }),
+      ),
+    ).toEqual({ lteRecovery: { gpsFixResetPolicy: "veto-deadzone" } });
+    // Carried but nothing valid → null ("cloud manages it, all defaults").
+    expect(
+      parseCloudConfig(JSON.stringify({ v: 1, lteRecovery: { gpsFixResetPolicy: "bogus" } })),
+    ).toEqual({ lteRecovery: null });
+    // Mistyped container → key absent (local settings untouched).
+    expect(parseCloudConfig(JSON.stringify({ v: 1, lteRecovery: [] }))).toEqual({});
+    expect(parseCloudConfig(JSON.stringify({ v: 1, lteRecovery: "defer" }))).toEqual({});
+  });
+
   it("parses uploadBucket and drops empty/mistyped values", () => {
     expect(
       parseCloudConfig(JSON.stringify({ v: 1, uploadBucket: "core-bucket" })),
@@ -141,5 +156,30 @@ describe("applyCloudConfig", () => {
     expect(loadSettings().recording).toBeUndefined();
     // …and clearing again is a no-op.
     expect(applyCloudConfig({ recording: null })).toEqual({ changed: false });
+  });
+
+  it("replaces the lteRecovery namespace with the cloud value (R8 policy conduit)", () => {
+    saveSettings({ mode: "real", lteRecovery: { deadZoneProfile: "aggressive" } });
+    expect(
+      applyCloudConfig({ lteRecovery: { gpsFixResetPolicy: "veto-deadzone" } }),
+    ).toEqual({ changed: true });
+    // REPLACE, not merge: the locally-set profile is gone, cloud is authoritative.
+    expect(loadSettings()).toEqual({
+      mode: "real",
+      lteRecovery: { gpsFixResetPolicy: "veto-deadzone" },
+    });
+    // Identical retained re-delivery no-ops.
+    expect(
+      applyCloudConfig({ lteRecovery: { gpsFixResetPolicy: "veto-deadzone" } }),
+    ).toEqual({ changed: false });
+  });
+
+  it("lteRecovery: null clears the local namespace; absent leaves it alone", () => {
+    saveSettings({ lteRecovery: { gpsFixResetPolicy: "veto-deadzone" }, gnssAntBias: true });
+    expect(applyCloudConfig({ gnssAntBias: true })).toEqual({ changed: false });
+    expect(loadSettings().lteRecovery).toEqual({ gpsFixResetPolicy: "veto-deadzone" });
+    expect(applyCloudConfig({ lteRecovery: null })).toEqual({ changed: true });
+    expect(loadSettings().lteRecovery).toBeUndefined();
+    expect(applyCloudConfig({ lteRecovery: null })).toEqual({ changed: false });
   });
 });

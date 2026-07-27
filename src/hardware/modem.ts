@@ -30,6 +30,40 @@ export interface ModemPresence {
 /** Atomic telemetry JSON published by the daemon. Override for local testing. */
 export const LTE_TELEMETRY_FILE = process.env.LTE_TELEMETRY_FILE ?? "/run/sim7600-lte/telemetry.json";
 
+/** Coarse GNSS health taxonomy published by the daemon (lte_gnss_recovery plan, Phase 5). */
+export type GnssHealth = "ok" | "acquiring" | "degraded" | "unhealthy";
+
+/**
+ * GNSS observability block (daemon `write_telemetry` `gnss` object). All
+ * LAST-KNOWLEDGE values: the daemon probes fix state only on healthy-LTE
+ * health ticks (~10 min) and at the CRESET gate, so while LTE is down these
+ * go stale rather than null — judge freshness by `fix_checked_at`.
+ */
+export interface ModemGnssTelemetry {
+  engine_on?: 0 | 1 | null;
+  has_fix?: 0 | 1 | null;
+  fix_checked_at?: string | null;
+  /** Coarse daemon-side TTFF (engine start → first fix-probe success), secs. */
+  ttff_s?: number | null;
+  last_engine_start?: string | null;
+  last_engine_restart?: { ts: string; reason: "off" | "wedge" | "post-reset" } | null;
+  /** 1 while the engine runs the plain-standalone fallback (SUPL start failed). */
+  standalone_fallback?: 0 | 1;
+  no_fix_since?: string | null;
+  wedge_restarts_1h?: number;
+  health?: GnssHealth | null;
+}
+
+/** LTE recovery-machinery observability block (daemon `recovery` object). */
+export interface ModemRecoveryTelemetry {
+  connect_fails?: number;
+  radio_cycles_since_ok?: number;
+  resets_24h?: number;
+  last_reset?: { ts: string; path: "ladder" | "deadzone" | "config-drift" } | null;
+  last_gate_skip?: { ts: string; context: string; reason: string } | null;
+  last_lte_ok?: string | null;
+}
+
 export interface ModemTelemetry {
   timestamp: string;
   /** AT+CSQ value 0–31, or 99 when unknown. Doubles as ASU. */
@@ -43,6 +77,10 @@ export interface ModemTelemetry {
   ip: string | null;
   /** Modem PMU temperature in °C (AT+CPMUTEMP), or null/absent when never read. */
   modem_temp?: number | null;
+  /** GNSS observability (absent on daemons predating the lte_gnss_recovery plan). */
+  gnss?: ModemGnssTelemetry;
+  /** Recovery observability (absent on daemons predating the lte_gnss_recovery plan). */
+  recovery?: ModemRecoveryTelemetry;
 }
 
 /**

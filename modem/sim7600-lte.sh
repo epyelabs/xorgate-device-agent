@@ -12,7 +12,9 @@
 #         periodic re-download — the big TTFF win in urban canyons
 #       * SUPL UE-based AGPS (AT+CGPSURL + AT+CGPS=1,2), auto-falls back to
 #         standalone when the server is unreachable
-#   - Re-asserts the GNSS engine while connected (survives modem resets)
+#   - Re-asserts the GNSS engine while connected (survives modem resets) and
+#     self-heals a wedged engine: on + fixless too long -> clean engine
+#     restart, capped per hour (never a modem reset)
 #   - Adaptive CSQ polling: faster when signal is changing rapidly
 #   - Signal-aware reconnect: distinguishes dead zone vs network failure
 #   - Registration-aware: good RSSI alone never triggers a connect attempt;
@@ -176,6 +178,16 @@ XTRA_CHECK_INTERVAL=21600
 XTRA_RETRY_DELAY=600                 # re-attempt sooner after a failed download
 HTP_HOST="${SIM7600_HTP_HOST:-www.google.com}"  # HTP time source (XTRA needs accurate clock)
 GNSS_REASSERT_INTERVAL=600           # re-check the engine every 10 min while connected
+# Wedge self-healing (R5, Q1 option (a) — blind but capped): an engine that is
+# ON yet fixless this long gets one clean engine restart (stop -> settled SUPL
+# start via gps_start). Engine-only, NEVER AT+CRESET — a wedge is an engine
+# problem, and the modem reset is what wedged it in the first place. Blind
+# cost, accepted: a healthy-but-indoors device loses a few minutes of
+# acquisition progress it wasn't converting anyway, at most the capped number
+# of times per hour; XTRA persists in module flash, so TTFF once sky returns
+# is barely affected.
+GNSS_WEDGE_RESTART_SECS="${SIM7600_GNSS_WEDGE_RESTART_SECS:-1200}"
+GNSS_WEDGE_RESTART_MAX_PER_HOUR="${SIM7600_GNSS_WEDGE_RESTART_MAX_PER_HOUR:-1}"  # 0 = detect + log only, never restart
 
 # Telemetry
 TELEMETRY_FILE="${SIM7600_TELEMETRY_FILE:-/run/sim7600-lte/telemetry.json}"
@@ -568,12 +580,13 @@ gps_stop() {
 }
 
 # Start the GNSS engine, SUPL-assisted when a SUPL server is configured.
-# Callers reach here only with the engine off ("found off" or post-reset via
-# gnss_recover_after_reset) — never to re-start a running engine (F5 non-goal).
+# Callers reach here only with the engine off ("found off", post-reset via
+# gnss_recover_after_reset, or a gnss_health wedge restart — the latter two
+# stop it first) — never to re-start a running healthy engine (F5 non-goal).
 # F5: mode 2 is non-sticky — when the SUPL session fails the engine
 # auto-reverts and AT+CGPS? later reads 1,1. That is the documented fallback,
 # NOT a failed start; nothing may flap the engine to force mode 2 back
-# (gnss_reassert's "any 1,x = on" check depends on this).
+# (gnss_health's "any 1,x = on" check depends on this).
 gps_start() {
     if gps_engine_on; then
         return
@@ -806,9 +819,23 @@ xtra_maintain() {
     fi
 }
 
-# Cheap engine liveness re-assert (modem may reset underneath us and come back
-# with GNSS off since AT+CGPSAUTO=0). Self-throttles to GNSS_REASSERT_INTERVAL.
-gnss_reassert() {
+# GNSS health check: engine liveness AND engine sanity (R5, principle 4).
+# Self-throttles to GNSS_REASSERT_INTERVAL while the link is healthy.
+# Liveness (pre-existing): an engine found off (modem reset underneath us,
+# AT+CGPSAUTO=0) is restarted. Sanity (the wedge detector): liveness is not
+# health — the 2026-07-24 wedge streamed NMEA and "tracked" phantom satellites
+# for days without ever fixing, and nothing ever restarted it. The daemon's
+# only fix view is AT+CGNSSINFO (F6, via gnss_fix_present; its lost-read =
+# no-fix posture is fine here — a flaky probe at worst advances the no-fix
+# clock, bounded by the cap), so the detector is blind to the GSV wedge
+# signature (Q1 option (b), not built) and works on time alone: engine on but
+# fixless for GNSS_WEDGE_RESTART_SECS -> one clean engine restart, hard-capped
+# per rolling hour. The restart is justified by the no-fix clock ONLY — never
+# by mode (F5: +CGPS: 1,1 after a SUPL auto-fallback is normal, not a failed
+# start) — and is engine-only, NEVER escalating to AT+CRESET.
+NO_FIX_SINCE=0            # epoch of the current fixless streak's first probe; 0 = no streak
+GNSS_WEDGE_RESTARTS=()    # epochs of wedge restarts inside the rolling 1 h cap window
+gnss_health() {
     [[ "$ENABLE_GPS" == "1" ]] || return 0
     local now
     now=$(date +%s)
@@ -817,13 +844,52 @@ gnss_reassert() {
     if ! gps_engine_on; then
         warn "GNSS engine found off (modem reset?) — restarting it."
         gps_start
+        NO_FIX_SINCE=0
         # An engine found off usually means the modem reset underneath us, which
         # also reverts AT+CVAUXS (antenna bias) to off while our last-applied
         # tracker still says on. Clear the tracker + throttle so the very next
         # gnss_bias_maintain tick re-asserts the bias from settings.json.
         GNSS_BIAS_APPLIED=""
         LAST_BIAS_CHECK=0
+        return 0
     fi
+    if gnss_fix_present; then
+        NO_FIX_SINCE=0
+        return 0
+    fi
+    if (( NO_FIX_SINCE == 0 )); then
+        NO_FIX_SINCE=$now
+        log "GNSS health: engine on, no fix — no-fix clock armed (engine restart if still fixless after ${GNSS_WEDGE_RESTART_SECS}s)."
+        return 0
+    fi
+    if (( LAST_MODEM_RESET > NO_FIX_SINCE )); then
+        # A CRESET path already restarted the engine (gnss_recover_after_reset)
+        # after this streak began; the fresh session earns a full window before
+        # the blind detector may judge it.
+        NO_FIX_SINCE=$now
+        log "GNSS health: no-fix clock re-armed — post-reset recovery restarted the engine $(( now - LAST_MODEM_RESET ))s ago; granting the fresh session a full ${GNSS_WEDGE_RESTART_SECS}s window."
+        return 0
+    fi
+    local fixless=$(( now - NO_FIX_SINCE ))
+    if (( fixless < GNSS_WEDGE_RESTART_SECS )); then
+        log "GNSS health: engine on, no fix for ${fixless}s/${GNSS_WEDGE_RESTART_SECS}s — watching."
+        return 0
+    fi
+    # Rolling per-hour cap (same prune idiom as creset_budget_recount).
+    local t kept=()
+    for t in "${GNSS_WEDGE_RESTARTS[@]}"; do
+        (( t > now - 3600 )) && kept+=("$t")
+    done
+    GNSS_WEDGE_RESTARTS=("${kept[@]}")
+    if (( ${#GNSS_WEDGE_RESTARTS[@]} >= GNSS_WEDGE_RESTART_MAX_PER_HOUR )); then
+        warn "GNSS health: no fix for ${fixless}s but engine-restart cap reached (${#GNSS_WEDGE_RESTARTS[@]}/$GNSS_WEDGE_RESTART_MAX_PER_HOUR in the last hour) — restart suppressed (the blind detector must not flap a merely-indoors device)."
+        return 0
+    fi
+    GNSS_WEDGE_RESTARTS+=("$now")
+    warn "GNSS health: engine on but fixless for ${fixless}s (>= ${GNSS_WEDGE_RESTART_SECS}s) — wedge suspected; clean engine restart (${#GNSS_WEDGE_RESTARTS[@]}/$GNSS_WEDGE_RESTART_MAX_PER_HOUR this hour; engine-only, never CRESET)."
+    gps_stop
+    gps_start
+    NO_FIX_SINCE=0
 }
 
 # --- Modem / interface helpers -----------------------------------------------
@@ -1326,7 +1392,7 @@ monitor_connection() {
             write_telemetry "$csq" "connected" "$interval"
             log "Health OK — CSQ=$csq ($dbm) [poll=${interval}s]"
             # GNSS upkeep while the link is healthy (all self-throttle).
-            gnss_reassert
+            gnss_health
             xtra_maintain
             gnss_bias_maintain
         else

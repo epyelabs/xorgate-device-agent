@@ -49,6 +49,29 @@ export interface RecordingSettings {
   };
   upload?: { mode?: "auto" | "off" };
   retention?: { maxBytes?: number; minFreeBytes?: number };
+  /**
+   * Runtime undervoltage load shedding (optimize-system-process-cycle plan,
+   * Phase 3): when the 5 V rail measurably fails, shed live streaming first,
+   * then recording (bridge-only), and restore with hysteresis. All thresholds
+   * are Q4 STARTING values, cloud-tunable for the Phase 5 field loop;
+   * defaults live in `src/recording/config.ts`.
+   */
+  powerShedding?: {
+    enabled?: boolean;
+    /** Shed when this many CURRENT-undervoltage samples land within uvWindowSecs. */
+    uvSamples?: number;
+    uvWindowSecs?: number;
+    /** ... OR the 5 V rail stays below this for railLowSecs straight. */
+    railLowVolts?: number;
+    railLowSecs?: number;
+    /** Continued trigger this long at a shed rung escalates to the next rung. */
+    escalateDwellSecs?: number;
+    /** Clean interval (no UV, rail ≥ railRestoreVolts) per restored rung. */
+    restoreSecs?: number;
+    railRestoreVolts?: number;
+    /** Shed cycles per rolling hour before parking at the shed level. */
+    maxShedsPerHour?: number;
+  };
 }
 
 /**
@@ -179,6 +202,41 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
   if (up && typeof up === "object") {
     const mode = (up as { mode?: unknown }).mode;
     if (mode === "auto" || mode === "off") out.upload = { mode };
+  }
+
+  const shed = src.powerShedding;
+  if (shed && typeof shed === "object") {
+    const p: NonNullable<RecordingSettings["powerShedding"]> = {};
+    const enabled = (shed as { enabled?: unknown }).enabled;
+    if (typeof enabled === "boolean") p.enabled = enabled;
+    // Integer knobs, clamped (forgiving posture — a bad value degrades to the
+    // nearest sane one rather than disabling protection).
+    const ints: [keyof typeof p, number, number][] = [
+      ["uvSamples", 1, 60],
+      ["uvWindowSecs", 5, 300],
+      ["railLowSecs", 3, 120],
+      ["escalateDwellSecs", 5, 600],
+      ["restoreSecs", 10, 3600],
+      ["maxShedsPerHour", 0, 60],
+    ];
+    for (const [field, min, max] of ints) {
+      const v = (shed as Record<string, unknown>)[field];
+      if (typeof v === "number" && Number.isFinite(v)) {
+        (p as Record<string, unknown>)[field] = Math.min(max, Math.max(min, Math.round(v)));
+      }
+    }
+    // Voltage thresholds keep their decimals; bounds bracket plausible 5 V rails.
+    const volts: [keyof typeof p, number, number][] = [
+      ["railLowVolts", 4.0, 5.2],
+      ["railRestoreVolts", 4.0, 5.4],
+    ];
+    for (const [field, min, max] of volts) {
+      const v = (shed as Record<string, unknown>)[field];
+      if (typeof v === "number" && Number.isFinite(v)) {
+        (p as Record<string, unknown>)[field] = Math.min(max, Math.max(min, v));
+      }
+    }
+    if (Object.keys(p).length > 0) out.powerShedding = p;
   }
 
   const ret = src.retention;

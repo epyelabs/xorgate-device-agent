@@ -6,9 +6,12 @@
  * PSU draw on a marginal supply), then flip to full capture the moment the
  * modem reaches a verdict.
  *
- * The decision is deliberately separable from the manager wiring: Phase 3's
- * runtime undervoltage shedding reuses this module as the home for
- * "power says no" logic.
+ * The decision is deliberately separable from the manager wiring: this module
+ * is the home for all "power says no" logic. It holds two independent
+ * evaluators:
+ *  - BootDeferPolicy (Phase 2): one-shot boot staging, LATCHES its first allow.
+ *  - LoadShedPolicy (Phase 3): runtime undervoltage load shedding — fully
+ *    reversible (never latches), fed measured power samples at ~1 Hz.
  *
  * Semantics (Q1/Q2, resolved 2026-07-28/29):
  *  - Arming (`recording.video.bootDefer`): "auto" arms only when the firmware
@@ -200,5 +203,270 @@ export class BootDeferPolicy {
     } catch {
       return null;
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime undervoltage load shedding (Phase 3)
+// ---------------------------------------------------------------------------
+//
+// When the 5 V rail is measurably failing, shed CPU load in value order —
+// live streaming (a convenience) before recording (the product) — and restore
+// in reverse with hysteresis once the rail is healthy. Triggers only on the
+// firmware's own measurements (the CURRENT undervoltage bit / EXT5V rail
+// voltage the agent already samples); sticky bits are history and never
+// trigger. A rolling-hour cycle cap parks a genuinely bad supply at its shed
+// level instead of letting it flap all day (Q4/README principle 4).
+
+/** Shed ladder rungs (Q3: 2-rung, preset downgrade scrapped). Extensible by design. */
+export type ShedLevel = 0 | 1 | 2;
+
+/** Human names per rung: 0 = everything on, 1 = live KVS off, 2 = recording off too. */
+export const SHED_LEVELS = ["full", "no-live", "bridge-only"] as const;
+
+/**
+ * The Phase 3 knobs (device setting `recording.powerShedding.*`) — Q4: the
+ * defaults are STARTING values; every one is cloud-tunable so the Phase 5
+ * field loop needs no redeploy.
+ */
+export interface ShedConfig {
+  enabled: boolean;
+  /** Shed when this many undervoltage samples land within uvWindowSecs. */
+  uvSamples: number;
+  uvWindowSecs: number;
+  /** ... OR the rail stays below this for railLowSecs straight. */
+  railLowVolts: number;
+  railLowSecs: number;
+  /** Continued trigger at a shed rung this long escalates to the next rung. */
+  escalateDwellSecs: number;
+  /** Clean interval (no UV, rail at/above railRestoreVolts) per restored rung. */
+  restoreSecs: number;
+  railRestoreVolts: number;
+  /** Shed cycles per rolling hour before parking at the shed level. */
+  maxShedsPerHour: number;
+}
+
+/** One ~1 Hz power reading (see agent/collectors samplePower). */
+export interface PowerSampleReading {
+  /** CURRENT undervoltage bit (0x1) of the throttle mask. */
+  uv: boolean;
+  /** EXT5V rail voltage; null when the PMIC ADC is unavailable (Pi 4). */
+  railV: number | null;
+}
+
+interface PowerSample extends PowerSampleReading {
+  tMs: number;
+}
+
+/**
+ * Rail-trigger freshness guard: the sustained-low check infers "still low"
+ * from the absence of a healthy reading, so it must not fire off a dead
+ * sampler. UV positives need no guard — they age out of their window.
+ */
+export const POWER_SAMPLE_STALE_MS = 5_000;
+
+/** What the sample window currently says (pure, exported for tests). */
+export interface ShedSignals {
+  trigger: boolean;
+  /** Trigger rationale for the transition log; null when not triggering. */
+  why: string | null;
+  /** Newest "dirty" sample (UV, or rail below railRestoreVolts); null if none in window. */
+  lastDirtyMs: number | null;
+}
+
+export function computeShedSignals(
+  samples: readonly PowerSample[],
+  cfg: ShedConfig,
+  nowMs: number,
+): ShedSignals {
+  const newest = samples[samples.length - 1];
+  const fresh = newest !== undefined && nowMs - newest.tMs <= POWER_SAMPLE_STALE_MS;
+
+  const uvCount = samples.filter((s) => s.uv && nowMs - s.tMs <= cfg.uvWindowSecs * 1000).length;
+
+  // Sustained rail low: the low run since the last healthy (>= threshold)
+  // reading must span railLowSecs. Only meaningful while sampling is live.
+  let lowRunStartMs: number | null = null;
+  let lastRail: number | null = null;
+  for (let i = samples.length - 1; i >= 0; i--) {
+    const r = samples[i].railV;
+    if (r === null) continue;
+    if (lastRail === null) lastRail = r;
+    if (r >= cfg.railLowVolts) break;
+    lowRunStartMs = samples[i].tMs;
+  }
+  const railLow =
+    fresh && lowRunStartMs !== null && nowMs - lowRunStartMs >= cfg.railLowSecs * 1000;
+
+  let lastDirtyMs: number | null = null;
+  for (const s of samples) {
+    if (s.uv || (s.railV !== null && s.railV < cfg.railRestoreVolts)) lastDirtyMs = s.tMs;
+  }
+
+  const why =
+    uvCount >= cfg.uvSamples
+      ? `undervoltage ${uvCount}x in ${cfg.uvWindowSecs}s`
+      : railLow
+        ? `rail ${lastRail?.toFixed(2)}V < ${cfg.railLowVolts}V for ${cfg.railLowSecs}s`
+        : null;
+  return { trigger: why !== null, why, lastDirtyMs };
+}
+
+/** Ladder state — plain data so the transition core stays pure. */
+export interface ShedState {
+  level: ShedLevel;
+  /** Cycle cap exhausted: no more restores until reboot/settings change. */
+  parked: boolean;
+  /** Last level transition (restore/escalate interval anchor). */
+  lastChangeMs: number;
+  /** Start of the current continuous trigger streak; null when not triggering. */
+  triggerSinceMs: number | null;
+  /** Shed cycle starts (level 0 → 1) within the rolling hour. */
+  shedStartsMs: number[];
+}
+
+export function initialShedState(nowMs: number): ShedState {
+  return { level: 0, parked: false, lastChangeMs: nowMs, triggerSinceMs: null, shedStartsMs: [] };
+}
+
+export interface ShedEvent {
+  level: "info" | "warn";
+  msg: string;
+}
+
+const HOUR_MS = 3_600_000;
+
+/**
+ * Pure ladder transition core: one evaluation tick. Escalation dwell is
+ * measured from the later of "trigger started" and "last rung change", so a
+ * long-standing trigger cannot skip straight past a rung.
+ */
+export function decideShedTransition(
+  cfg: ShedConfig,
+  prev: ShedState,
+  sig: ShedSignals,
+  nowMs: number,
+): { state: ShedState; event: ShedEvent | null } {
+  const s: ShedState = { ...prev, shedStartsMs: prev.shedStartsMs.filter((t) => nowMs - t <= HOUR_MS) };
+
+  if (sig.trigger) {
+    s.triggerSinceMs = prev.triggerSinceMs ?? nowMs;
+    if (s.level === 0) {
+      s.level = 1;
+      s.lastChangeMs = nowMs;
+      s.shedStartsMs = [...s.shedStartsMs, nowMs];
+      let msg = `power shed → no-live (${sig.why}): live streaming off, recording continues`;
+      if (s.shedStartsMs.length > cfg.maxShedsPerHour) {
+        s.parked = true;
+        msg += `; shed-cycle cap (${cfg.maxShedsPerHour}/h) exhausted — parked until reboot or settings change`;
+      }
+      return { state: s, event: { level: "warn", msg } };
+    }
+    if (s.level === 1 && nowMs - Math.max(s.triggerSinceMs, s.lastChangeMs) >= cfg.escalateDwellSecs * 1000) {
+      s.level = 2;
+      s.lastChangeMs = nowMs;
+      return {
+        state: s,
+        event: {
+          level: "warn",
+          msg: `power shed → bridge-only (${sig.why}, continued ${cfg.escalateDwellSecs}s past no-live): video recording off, telemetry recording continues`,
+        },
+      };
+    }
+    return { state: s, event: null };
+  }
+
+  s.triggerSinceMs = null;
+  if (s.level > 0 && !s.parked) {
+    // Fail open: with no dirty sample on record (sampler gone quiet), the
+    // clean interval alone restores — shedding must never strand a healthy
+    // device below full operation.
+    const anchor = Math.max(s.lastChangeMs, sig.lastDirtyMs ?? 0);
+    if (nowMs - anchor >= cfg.restoreSecs * 1000) {
+      s.level = (s.level - 1) as ShedLevel;
+      s.lastChangeMs = nowMs;
+      return {
+        state: s,
+        event: {
+          level: "info",
+          msg: `power shed restore → ${SHED_LEVELS[s.level]} (rail clean for ${cfg.restoreSecs}s)`,
+        },
+      };
+    }
+  }
+  return { state: s, event: null };
+}
+
+export interface ShedVerdict {
+  level: ShedLevel;
+  parked: boolean;
+  /** Log-worthy transition this evaluation produced; null when steady. */
+  event: ShedEvent | null;
+}
+
+export interface LoadShedPolicyOptions {
+  /** Test seam. */
+  now?: () => number;
+}
+
+/**
+ * Stateful wrapper the recording manager holds: buffers pushed power samples,
+ * evaluates the ladder on the manager's shed tick, and — unlike
+ * BootDeferPolicy — never latches (shedding is reversible by design). All
+ * decisions are made from data already pushed; evaluate() itself never probes
+ * hardware.
+ */
+export class LoadShedPolicy {
+  private readonly now: () => number;
+  private samples: PowerSample[] = [];
+  private state: ShedState;
+
+  constructor(opts: LoadShedPolicyOptions = {}) {
+    this.now = opts.now ?? Date.now;
+    this.state = initialShedState(this.now());
+  }
+
+  /** Record one power reading (manager's ~1 Hz tick). */
+  push(reading: PowerSampleReading): void {
+    this.samples.push({ ...reading, tMs: this.now() });
+    // Backstop prune so a caller that only pushes can never grow unbounded;
+    // evaluate() prunes precisely per config.
+    if (this.samples.length > 4000) this.samples.splice(0, this.samples.length - 4000);
+  }
+
+  /** Evaluate the ladder for this tick. Never latches; safe to call often. */
+  evaluate(cfg: ShedConfig): ShedVerdict {
+    const nowMs = this.now();
+    if (!cfg.enabled) {
+      const wasActive = this.state.level > 0 || this.state.parked;
+      this.reset();
+      return {
+        level: 0,
+        parked: false,
+        event: wasActive
+          ? { level: "info", msg: "power shedding disabled by settings — restoring full operation" }
+          : null,
+      };
+    }
+    const horizonMs =
+      Math.max(cfg.uvWindowSecs, cfg.railLowSecs, cfg.restoreSecs) * 1000 + POWER_SAMPLE_STALE_MS;
+    this.samples = this.samples.filter((s) => nowMs - s.tMs <= horizonMs);
+    const signals = computeShedSignals(this.samples, cfg, nowMs);
+    const { state, event } = decideShedTransition(cfg, this.state, signals, nowMs);
+    this.state = state;
+    return { level: state.level, parked: state.parked, event };
+  }
+
+  /** Forget everything (settings change / monitor disarm — clears park + cap). */
+  reset(): void {
+    this.samples = [];
+    this.state = initialShedState(this.now());
+  }
+
+  /** Current rung as a state.json-friendly string; null at full operation. */
+  statusString(): string | null {
+    if (this.state.level === 0 && !this.state.parked) return null;
+    const name = SHED_LEVELS[this.state.level];
+    return this.state.parked ? `parked:${name}` : name;
   }
 }

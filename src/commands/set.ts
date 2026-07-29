@@ -30,6 +30,14 @@
  *   recording.video.spawnStaggerSecs <0-30>
  * (bootDefer* / spawnStaggerSecs are the Phase 2 boot power staging knobs —
  * optimize-system-process-cycle plan.)
+ *   recording.powerShedding.enabled <on|off>
+ *   recording.powerShedding.uvSamples <1-60>        recording.powerShedding.uvWindowSecs <5-300>
+ *   recording.powerShedding.railLowVolts <4-5.2>    recording.powerShedding.railLowSecs <3-120>
+ *   recording.powerShedding.escalateDwellSecs <5-600>
+ *   recording.powerShedding.restoreSecs <10-3600>   recording.powerShedding.railRestoreVolts <4-5.4>
+ *   recording.powerShedding.maxShedsPerHour <0-60>
+ * (powerShedding.* is the Phase 3 runtime undervoltage load-shedding ladder —
+ * live streaming sheds first, recording last, restore with hysteresis.)
  */
 import {
   loadSettings,
@@ -104,7 +112,15 @@ function setRecordingCommand(key: string, value: string | undefined): void {
     field === "minFreeBytes" ||
     field === "bootDeferMaxSecs" ||
     field === "bootDeferMinBudgetMa" ||
-    field === "spawnStaggerSecs"
+    field === "spawnStaggerSecs" ||
+    field === "uvSamples" ||
+    field === "uvWindowSecs" ||
+    field === "railLowVolts" ||
+    field === "railLowSecs" ||
+    field === "escalateDwellSecs" ||
+    field === "restoreSecs" ||
+    field === "railRestoreVolts" ||
+    field === "maxShedsPerHour"
   ) {
     if (!Number.isFinite(num) || num < 0) {
       console.error(`${key} must be a non-negative number, got '${value ?? ""}'`);

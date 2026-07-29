@@ -91,6 +91,70 @@ describe("parseRecordingSettings", () => {
     expect(RECORDING_DEFAULTS.video.bootDefer).toBe("auto");
   });
 
+  it("accepts and clamps the Phase 3 powerShedding knobs", () => {
+    const full = {
+      enabled: true,
+      uvSamples: 3,
+      uvWindowSecs: 30,
+      railLowVolts: 4.85,
+      railLowSecs: 15,
+      escalateDwellSecs: 60,
+      restoreSecs: 120,
+      railRestoreVolts: 4.95,
+      maxShedsPerHour: 4,
+    };
+    expect(parseRecordingSettings({ powerShedding: full })).toEqual({ powerShedding: full });
+    // Clamps: integers round + clamp, voltages clamp without rounding.
+    expect(
+      parseRecordingSettings({
+        powerShedding: {
+          uvSamples: 0,
+          uvWindowSecs: 9999,
+          railLowVolts: 6,
+          railLowSecs: 1,
+          escalateDwellSecs: 0,
+          restoreSecs: 100_000,
+          railRestoreVolts: 3,
+          maxShedsPerHour: -5,
+        },
+      }),
+    ).toEqual({
+      powerShedding: {
+        uvSamples: 1,
+        uvWindowSecs: 300,
+        railLowVolts: 5.2,
+        railLowSecs: 3,
+        escalateDwellSecs: 5,
+        restoreSecs: 3600,
+        railRestoreVolts: 4.0,
+        maxShedsPerHour: 0,
+      },
+    });
+    // Mistyped leaves drop; valid siblings survive; enabled=false persists.
+    expect(
+      parseRecordingSettings({ powerShedding: { enabled: false, uvSamples: "three" } }),
+    ).toEqual({ powerShedding: { enabled: false } });
+  });
+
+  it("resolves powerShedding defaults (on, Q4 starting thresholds)", () => {
+    const cfg = resolveRecordingConfig(undefined);
+    expect(cfg.powerShedding).toEqual({
+      enabled: true,
+      uvSamples: 3,
+      uvWindowSecs: 30,
+      railLowVolts: 4.85,
+      railLowSecs: 15,
+      escalateDwellSecs: 60,
+      restoreSecs: 120,
+      railRestoreVolts: 4.95,
+      maxShedsPerHour: 4,
+    });
+    // Partial overlay keeps the rest of the defaults.
+    expect(resolveRecordingConfig({ powerShedding: { railLowVolts: 4.75 } }).powerShedding).toEqual(
+      { ...RECORDING_DEFAULTS.powerShedding, railLowVolts: 4.75 },
+    );
+  });
+
   it("drops mistyped leaves but keeps valid siblings", () => {
     const s = parseRecordingSettings({
       telemetry: { enabled: "yes", rateHz: 5 },

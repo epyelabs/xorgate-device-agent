@@ -29,7 +29,14 @@ import {
 import { DiskManager } from "./disk.js";
 import { finalizeOrphanSegments } from "./segments.js";
 import { TelemetryRecorder } from "./telemetry-recorder.js";
-import { BootDeferPolicy, type BootDeferVerdict } from "./boot-policy.js";
+import {
+  BootDeferPolicy,
+  LoadShedPolicy,
+  type BootDeferVerdict,
+  type PowerSampleReading,
+  type ShedLevel,
+  type ShedVerdict,
+} from "./boot-policy.js";
 import {
   createTimeSourceTracker,
   mintSessionId,
@@ -58,6 +65,12 @@ const SETTINGS_POLL_MS = 5_000;
 const TIME_PROBE_TIMEOUT_MS = 2_000;
 /** Slow disk-pressure sweep; rotations also trigger enforcement directly. */
 const DISK_ENFORCE_MS = 60_000;
+/**
+ * Load-shedding power sample cadence (Phase 3). Matches the system collector's
+ * native 1 Hz sample cache, so this tick reuses the same vcgencmd reads as the
+ * telemetry recorder rather than adding a second poller.
+ */
+const SHED_SAMPLE_MS = 1_000;
 
 /**
  * Upload plumbing injected by the worker (Phase 2). Absent when the device has
@@ -89,6 +102,12 @@ export interface RecordingVideoOptions {
   cameras(): CaptureCamera[];
   /** Bounce a stream's KVS master after its capture child (re)spawns. */
   onCaptureSpawned?: (streamKey: string) => void;
+  /**
+   * Shed rung 1 (Phase 3): park (true) / release (false) the live KVS masters.
+   * The worker wires this to the media supervisor; parked masters are held
+   * down until released. Absent on hosts without live streaming.
+   */
+  setLiveShed?: (shed: boolean) => void;
   /** Overrides for tests. */
   shmDir?: string;
   spawn?: CaptureSpawn;
@@ -123,6 +142,15 @@ export interface RecordingManagerOptions {
   timeProbeTimeoutMs?: number;
   /** Boot power staging policy override (tests inject fake telemetry/budget). */
   bootPolicy?: BootDeferPolicy;
+  /**
+   * ~1 Hz power reading for load shedding (Phase 3); the worker wires the
+   * system collector's cached sampler. null = no reading this tick (off-Pi,
+   * vcgencmd absent/failed) — the policy then simply never triggers.
+   */
+  powerSample?: () => Promise<PowerSampleReading | null>;
+  /** Load-shedding policy override (tests inject a fake clock). */
+  shedPolicy?: LoadShedPolicy;
+  shedSampleMs?: number;
 }
 
 export class RecordingManager {
@@ -141,6 +169,16 @@ export class RecordingManager {
   private readonly bootPolicy: BootDeferPolicy;
   /** Last boot-defer status string that was logged/published (dedupe key). */
   private bootDeferStatus: string | null = null;
+  /** Runtime undervoltage load shedding (Phase 3). */
+  private readonly shedPolicy: LoadShedPolicy;
+  private shedTimer: NodeJS.Timeout | null = null;
+  /** Current rung as published in status(); null = full operation / inert. */
+  private shedStatus: string | null = null;
+  private shedLevel: ShedLevel = 0;
+  /** Whether the live KVS masters are currently parked by rung 1. */
+  private liveShed = false;
+  /** powerShedding namespace fingerprint — a change resets the policy (clears park). */
+  private shedCfgKey: string;
   /** Serializes capture stop→start handovers (see applyVideo). */
   private videoTransition: Promise<void> = Promise.resolve();
   private pollTimer: NodeJS.Timeout | null = null;
@@ -151,8 +189,10 @@ export class RecordingManager {
     this.opts = opts;
     this.timeSource = opts.timeSource ?? createTimeSourceTracker();
     this.bootPolicy = opts.bootPolicy ?? new BootDeferPolicy();
+    this.shedPolicy = opts.shedPolicy ?? new LoadShedPolicy();
     this.root = opts.root ?? recordingsRoot();
     this.cfg = resolveRecordingConfig(loadSettings().recording);
+    this.shedCfgKey = JSON.stringify(this.cfg.powerShedding);
     if (opts.upload) this.uploader = this.buildUploader(opts.upload);
   }
 
@@ -265,8 +305,10 @@ export class RecordingManager {
     this.stopRequested = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.diskTimer) clearInterval(this.diskTimer);
+    if (this.shedTimer) clearInterval(this.shedTimer);
     this.pollTimer = null;
     this.diskTimer = null;
+    this.shedTimer = null;
     this.uploader?.stop();
     this.stopRecorder("agent shutdown");
     this.videoCapture?.stop();
@@ -296,6 +338,8 @@ export class RecordingManager {
       // Boot power staging verdict (Phase 2); absent until the video path
       // first consulted the policy (video off / no cameras / telemetry-only).
       ...(this.bootDeferStatus !== null ? { bootDefer: this.bootDeferStatus } : {}),
+      // Load-shedding rung (Phase 3); absent at full operation.
+      ...(this.shedStatus !== null ? { powerShed: this.shedStatus } : {}),
     };
   }
 
@@ -305,6 +349,14 @@ export class RecordingManager {
 
   private apply(): void {
     this.disk?.setRetention(this.cfg.retention);
+
+    // A powerShedding settings change resets the ladder (clears park + the
+    // cycle cap) — the documented operator escape hatch short of a reboot.
+    const shedKey = JSON.stringify(this.cfg.powerShedding);
+    if (shedKey !== this.shedCfgKey) {
+      this.shedCfgKey = shedKey;
+      this.shedPolicy.reset();
+    }
 
     const want = this.cfg.telemetry.enabled;
     const rateChanged =
@@ -332,6 +384,15 @@ export class RecordingManager {
     const vo = this.opts.video;
     if (!vo) return;
     const cameras = vo.mediaEnabled ? vo.cameras() : [];
+    // Runtime undervoltage shedding (Phase 3): armed only while a bridged
+    // camera exists (the heavy-load case this protects); null = feature inert,
+    // behave exactly as today.
+    const shed = this.updateShedMonitor(cameras.length > 0);
+    const shedLive = shed !== null && shed.level >= 1;
+    if (shedLive !== this.liveShed) {
+      this.liveShed = shedLive;
+      vo.setLiveShed?.(shedLive);
+    }
     // Boot power staging (Phase 2): while the modem is still bringing up LTE
     // on a constrained supply budget, run bridge-only (record=false) so live
     // streaming can attach but no x264 encoder competes with the attach/TX
@@ -347,6 +408,9 @@ export class RecordingManager {
       record = verdict.allow;
       this.noteBootDefer(verdict);
     }
+    // Shed rung 2: recording off, bridge-only (telemetry recording — the
+    // crash evidence — keeps running; it is not touched by the ladder).
+    if (record && shed !== null && shed.level >= 2) record = false;
     const preset = resolveVideoPreset(this.cfg.video.preset);
     const key = JSON.stringify({
       cameras,
@@ -380,6 +444,68 @@ export class RecordingManager {
       if (this.videoKey !== key) return; // superseded by a newer config change
       this.startVideo(cameras, record, preset);
     });
+  }
+
+  /**
+   * Arm/disarm the shed monitor and evaluate the ladder for this apply pass.
+   * Armed: a 1 s sample tick feeds the policy (reusing the system collector's
+   * cached power reads). Disarmed (no cameras, feature disabled, no sampler):
+   * everything resets — fail open, zero behavior change vs. today.
+   */
+  private updateShedMonitor(camerasPresent: boolean): ShedVerdict | null {
+    const armed =
+      camerasPresent && this.cfg.powerShedding.enabled && this.opts.powerSample !== undefined;
+    if (!armed) {
+      if (this.shedTimer) {
+        clearInterval(this.shedTimer);
+        this.shedTimer = null;
+      }
+      this.shedPolicy.reset();
+      this.shedLevel = 0;
+      if (this.shedStatus !== null) {
+        this.shedStatus = null;
+        this.opts.onEvent?.("info", "power shedding disarmed — restoring full operation");
+        this.notifyStatus();
+      }
+      return null;
+    }
+    if (!this.shedTimer) {
+      this.shedTimer = setInterval(() => {
+        void this.shedTick();
+      }, this.opts.shedSampleMs ?? SHED_SAMPLE_MS);
+      this.shedTimer.unref();
+    }
+    return this.evaluateShed();
+  }
+
+  /** One shed-monitor tick: sample power, evaluate, re-apply on a rung change. */
+  private async shedTick(): Promise<void> {
+    if (this.stopRequested) return;
+    try {
+      const reading = await this.opts.powerSample!();
+      if (reading) this.shedPolicy.push(reading);
+    } catch {
+      /* fail open: no sample, no shed */
+    }
+    if (this.stopRequested) return;
+    const before = this.shedLevel;
+    const verdict = this.evaluateShed();
+    // A rung change flows through applyVideo — the same choke point as every
+    // other lifecycle change (it re-evaluates; transitions are idempotent).
+    if (verdict.level !== before) this.applyVideo();
+  }
+
+  /** Evaluate the ladder, logging transitions and publishing the rung status. */
+  private evaluateShed(): ShedVerdict {
+    const verdict = this.shedPolicy.evaluate(this.cfg.powerShedding);
+    this.shedLevel = verdict.level;
+    if (verdict.event) this.opts.onEvent?.(verdict.event.level, verdict.event.msg);
+    const status = this.shedPolicy.statusString();
+    if (status !== this.shedStatus) {
+      this.shedStatus = status;
+      this.notifyStatus();
+    }
+    return verdict;
   }
 
   /**

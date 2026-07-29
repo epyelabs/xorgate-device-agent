@@ -54,6 +54,13 @@ export interface MediaSupervisor {
    * restart path brings it back against the new socket.
    */
   restartChannel(streamKey: string): void;
+  /**
+   * Power load shedding rung 1 (optimize-system-process-cycle plan, Phase 3):
+   * true parks EVERY master (SIGINT + no respawn — unlike a plain stop, the
+   * supervisor holds them down until released); false releases and respawns.
+   * Reversible, unlike stop().
+   */
+  setShed(shed: boolean): void;
 }
 
 const IDLE: TelemetryMedia = {
@@ -65,6 +72,8 @@ const IDLE: TelemetryMedia = {
 export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
   let started = false;
   let stopped = false;
+  /** Load-shedding park: while true, nothing spawns (see setShed). */
+  let shed = false;
   let warned = false;
   let manifest: KvsManifest | null = null;
   const channels = new Map<string, ChannelSupervisor>();
@@ -115,7 +124,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
       channels.set(ch.channelName, {
         streamKey: ch.streamKey,
         channelName: ch.channelName,
-        state: "starting",
+        state: shed ? "stopped" : "starting",
         handle: null,
         startedAt: 0,
         backoffMs: BASE_BACKOFF_MS,
@@ -129,7 +138,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
 
   function spawn(channelName: string): void {
     const c = channels.get(channelName);
-    if (!c || stopped || !manifest) return;
+    if (!c || stopped || shed || !manifest) return;
 
     // Each channel/camera gets its own pipeline: <pipelineDir>/<streamKey>.gst,
     // falling back to the global KVS_GST_PIPELINE, then the runtime's default.
@@ -193,7 +202,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
       c.stableTimer = null;
     }
     c.handle = null;
-    if (stopped) {
+    if (stopped || shed) {
       c.state = "stopped";
       return;
     }
@@ -251,8 +260,34 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
       }
       return snapshot();
     },
+    setShed(on: boolean): void {
+      if (stopped || shed === on) return;
+      shed = on;
+      if (on) {
+        // Park: SIGINT every master and cancel pending restarts. onExit sees
+        // `shed` and marks the channel stopped instead of rescheduling.
+        for (const c of channels.values()) {
+          if (c.stableTimer) clearTimeout(c.stableTimer);
+          if (c.restartTimer) clearTimeout(c.restartTimer);
+          c.stableTimer = null;
+          c.restartTimer = null;
+          c.state = "stopped";
+          c.handle?.stop("SIGINT");
+        }
+        if (channels.size > 0) console.warn("[media] live masters parked (power load shedding)");
+        return;
+      }
+      // Release: respawn everything from a clean slate (fresh backoff — the
+      // previous exits were ours, not failures).
+      for (const c of channels.values()) {
+        c.quickFailures = 0;
+        c.backoffMs = BASE_BACKOFF_MS;
+        if (!c.handle && !c.restartTimer) spawn(c.channelName);
+      }
+      if (channels.size > 0) console.log("[media] live masters released (power load shedding over)");
+    },
     restartChannel(streamKey: string): void {
-      if (stopped) return;
+      if (stopped || shed) return;
       for (const c of channels.values()) {
         if (c.streamKey !== streamKey) continue;
         if (c.handle) {

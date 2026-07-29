@@ -27,6 +27,7 @@ import { loadManifest, persistUploadBucket } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
 import { s3Put } from "./recording/s3-put.js";
 import { RecordingManager, type RecordingUploadOptions } from "./recording/manager.js";
+import type { PowerSampleReading } from "./recording/boot-policy.js";
 import { resolveBridgedCameras } from "./recording/video-capture.js";
 import type { StateSnapshot, TelemetryPayload, TelemetryReading } from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
@@ -51,6 +52,8 @@ const source: {
   sampleGroups: () => Promise<Record<string, GroupSample>>;
   stop?: () => void;
   restartMediaChannel?: (streamKey: string) => void;
+  setLiveShed?: (shed: boolean) => void;
+  samplePower?: () => Promise<PowerSampleReading | null>;
 } =
   config.mode === "real"
     ? createCollector(
@@ -174,8 +177,14 @@ const recording = new RecordingManager({
     // A KVS master attached to a dead shm writer wedges instead of crashing
     // (shmsrc shm_open loop, black stream) — bounce it onto the new socket.
     onCaptureSpawned: (streamKey) => source.restartMediaChannel?.(streamKey),
+    // Load shedding rung 1 (Phase 3): park/release the live KVS masters.
+    setLiveShed: (shed) => source.setLiveShed?.(shed),
   },
   sampleGroups: () => source.sampleGroups(),
+  // ~1 Hz power reading for the shed policy — the system collector's cached
+  // sampler, so the recorder and the shedder share one vcgencmd stream.
+  // Absent in sim mode (no real power to measure → shedding inert).
+  powerSample: source.samplePower ? () => source.samplePower!() : undefined,
   onStatus: (status) => {
     store.setRecording(status);
     store.flush(Date.now());

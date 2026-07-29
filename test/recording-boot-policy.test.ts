@@ -4,9 +4,13 @@ import { join } from "node:path";
 import {
   BootDeferPolicy,
   decideBootDefer,
+  LoadShedPolicy,
   TELEMETRY_STALE_MS,
   type BootDeferConfig,
   type BootDeferInputs,
+  type PowerSampleReading,
+  type ShedConfig,
+  type ShedVerdict,
 } from "../src/recording/boot-policy.js";
 import { cleanup, tempHome } from "./helpers.js";
 
@@ -210,6 +214,171 @@ describe("BootDeferPolicy", () => {
 
   it("statusString is null before the first evaluation", () => {
     const policy = new BootDeferPolicy({ budgetPath: join(dir, "absent") });
+    expect(policy.statusString()).toBeNull();
+  });
+});
+
+describe("LoadShedPolicy (Phase 3 runtime undervoltage shedding)", () => {
+  /** The Q4 starting values (mirrors RECORDING_DEFAULTS.powerShedding). */
+  const CFG: ShedConfig = {
+    enabled: true,
+    uvSamples: 3,
+    uvWindowSecs: 30,
+    railLowVolts: 4.85,
+    railLowSecs: 15,
+    escalateDwellSecs: 60,
+    restoreSecs: 120,
+    railRestoreVolts: 4.95,
+    maxShedsPerHour: 4,
+  };
+
+  /** Fake-clocked policy + a tick() that mimics the manager's 1 Hz loop. */
+  function makePolicy() {
+    const clock = { now: 0 };
+    const policy = new LoadShedPolicy({ now: () => clock.now });
+    const tick = (secs: number, reading: PowerSampleReading, cfg: ShedConfig = CFG) => {
+      let last!: ShedVerdict;
+      const events: string[] = [];
+      for (let i = 0; i < secs; i++) {
+        clock.now += 1000;
+        policy.push(reading);
+        last = policy.evaluate(cfg);
+        if (last.event) events.push(last.event.msg);
+      }
+      return { last, events };
+    };
+    return { clock, policy, tick };
+  }
+
+  it("healthy samples never shed", () => {
+    const { policy, tick } = makePolicy();
+    const { last } = tick(120, { uv: false, railV: 5.05 });
+    expect(last.level).toBe(0);
+    expect(policy.statusString()).toBeNull();
+  });
+
+  it("sheds live (rung 1) on the 3rd UV sample in the window, not before", () => {
+    const { policy, tick } = makePolicy();
+    tick(1, { uv: true, railV: 5.0 });
+    tick(10, { uv: false, railV: 5.0 });
+    let r = tick(1, { uv: true, railV: 5.0 });
+    expect(r.last.level).toBe(0);
+    r = tick(1, { uv: true, railV: 5.0 });
+    expect(r.last.level).toBe(1);
+    expect(r.events[0]).toContain("no-live");
+    expect(r.events[0]).toContain("undervoltage 3x");
+    expect(policy.statusString()).toBe("no-live");
+  });
+
+  it("UV positives age out of the window (sparse UV never sheds)", () => {
+    const { tick } = makePolicy();
+    for (let i = 0; i < 3; i++) {
+      const r = tick(1, { uv: true, railV: 5.0 });
+      expect(r.last.level).toBe(0);
+      tick(40, { uv: false, railV: 5.0 });
+    }
+  });
+
+  it("sustained rail low sheds; a brief sag does not", () => {
+    const brief = makePolicy();
+    brief.tick(10, { uv: false, railV: 4.8 });
+    brief.tick(1, { uv: false, railV: 5.0 }); // healthy reading resets the run
+    const r1 = brief.tick(14, { uv: false, railV: 4.8 });
+    expect(r1.last.level).toBe(0);
+
+    const sustained = makePolicy();
+    const r2 = sustained.tick(16, { uv: false, railV: 4.8 });
+    expect(r2.last.level).toBe(1);
+    expect(r2.events[0]).toContain("rail 4.80V < 4.85V");
+  });
+
+  it("rail trigger requires fresh samples (a dead sampler cannot shed)", () => {
+    const { clock, policy, tick } = makePolicy();
+    tick(14, { uv: false, railV: 4.7 });
+    clock.now += 60_000; // sampler dies; the low run now spans >15 s but is stale
+    expect(policy.evaluate(CFG).level).toBe(0);
+  });
+
+  it("escalates to bridge-only (rung 2) only after the dwell of continued trigger", () => {
+    const { policy, tick } = makePolicy();
+    let r = tick(3, { uv: true, railV: 4.7 });
+    expect(r.last.level).toBe(1);
+    r = tick(59, { uv: true, railV: 4.7 });
+    expect(r.last.level).toBe(1); // 59 s after the shed — one short
+    r = tick(2, { uv: true, railV: 4.7 });
+    expect(r.last.level).toBe(2);
+    expect(r.events[0]).toContain("bridge-only");
+    expect(policy.statusString()).toBe("bridge-only");
+  });
+
+  it("a trigger break resets the escalation dwell", () => {
+    const { tick } = makePolicy();
+    tick(3, { uv: true, railV: 5.0 }); // shed
+    tick(35, { uv: false, railV: 5.0 }); // trigger drops (UV ages out), <120 s so no restore
+    let r = tick(3, { uv: true, railV: 5.0 }); // trigger returns
+    expect(r.last.level).toBe(1); // still rung 1 — dwell restarted
+    r = tick(61, { uv: true, railV: 5.0 });
+    expect(r.last.level).toBe(2);
+  });
+
+  it("restores one rung per clean interval; a sub-restore rail blocks it", () => {
+    const { policy, tick } = makePolicy();
+    tick(3, { uv: true, railV: 4.7 });
+    tick(62, { uv: true, railV: 4.7 });
+    expect(policy.statusString()).toBe("bridge-only");
+    // 4.90 V: above the trigger threshold but below restore — hysteresis holds.
+    let r = tick(130, { uv: false, railV: 4.9 });
+    expect(r.last.level).toBe(2);
+    r = tick(119, { uv: false, railV: 5.02 });
+    expect(r.last.level).toBe(2); // one second short of the clean interval
+    r = tick(2, { uv: false, railV: 5.02 });
+    expect(r.last.level).toBe(1);
+    expect(r.events[0]).toContain("restore → no-live");
+    r = tick(121, { uv: false, railV: 5.02 });
+    expect(r.last.level).toBe(0);
+    expect(r.events[0]).toContain("restore → full");
+    expect(policy.statusString()).toBeNull();
+  });
+
+  it("shed-cycle cap parks at the shed level (no flapping)", () => {
+    const cfg: ShedConfig = { ...CFG, maxShedsPerHour: 1, restoreSecs: 10 };
+    const { policy, tick } = makePolicy();
+    tick(3, { uv: true, railV: 5.0 }, cfg); // cycle 1
+    expect(policy.statusString()).toBe("no-live");
+    tick(45, { uv: false, railV: 5.02 }, cfg); // UV ages out + clean interval → restored
+    expect(policy.statusString()).toBeNull();
+    const r = tick(3, { uv: true, railV: 5.0 }, cfg); // cycle 2 exceeds the 1/h cap
+    expect(r.last).toMatchObject({ level: 1, parked: true });
+    expect(r.events[0]).toContain("parked until reboot or settings change");
+    tick(600, { uv: false, railV: 5.05 }, cfg);
+    expect(policy.statusString()).toBe("parked:no-live"); // parked: never restores
+  });
+
+  it("disabling via settings restores immediately and reports once", () => {
+    const { policy, tick } = makePolicy();
+    tick(3, { uv: true, railV: 4.7 });
+    const off: ShedConfig = { ...CFG, enabled: false };
+    let v = policy.evaluate(off);
+    expect(v).toMatchObject({ level: 0, parked: false });
+    expect(v.event?.msg).toContain("disabled");
+    v = policy.evaluate(off);
+    expect(v.event).toBeNull();
+  });
+
+  it("fails open: a shed device whose sampler dies restores on the clean interval", () => {
+    const { clock, policy, tick } = makePolicy();
+    tick(3, { uv: true, railV: 4.7 });
+    clock.now += 121_000; // no samples at all for 2 minutes
+    expect(policy.evaluate(CFG).level).toBe(0);
+  });
+
+  it("reset() clears park and level (settings-change escape hatch)", () => {
+    const cfg: ShedConfig = { ...CFG, maxShedsPerHour: 0 };
+    const { policy, tick } = makePolicy();
+    const r = tick(3, { uv: true, railV: 5.0 }, cfg);
+    expect(r.last.parked).toBe(true);
+    policy.reset();
+    expect(policy.evaluate(cfg)).toMatchObject({ level: 0, parked: false });
     expect(policy.statusString()).toBeNull();
   });
 });

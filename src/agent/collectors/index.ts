@@ -1,5 +1,6 @@
 import type { TelemetryReading } from "../telemetry.js";
 import type { MediaConfig } from "../config.js";
+import type { PowerSampleReading } from "../../recording/boot-policy.js";
 import { createImuCollector } from "./imu.js";
 import { createGpsCollector } from "./gps.js";
 import { createLteCollector } from "./lte.js";
@@ -56,12 +57,21 @@ export function createCollector(
   stop(): void;
   /** Bounce one KVS master (bridged capture respawned — see MediaSupervisor). */
   restartMediaChannel(streamKey: string): void;
+  /** Park/release the live KVS masters (load shedding rung 1 — see MediaSupervisor). */
+  setLiveShed(shed: boolean): void;
+  /**
+   * Power reading for the shed policy, from the system collector's 1 Hz sample
+   * cache (shared with the telemetry recorder — no extra vcgencmd poller).
+   * null when the system group is off or vcgencmd is unavailable (dev box).
+   */
+  samplePower(): Promise<PowerSampleReading | null>;
 } {
   const collectors: Collector[] = [];
+  const system = ioCapabilities.system ? createSystemCollector() : null;
   if (ioCapabilities.sensors?.imu) collectors.push(createImuCollector());
   if (ioCapabilities.comm?.gps) collectors.push(createGpsCollector());
   if (ioCapabilities.comm?.signal) collectors.push(createLteCollector());
-  if (ioCapabilities.system) collectors.push(createSystemCollector());
+  if (system) collectors.push(system);
 
   // The media collector supervises the KVS WebRTC runtime; it produces the
   // `media` field (and self-gates when off/unavailable). When disabled, media
@@ -101,6 +111,21 @@ export function createCollector(
     },
     restartMediaChannel(streamKey: string): void {
       media?.restartChannel(streamKey);
+    },
+    setLiveShed(shed: boolean): void {
+      media?.setShed(shed);
+    },
+    async samplePower(): Promise<PowerSampleReading | null> {
+      if (!system?.sample) return null;
+      try {
+        const s = await system.sample();
+        const throttled = (s?.fields.throttled as { value?: unknown } | undefined)?.value;
+        if (typeof throttled !== "number") return null; // no vcgencmd → feature inert
+        const rail = (s?.fields.rail_5v as { value?: unknown } | undefined)?.value;
+        return { uv: (throttled & 0x1) !== 0, railV: typeof rail === "number" ? rail : null };
+      } catch {
+        return null;
+      }
     },
   };
 }

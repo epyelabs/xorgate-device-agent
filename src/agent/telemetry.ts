@@ -149,6 +149,12 @@ export interface RecordingStatus {
    * path first consulted the policy (and on agents predating the feature).
    */
   bootDefer?: string;
+  /**
+   * Runtime load-shedding rung (optimize-system-process-cycle plan, Phase 3):
+   * "no-live" | "bridge-only", prefixed "parked:" when the shed-cycle cap is
+   * exhausted. Absent at full operation (and on agents predating the feature).
+   */
+  powerShed?: string;
 }
 
 export type RunMode = "sim" | "real";

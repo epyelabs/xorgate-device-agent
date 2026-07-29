@@ -12,7 +12,11 @@ import {
 } from "../src/recording/video-capture.js";
 import { resolveVideoPreset } from "../src/recording/video-presets.js";
 import { RecordingManager } from "../src/recording/manager.js";
-import { BootDeferPolicy } from "../src/recording/boot-policy.js";
+import {
+  BootDeferPolicy,
+  LoadShedPolicy,
+  type PowerSampleReading,
+} from "../src/recording/boot-policy.js";
 import type { TimeSource, TimeSourceTracker } from "../src/recording/session.js";
 import { saveSettings } from "../src/daemon/settings.js";
 import { cleanup, delay, tempHome } from "./helpers.js";
@@ -662,5 +666,158 @@ describe("RecordingManager boot power staging (Phase 2)", () => {
     await delay(150);
     expect(manager.status().enabled).toBe(true); // telemetry recorder running
     expect(manager.status().bootDefer).toBeUndefined(); // policy never consulted
+  });
+});
+
+describe("RecordingManager power load shedding (Phase 3)", () => {
+  let manager: RecordingManager | null = null;
+  afterEach(() => {
+    manager?.stop();
+    manager = null;
+  });
+
+  /** Poll until cond() holds (shed ticks run on a fast real timer). */
+  async function until(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+    const t0 = Date.now();
+    while (!cond()) {
+      if (Date.now() - t0 > timeoutMs) throw new Error("until(): condition not met in time");
+      await delay(10);
+    }
+  }
+
+  /**
+   * Fake-clocked rig: every powerSample() call advances 1 fake second, so a
+   * few real 10 ms ticks traverse minutes of policy time.
+   */
+  function makeRig(opts: { powerSample?: boolean } = { powerSample: true }) {
+    const spawner = fakeSpawner();
+    const clock = { now: 0 };
+    const rig = {
+      spawner,
+      clock,
+      reading: { uv: false, railV: 5.05 } as PowerSampleReading,
+      sampleCalls: 0,
+      liveShed: [] as boolean[],
+      events: [] as string[],
+    };
+    manager = new RecordingManager({
+      deviceId: "dev-1",
+      sampleGroups: async () => ({}),
+      root: join(home, "recordings"),
+      pollMs: 60_000,
+      shedPolicy: new LoadShedPolicy({ now: () => clock.now }),
+      shedSampleMs: 10,
+      powerSample:
+        opts.powerSample === false
+          ? undefined
+          : async () => {
+              rig.sampleCalls++;
+              clock.now += 1000;
+              return rig.reading;
+            },
+      onEvent: (_l, m) => rig.events.push(m),
+      video: {
+        mediaEnabled: true,
+        cameras: () => [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+        shmDir: join(home, "shm"),
+        spawn: spawner.spawn,
+        stableMs: 50,
+        sweepPollMs: 3600_000,
+        setLiveShed: (s) => rig.liveShed.push(s),
+      },
+    });
+    return rig;
+  }
+
+  it("walks the ladder down (live first, recording second) and back up", async () => {
+    saveSettings({
+      recording: {
+        video: { enabled: true, bootDefer: "off" },
+        powerShedding: { uvWindowSecs: 5, escalateDwellSecs: 5, restoreSecs: 10 },
+      },
+    });
+    const rig = makeRig();
+    rig.reading = { uv: true, railV: 4.7 };
+    await manager!.start();
+    await delay(20);
+    // Recording starts normally — shedding reacts to measurements, it never defers.
+    expect(rig.spawner.spawns[0].args.join(" ")).toContain("splitmuxsink");
+
+    // Rung 1 (3 UV samples): live parked, recording untouched (same child).
+    await until(() => rig.liveShed.includes(true));
+    expect(manager!.status().powerShed).toBe("no-live");
+    expect(rig.spawner.spawns.length).toBe(1);
+    expect(rig.events.some((m) => m.includes("no-live") && m.includes("undervoltage"))).toBe(true);
+
+    // Rung 2 (5 s continued trigger): capture flips to bridge-only.
+    await until(() => rig.spawner.spawns.length === 2);
+    expect(rig.spawner.spawns[1].args.join(" ")).not.toContain("splitmuxsink");
+    expect(manager!.status().powerShed).toBe("bridge-only");
+
+    // Recovery: clean rail → recording restores first, live last, status clears.
+    rig.reading = { uv: false, railV: 5.05 };
+    await until(() => rig.spawner.spawns.length === 3);
+    expect(rig.spawner.spawns[2].args.join(" ")).toContain("splitmuxsink");
+    expect(manager!.status().powerShed).toBe("no-live");
+    await until(() => rig.liveShed[rig.liveShed.length - 1] === false);
+    expect(manager!.status().powerShed).toBeUndefined();
+    expect(rig.events.some((m) => m.includes("restore → full"))).toBe(true);
+  });
+
+  it("cycle cap parks; a powerShedding settings change resets and restores", async () => {
+    saveSettings({
+      recording: {
+        video: { enabled: true, bootDefer: "off" },
+        powerShedding: { uvWindowSecs: 5, restoreSecs: 10, maxShedsPerHour: 0 },
+      },
+    });
+    const rig = makeRig();
+    rig.reading = { uv: true, railV: 5.0 };
+    await manager!.start();
+    await until(() => manager!.status().powerShed === "parked:no-live");
+    rig.reading = { uv: false, railV: 5.05 };
+    // Parked: a long clean stretch (fake minutes) must NOT restore.
+    await until(() => rig.clock.now > 120_000);
+    expect(manager!.status().powerShed).toBe("parked:no-live");
+    expect(rig.liveShed[rig.liveShed.length - 1]).toBe(true);
+
+    // The documented escape hatch: any powerShedding settings change resets.
+    saveSettings({
+      recording: {
+        video: { enabled: true, bootDefer: "off" },
+        powerShedding: { uvWindowSecs: 5, restoreSecs: 10, maxShedsPerHour: 4 },
+      },
+    });
+    manager!.reapply();
+    await until(() => rig.liveShed[rig.liveShed.length - 1] === false);
+    expect(manager!.status().powerShed).toBeUndefined();
+  });
+
+  it("feature disabled: monitor never arms, zero behavior change", async () => {
+    saveSettings({
+      recording: {
+        video: { enabled: true, bootDefer: "off" },
+        powerShedding: { enabled: false },
+      },
+    });
+    const rig = makeRig();
+    rig.reading = { uv: true, railV: 4.5 }; // would trigger instantly if armed
+    await manager!.start();
+    await delay(150);
+    expect(rig.sampleCalls).toBe(0);
+    expect(rig.liveShed).toEqual([]);
+    expect(rig.spawner.spawns.length).toBe(1);
+    expect(rig.spawner.spawns[0].args.join(" ")).toContain("splitmuxsink");
+    expect(manager!.status().powerShed).toBeUndefined();
+  });
+
+  it("no power sampler (sim/dev host): feature inert", async () => {
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off" } } });
+    const rig = makeRig({ powerSample: false });
+    await manager!.start();
+    await delay(150);
+    expect(rig.liveShed).toEqual([]);
+    expect(rig.spawner.spawns[0].args.join(" ")).toContain("splitmuxsink");
+    expect(manager!.status().powerShed).toBeUndefined();
   });
 });

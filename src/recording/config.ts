@@ -7,6 +7,7 @@
 import { join } from "node:path";
 import type { RecordingSettings } from "../daemon/settings.js";
 import { runtimeHome } from "../daemon/runtime.js";
+import type { ShedConfig } from "./boot-policy.js";
 
 export interface ResolvedRecordingConfig {
   telemetry: { enabled: boolean; rateHz: number };
@@ -22,6 +23,8 @@ export interface ResolvedRecordingConfig {
   };
   upload: { mode: "auto" | "off" };
   retention: { maxBytes: number; minFreeBytes: number };
+  /** Runtime undervoltage load shedding (Phase 3) — see RecordingSettings.powerShedding. */
+  powerShedding: ShedConfig;
 }
 
 export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
@@ -37,6 +40,18 @@ export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
   },
   upload: { mode: "auto" },
   retention: { maxBytes: 10 * 1024 ** 3, minFreeBytes: 2 * 1024 ** 3 },
+  // Q4 STARTING values (2026-07-28) — tune from the field via settings, not code.
+  powerShedding: {
+    enabled: true,
+    uvSamples: 3,
+    uvWindowSecs: 30,
+    railLowVolts: 4.85,
+    railLowSecs: 15,
+    escalateDwellSecs: 60,
+    restoreSecs: 120,
+    railRestoreVolts: 4.95,
+    maxShedsPerHour: 4,
+  },
 };
 
 export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecordingConfig {
@@ -59,6 +74,17 @@ export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecording
     retention: {
       maxBytes: s?.retention?.maxBytes ?? d.retention.maxBytes,
       minFreeBytes: s?.retention?.minFreeBytes ?? d.retention.minFreeBytes,
+    },
+    powerShedding: {
+      enabled: s?.powerShedding?.enabled ?? d.powerShedding.enabled,
+      uvSamples: s?.powerShedding?.uvSamples ?? d.powerShedding.uvSamples,
+      uvWindowSecs: s?.powerShedding?.uvWindowSecs ?? d.powerShedding.uvWindowSecs,
+      railLowVolts: s?.powerShedding?.railLowVolts ?? d.powerShedding.railLowVolts,
+      railLowSecs: s?.powerShedding?.railLowSecs ?? d.powerShedding.railLowSecs,
+      escalateDwellSecs: s?.powerShedding?.escalateDwellSecs ?? d.powerShedding.escalateDwellSecs,
+      restoreSecs: s?.powerShedding?.restoreSecs ?? d.powerShedding.restoreSecs,
+      railRestoreVolts: s?.powerShedding?.railRestoreVolts ?? d.powerShedding.railRestoreVolts,
+      maxShedsPerHour: s?.powerShedding?.maxShedsPerHour ?? d.powerShedding.maxShedsPerHour,
     },
   };
 }

@@ -25,7 +25,11 @@
  *   recording.video.enabled <on|off>         recording.video.preset <name>
  *   recording.video.segmentSeconds <10-600>  recording.upload.mode <auto|off>
  *   recording.retention.maxBytes <n>         recording.retention.minFreeBytes <n>
- * (video/upload keys are plumbing for Phases 2–3 — persisted but inert today.)
+ *   recording.video.bootDefer <auto|always|off>
+ *   recording.video.bootDeferMaxSecs <0-600> recording.video.bootDeferMinBudgetMa <0-10000>
+ *   recording.video.spawnStaggerSecs <0-30>
+ * (bootDefer* / spawnStaggerSecs are the Phase 2 boot power staging knobs —
+ * optimize-system-process-cycle plan.)
  */
 import {
   loadSettings,
@@ -94,13 +98,27 @@ function setRecordingCommand(key: string, value: string | undefined): void {
       return;
     }
     raw = num;
-  } else if (field === "segmentSeconds" || field === "maxBytes" || field === "minFreeBytes") {
+  } else if (
+    field === "segmentSeconds" ||
+    field === "maxBytes" ||
+    field === "minFreeBytes" ||
+    field === "bootDeferMaxSecs" ||
+    field === "bootDeferMinBudgetMa" ||
+    field === "spawnStaggerSecs"
+  ) {
     if (!Number.isFinite(num) || num < 0) {
       console.error(`${key} must be a non-negative number, got '${value ?? ""}'`);
       process.exitCode = 1;
       return;
     }
     raw = num;
+  } else if (field === "bootDefer") {
+    if (value !== "auto" && value !== "always" && value !== "off") {
+      console.error(`${key} must be auto|always|off, got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    raw = value;
   } else if (field === "preset") {
     // Presets are a closed table (bounded CPU on a Pi with software-only
     // encoding); reject unknowns here with the list rather than letting the

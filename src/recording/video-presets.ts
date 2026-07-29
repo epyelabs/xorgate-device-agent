@@ -16,6 +16,11 @@
  * the one that halves bytes on disk and the upload backlog. Default stays
  * mid-range (1080p15) so dual-camera record + live stream keeps comfortable
  * headroom on 4 cores.
+ * With the Phase 2 hardening (x264enc pinned to threads=2 + child at nice 10,
+ * optimize-system-process-cycle plan), dual-camera 720p15 @ 1 Mbps measured
+ * ≈ 18.5 % of one core per camera on the test Pi (2026-07-29) — no regression
+ * vs the unpinned 21 %, with the worst-case simultaneous thread demand now
+ * bounded at 2 encoder threads per camera.
  */
 
 export interface VideoPreset {

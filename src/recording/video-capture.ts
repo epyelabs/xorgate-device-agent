@@ -17,6 +17,7 @@
  * preset; the bridge branch scales/rates down to the fixed contract.
  */
 import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync } from "node:fs";
+import { setPriority } from "node:os";
 import { join } from "node:path";
 import { watch, type FSWatcher } from "node:fs";
 import { runStream, type StreamHandle } from "../lib/exec.js";
@@ -130,6 +131,12 @@ export function buildCapturePipelineArgs(spec: CapturePipelineSpec): string[] {
     // outweigh the compression-efficiency loss for dashcam footage.
     "speed-preset=ultrafast",
     "tune=zerolatency",
+    // Pin the encoder thread pool like the KVS side does (threads=2 there):
+    // unpinned, x264 spawns ~1.5x logical cores worth of threads per camera —
+    // 6 per encoder on the Pi 5 — and dual-camera boot bursts all of them at
+    // once. Two threads comfortably cover every preset in the table at
+    // ultrafast and bound the worst-case simultaneous demand.
+    "threads=2",
     `bitrate=${preset.bitrateKbps}`,
     `key-int-max=${keyIntMax}`,
     "!",
@@ -212,6 +219,14 @@ export interface VideoCaptureOptions {
   record: boolean;
   preset: VideoPreset;
   segmentSeconds: number;
+  /**
+   * Inter-camera spawn delay (Phase 2 staged boot): camera N starts N*staggerMs
+   * after start(). The 2026-07-21 bench brownouts fired within seconds of the
+   * SECOND encoder starting — the start-up transient matters, so offset it.
+   * 0/absent = spawn all cameras synchronously (old behavior). Applies on
+   * every supervisor (re)start, not just boot.
+   */
+  staggerMs?: number;
   /** recordings/video root; sessions land at <root>/<streamKey>/<sessionId>/. */
   videoRoot: string;
   /** Directory for shm sockets (created; sockets are <dir>/<streamKey>.sock). */
@@ -271,8 +286,10 @@ export class VideoCaptureSupervisor {
 
   start(): void {
     mkdirSync(this.opts.shmDir, { recursive: true });
+    const staggerMs = this.opts.staggerMs ?? 0;
+    let index = 0;
     for (const cam of this.opts.cameras) {
-      this.runs.set(cam.streamKey, {
+      const run: CameraRun = {
         cam,
         state: "starting",
         handle: null,
@@ -287,8 +304,20 @@ export class VideoCaptureSupervisor {
         watcher: null,
         sweepTimer: null,
         sweeping: false,
-      });
-      this.spawn(cam.streamKey);
+      };
+      this.runs.set(cam.streamKey, run);
+      const delayMs = index * staggerMs;
+      index += 1;
+      if (delayMs <= 0) {
+        this.spawn(cam.streamKey);
+      } else {
+        // Staggered bring-up rides the restart-timer slot so stop() cancels a
+        // still-pending first spawn the same way it cancels a retry.
+        run.restartTimer = setTimeout(() => {
+          run.restartTimer = null;
+          this.spawn(cam.streamKey);
+        }, delayMs);
+      }
     }
   }
 
@@ -422,6 +451,17 @@ export class VideoCaptureSupervisor {
       },
     });
 
+    // Phase 2 hardening: encoders run at nice 10 so the agent / modem-daemon
+    // control paths stay responsive when x264 saturates cores. Record mode
+    // only — the bridge-only pipeline is near-zero CPU and feeds live view.
+    if (this.opts.record && run.handle.pid !== undefined) {
+      try {
+        setPriority(run.handle.pid, 10);
+      } catch {
+        /* child already exited, or platform refuses — normal priority is fine */
+      }
+    }
+
     if (this.opts.record) this.watchSession(run);
 
     run.stableTimer = setTimeout(() => {
@@ -547,7 +587,13 @@ export class VideoCaptureSupervisor {
     if (!run.sessionDir || !run.manifest || run.sweeping) return;
     run.sweeping = true;
     try {
-      const res = sweepSessionDir(run.sessionDir, run.manifest, { includeNewest: false });
+      // Sidecars carry the CURRENT time provenance, not the spawn-time value in
+      // session.json — so segments cut after NTP lands mid-session say "ntp"
+      // (the video twin of telemetry's noteTimeSource re-emit).
+      const res = sweepSessionDir(run.sessionDir, run.manifest, {
+        includeNewest: false,
+        timeSource: this.opts.timeSource(),
+      });
       this.opts.onActiveSegment?.(run.cam.streamKey, res.activePath);
       for (const mp4 of res.closed) this.opts.onSegmentClosed?.(mp4);
       // splitmuxsink never fsyncs; on a hard power cut the ACTIVE fragment's
@@ -579,6 +625,7 @@ export class VideoCaptureSupervisor {
     // already encodes that, so don't override it.
     const res = sweepSessionDir(run.sessionDir, run.manifest, {
       includeNewest: true,
+      timeSource: this.opts.timeSource(),
       ...(cleanStop ? { finalized: true } : {}),
     });
     for (const mp4 of res.closed) this.opts.onSegmentClosed?.(mp4);

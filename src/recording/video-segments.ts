@@ -123,6 +123,14 @@ export function buildSidecar(
      * closer to the first real frame (Phase 6.6).
      */
     boundaryEndMs?: number;
+    /**
+     * Time provenance AT SIDECAR-WRITE time (optimize-system-process-cycle
+     * Phase 1): the live sweep passes the tracker's current value so segments
+     * cut after an unsynced→ntp transition carry the upgraded value — the video
+     * twin of telemetry's noteTimeSource. Absent (crash recovery of a dead
+     * session), the manifest's spawn-time value is the best we know.
+     */
+    timeSource?: TimeSource;
   },
 ): VideoSidecar {
   // ext4 gives real birthtimes; a zero/bogus one (some tmpfs, copied trees)
@@ -159,7 +167,7 @@ export function buildSidecar(
     startMono: anchorMonoMs + (startTs - manifest.anchorTs),
     durationMs,
     sizeBytes: stat.sizeBytes,
-    timeSource: manifest.timeSource,
+    timeSource: opts.timeSource ?? manifest.timeSource,
     codec: "h264",
     width: manifest.width,
     height: manifest.height,
@@ -189,7 +197,7 @@ export interface SweepResult {
 export function sweepSessionDir(
   dir: string,
   manifest: VideoSessionManifest,
-  opts: { includeNewest: boolean; finalized?: boolean },
+  opts: { includeNewest: boolean; finalized?: boolean; timeSource?: TimeSource },
 ): SweepResult {
   let names: string[];
   try {
@@ -252,7 +260,7 @@ export function sweepSessionDir(
       { sizeBytes: st.size, birthtimeMs: st.birthtimeMs, mtimeMs: st.mtimeMs },
       // The newest fragment of a dead session may have been cut mid-write; all
       // others were finalized by splitmuxsink before it opened the next one.
-      { finalized: opts.finalized ?? !isNewest, boundaryEndMs },
+      { finalized: opts.finalized ?? !isNewest, boundaryEndMs, timeSource: opts.timeSource },
     );
     try {
       atomicWriteJson(sidecarPathFor(mp4Path), sidecar);

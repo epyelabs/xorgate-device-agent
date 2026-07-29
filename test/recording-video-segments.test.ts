@@ -257,3 +257,31 @@ describe("recoverOrphanVideoSessions", () => {
     expect(recoverOrphanVideoSessions(join(home, "recordings", "video"))).toBe(0);
   });
 });
+
+describe("timeSource re-stamping (optimize-system-process-cycle Phase 1)", () => {
+  it("sidecars carry the sweep-time value; session.json keeps the spawn value", () => {
+    const m = manifest({ timeSource: "unsynced" });
+    const dir = sessionDir("cam0", "sess-1", 3);
+    writeSessionManifest(dir, m);
+
+    // NTP landed mid-session: the live sweep passes the tracker's current value.
+    const res = sweepSessionDir(dir, m, { includeNewest: false, timeSource: "ntp" });
+    expect(res.closed.length).toBe(2);
+    for (const mp4 of res.closed) {
+      expect(JSON.parse(readFileSync(sidecarPathFor(mp4), "utf8")).timeSource).toBe("ntp");
+    }
+    // Session-level manifest stays the spawn-time (worst) value.
+    expect(readSessionManifest(dir)!.timeSource).toBe("unsynced");
+  });
+
+  it("crash recovery without an override falls back to the manifest value", () => {
+    const m = manifest({ timeSource: "rtc" });
+    const dir = sessionDir("cam0", "sess-dead", 2);
+    writeSessionManifest(dir, m);
+    const res = sweepSessionDir(dir, m, { includeNewest: true });
+    expect(res.closed.length).toBe(2);
+    for (const mp4 of res.closed) {
+      expect(JSON.parse(readFileSync(sidecarPathFor(mp4), "utf8")).timeSource).toBe("rtc");
+    }
+  });
+});

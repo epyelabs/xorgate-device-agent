@@ -43,6 +43,54 @@ describe("parseRecordingSettings", () => {
     });
   });
 
+  it("accepts and clamps the Phase 2 boot staging knobs", () => {
+    expect(
+      parseRecordingSettings({
+        video: {
+          bootDefer: "always",
+          bootDeferMaxSecs: 120,
+          bootDeferMinBudgetMa: 4000,
+          spawnStaggerSecs: 5,
+        },
+      }),
+    ).toEqual({
+      video: {
+        bootDefer: "always",
+        bootDeferMaxSecs: 120,
+        bootDeferMinBudgetMa: 4000,
+        spawnStaggerSecs: 5,
+      },
+    });
+    // 0 is meaningful (feature off / no stagger) and must survive parsing.
+    expect(parseRecordingSettings({ video: { bootDeferMaxSecs: 0, spawnStaggerSecs: 0 } })).toEqual(
+      { video: { bootDeferMaxSecs: 0, spawnStaggerSecs: 0 } },
+    );
+    // Clamps + enum rejection.
+    expect(
+      parseRecordingSettings({
+        video: {
+          bootDefer: "sometimes",
+          bootDeferMaxSecs: 10_000,
+          bootDeferMinBudgetMa: 99_999,
+          spawnStaggerSecs: 300,
+        },
+      }),
+    ).toEqual({
+      video: { bootDeferMaxSecs: 600, bootDeferMinBudgetMa: 10_000, spawnStaggerSecs: 30 },
+    });
+  });
+
+  it("resolves boot staging defaults (auto / 90 s / 5000 mA / 4 s stagger)", () => {
+    const cfg = resolveRecordingConfig(undefined);
+    expect(cfg.video).toMatchObject({
+      bootDefer: "auto",
+      bootDeferMaxSecs: 90,
+      bootDeferMinBudgetMa: 5000,
+      spawnStaggerSecs: 4,
+    });
+    expect(RECORDING_DEFAULTS.video.bootDefer).toBe("auto");
+  });
+
   it("drops mistyped leaves but keeps valid siblings", () => {
     const s = parseRecordingSettings({
       telemetry: { enabled: "yes", rateHz: 5 },

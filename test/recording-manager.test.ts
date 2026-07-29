@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RecordingManager } from "../src/recording/manager.js";
 import { saveSettings } from "../src/daemon/settings.js";
 import type { GroupSample } from "../src/agent/collectors/index.js";
+import type { TimeSource, TimeSourceTracker } from "../src/recording/session.js";
 import { cleanup, delay, tempHome } from "./helpers.js";
 
 let home: string;
@@ -28,7 +29,7 @@ const sampleGroups = async (): Promise<Record<string, GroupSample>> => ({
 describe("RecordingManager", () => {
   it("creates nothing when recording is disabled (disabled-by-default regression)", async () => {
     manager = new RecordingManager({ deviceId: "d", sampleGroups, root, pollMs: 60_000 });
-    manager.start();
+    await manager.start();
     await delay(150);
     expect(existsSync(root)).toBe(false);
     expect(manager.status()).toMatchObject({ enabled: false, sessionId: null });
@@ -37,7 +38,7 @@ describe("RecordingManager", () => {
   it("starts and stops the recorder live from settings changes", async () => {
     saveSettings({ recording: { telemetry: { enabled: true, rateHz: 20 } } });
     manager = new RecordingManager({ deviceId: "d", sampleGroups, root, pollMs: 60_000 });
-    manager.start();
+    await manager.start();
     await delay(300); // a few 50 ms ticks
 
     const st = manager.status();
@@ -58,7 +59,7 @@ describe("RecordingManager", () => {
   it("mints a new session when rateHz changes", async () => {
     saveSettings({ recording: { telemetry: { enabled: true, rateHz: 20 } } });
     manager = new RecordingManager({ deviceId: "d", sampleGroups, root, pollMs: 60_000 });
-    manager.start();
+    await manager.start();
     await delay(120);
     const first = manager.status().sessionId;
     expect(first).not.toBeNull();
@@ -70,6 +71,60 @@ describe("RecordingManager", () => {
     expect(second).not.toBe(first);
   });
 
+  it("stamps the first session with the PROBED time source, not the placeholder", async () => {
+    // Tracker that starts at the pessimistic placeholder and only learns the
+    // truth from the probe — exactly the boot shape of the badge bug.
+    let value: TimeSource = "unsynced";
+    const tracker: TimeSourceTracker = {
+      current: () => value,
+      refresh: async () => {
+        await delay(20);
+        value = "ntp";
+        return value;
+      },
+    };
+    saveSettings({ recording: { telemetry: { enabled: true, rateHz: 20 } } });
+    manager = new RecordingManager({
+      deviceId: "d",
+      sampleGroups,
+      root,
+      pollMs: 60_000,
+      timeSource: tracker,
+    });
+    await manager.start();
+    await delay(150); // a few ticks so the first segment opens
+
+    const sessionDir = join(root, "telemetry", manager.status().sessionId!);
+    const seg = readdirSync(sessionDir).find((n) => n.endsWith(".jsonl"))!;
+    const header = JSON.parse(readFileSync(join(sessionDir, seg), "utf8").split("\n")[0]);
+    expect(header.timeSource).toBe("ntp");
+  });
+
+  it("a hung probe cannot delay start beyond the bound (proceeds pessimistic)", async () => {
+    const tracker: TimeSourceTracker = {
+      current: () => "unsynced",
+      refresh: () => new Promise<TimeSource>(() => {}), // never resolves
+    };
+    saveSettings({ recording: { telemetry: { enabled: true, rateHz: 20 } } });
+    manager = new RecordingManager({
+      deviceId: "d",
+      sampleGroups,
+      root,
+      pollMs: 60_000,
+      timeSource: tracker,
+      timeProbeTimeoutMs: 50,
+    });
+    const t0 = Date.now();
+    await manager.start();
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(manager.status().enabled).toBe(true);
+    await delay(120);
+    const sessionDir = join(root, "telemetry", manager.status().sessionId!);
+    const seg = readdirSync(sessionDir).find((n) => n.endsWith(".jsonl"))!;
+    const header = JSON.parse(readFileSync(join(sessionDir, seg), "utf8").split("\n")[0]);
+    expect(header.timeSource).toBe("unsynced");
+  });
+
   it("finalizes orphans from a previous run on start, even with recording off", async () => {
     const oldDir = join(root, "telemetry", "prev-session");
     mkdirSync(oldDir, { recursive: true });
@@ -78,7 +133,7 @@ describe("RecordingManager", () => {
     writeFileSync(join(oldDir, "seg-1-00000.jsonl"), `${head}\n${sample}\n{"torn`);
 
     manager = new RecordingManager({ deviceId: "d", sampleGroups, root, pollMs: 60_000 });
-    manager.start();
+    await manager.start();
     await delay(150); // let the initial disk enforce run
 
     expect(readdirSync(oldDir)).toEqual(["seg-1-00000.jsonl.gz"]);

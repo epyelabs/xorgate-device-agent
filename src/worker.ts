@@ -187,7 +187,9 @@ const recording = new RecordingManager({
     store.flush(t, true);
   },
 });
-recording.start();
+// Awaited: the bounded (≤2 s) time-source probe inside start() must land
+// before the first capture spawn so first sessions aren't stamped "unsynced".
+await recording.start();
 
 let seq = 0;
 let shuttingDown = false;

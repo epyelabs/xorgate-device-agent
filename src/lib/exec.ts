@@ -55,6 +55,8 @@ export interface StreamHandle {
   done: Promise<RunResult>;
   /** Send SIGINT (default) so tools like rpicam-vid/arecord flush and finalize. */
   stop: (signal?: NodeJS.Signals) => void;
+  /** OS pid of the child (absent when the spawn itself failed, or in test fakes). */
+  pid?: number;
 }
 
 /**
@@ -132,6 +134,7 @@ export function runStream(
 
   return {
     done,
+    pid: child.pid,
     stop: (signal: NodeJS.Signals = "SIGINT") => {
       try {
         child.kill(signal);

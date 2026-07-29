@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { RunResult, StreamHandle } from "../src/lib/exec.js";
 import {
@@ -12,6 +12,8 @@ import {
 } from "../src/recording/video-capture.js";
 import { resolveVideoPreset } from "../src/recording/video-presets.js";
 import { RecordingManager } from "../src/recording/manager.js";
+import { BootDeferPolicy } from "../src/recording/boot-policy.js";
+import type { TimeSource, TimeSourceTracker } from "../src/recording/session.js";
 import { saveSettings } from "../src/daemon/settings.js";
 import { cleanup, delay, tempHome } from "./helpers.js";
 
@@ -63,6 +65,7 @@ describe("pipeline builders", () => {
     expect(s).toContain("width=1920,height=1080,framerate=30/1");
     expect(s).toContain("bitrate=4000");
     expect(s).toContain("key-int-max=60");
+    expect(s).toContain("threads=2"); // pinned like the KVS-side encoder
     expect(s).toContain("location=/out/%05d.mp4");
     expect(s).toContain("max-size-time=60000000000");
     expect(s).toContain(SHM_BRIDGE_CAPS);
@@ -196,6 +199,44 @@ describe("VideoCaptureSupervisor", () => {
     sup.stop();
   });
 
+  it("sidecars follow a mid-session timeSource upgrade; session.json keeps the spawn value", async () => {
+    const spawner = fakeSpawner();
+    let ts: TimeSource = "unsynced";
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "dev-1",
+      cameras: [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+      record: true,
+      preset,
+      segmentSeconds: 60,
+      videoRoot: join(home, "recordings", "video"),
+      shmDir: join(home, "shm"),
+      timeSource: () => ts,
+      spawn: spawner.spawn,
+      stableMs: 10,
+      sweepPollMs: 25,
+    });
+    sup.start();
+    const sessionId = sup.status()[0].sessionId!;
+    const dir = join(home, "recordings", "video", "cam0", sessionId);
+
+    writeFileSync(join(dir, "00000.mp4"), Buffer.alloc(100, 1));
+    writeFileSync(join(dir, "00001.mp4"), Buffer.alloc(100, 1));
+    await delay(80); // sweep closes 00000 while the clock is still unsynced
+    expect(JSON.parse(readFileSync(join(dir, "00000.json"), "utf8")).timeSource).toBe("unsynced");
+
+    ts = "ntp"; // NTP lands mid-session
+    writeFileSync(join(dir, "00002.mp4"), Buffer.alloc(100, 1));
+    await delay(80); // sweep closes 00001 with the upgraded value
+    expect(JSON.parse(readFileSync(join(dir, "00001.json"), "utf8")).timeSource).toBe("ntp");
+
+    // Spawn-time value stays in session.json (the session's worst value).
+    expect(JSON.parse(readFileSync(join(dir, "session.json"), "utf8")).timeSource).toBe("unsynced");
+    sup.stop();
+    await delay(20);
+    // Final sweep also stamps the current value.
+    expect(JSON.parse(readFileSync(join(dir, "00002.json"), "utf8")).timeSource).toBe("ntp");
+  });
+
   it("fires onSpawned per spawn so the worker can bounce the KVS master", async () => {
     const spawner = fakeSpawner();
     const spawned: string[] = [];
@@ -275,14 +316,14 @@ describe("RecordingManager video wiring", () => {
         sweepPollMs: 3600_000,
       },
     });
-    manager.start();
+    await manager.start();
     await delay(20);
     // recording.video.enabled defaults false → bridge-only child
     expect(spawner.spawns.length).toBe(1);
     expect(spawner.spawns[0].args.join(" ")).not.toContain("splitmuxsink");
     expect(manager.videoStatus().recording).toBe(false);
 
-    saveSettings({ recording: { video: { enabled: true } } });
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off" } } });
     manager.reapply();
     await delay(200); // serialized handover: old child exits, then spawn + 50 ms stableMs
     expect(spawner.spawns.length).toBe(2);
@@ -290,7 +331,7 @@ describe("RecordingManager video wiring", () => {
     expect(manager.videoStatus().recording).toBe(true);
     expect(manager.videoStatus().streams[0]).toMatchObject({ streamKey: "cam0", state: "running" });
 
-    saveSettings({ recording: { video: { enabled: false } } });
+    saveSettings({ recording: { video: { enabled: false, bootDefer: "off" } } });
     manager.reapply();
     await delay(20);
     expect(spawner.spawns.length).toBe(3);
@@ -300,7 +341,7 @@ describe("RecordingManager video wiring", () => {
 
   it("never spawns capture when media is disabled", async () => {
     const spawner = fakeSpawner();
-    saveSettings({ recording: { video: { enabled: true } } });
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off" } } });
     manager = new RecordingManager({
       deviceId: "dev-1",
       sampleGroups: async () => ({}),
@@ -313,7 +354,7 @@ describe("RecordingManager video wiring", () => {
         spawn: spawner.spawn,
       },
     });
-    manager.start();
+    await manager.start();
     await delay(20);
     expect(spawner.spawns.length).toBe(0);
     expect(manager.videoStatus().streams).toEqual([]);
@@ -321,7 +362,7 @@ describe("RecordingManager video wiring", () => {
 
   it("preset change restarts capture with new args (new session)", async () => {
     const spawner = fakeSpawner();
-    saveSettings({ recording: { video: { enabled: true } } });
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off" } } });
     manager = new RecordingManager({
       deviceId: "dev-1",
       sampleGroups: async () => ({}),
@@ -336,17 +377,52 @@ describe("RecordingManager video wiring", () => {
         sweepPollMs: 3600_000,
       },
     });
-    manager.start();
+    await manager.start();
     await delay(20);
     const firstSession = manager.videoStatus().streams[0].sessionId;
     expect(spawner.spawns[0].args.join(" ")).toContain("width=1920");
 
-    saveSettings({ recording: { video: { enabled: true, preset: "720p30-2mbps" } } });
+    saveSettings({ recording: { video: { enabled: true, preset: "720p30-2mbps", bootDefer: "off" } } });
     manager.reapply();
     await delay(20);
     expect(spawner.spawns.length).toBe(2);
     expect(spawner.spawns[1].args.join(" ")).toContain("width=1280,height=720,framerate=30/1");
     expect(manager.videoStatus().streams[0].sessionId).not.toBe(firstSession);
+  });
+
+  it("first video session.json carries the probed time source (badge-bug fix)", async () => {
+    const spawner = fakeSpawner();
+    let value: TimeSource = "unsynced";
+    const tracker: TimeSourceTracker = {
+      current: () => value,
+      refresh: async () => {
+        value = "ntp";
+        return value;
+      },
+    };
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off" } } });
+    manager = new RecordingManager({
+      deviceId: "dev-1",
+      sampleGroups: async () => ({}),
+      root: join(home, "recordings"),
+      pollMs: 60_000,
+      timeSource: tracker,
+      video: {
+        mediaEnabled: true,
+        cameras: () => [{ streamKey: "cam0", cameraName: "/c" }],
+        shmDir: join(home, "shm"),
+        spawn: spawner.spawn,
+        stableMs: 50,
+        sweepPollMs: 3600_000,
+      },
+    });
+    await manager.start();
+    await delay(20);
+    const sessionId = manager.videoStatus().streams[0].sessionId!;
+    const mf = JSON.parse(
+      readFileSync(join(home, "recordings", "video", "cam0", sessionId, "session.json"), "utf8"),
+    );
+    expect(mf.timeSource).toBe("ntp");
   });
 
   it("orphan video sessions get sidecars on start", async () => {
@@ -380,10 +456,211 @@ describe("RecordingManager video wiring", () => {
       root,
       pollMs: 60_000,
     });
-    manager.start();
+    await manager.start();
     await delay(100);
     expect(existsSync(join(dead, "00000.json"))).toBe(true);
     // The recovered mp4 counts into the backlog (upload fodder for Phase 4).
     expect(manager.status().backlogSegments).toBe(1);
+  });
+});
+
+describe("camera spawn stagger (Phase 2 staged boot)", () => {
+  const twoCams = [
+    { streamKey: "cam0", cameraName: "/base/cam0@1a" },
+    { streamKey: "cam1", cameraName: "/base/cam1@1a" },
+  ];
+  function makeSup(spawner: ReturnType<typeof fakeSpawner>, staggerMs: number) {
+    return new VideoCaptureSupervisor({
+      deviceId: "dev-1",
+      cameras: twoCams,
+      record: true,
+      preset,
+      segmentSeconds: 60,
+      staggerMs,
+      videoRoot: join(home, "recordings", "video"),
+      shmDir: join(home, "shm"),
+      timeSource: () => "ntp",
+      spawn: spawner.spawn,
+      stableMs: 3600_000,
+      sweepPollMs: 3600_000,
+    });
+  }
+
+  it("offsets the second camera by staggerMs (the second-encoder transient)", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup(spawner, 60);
+    sup.start();
+    expect(spawner.spawns.map((s) => s.args.join(" ").includes("cam0@1a"))).toEqual([true]);
+    expect(sup.status().find((s) => s.streamKey === "cam1")?.state).toBe("starting");
+    await delay(120);
+    expect(spawner.spawns.length).toBe(2);
+    expect(spawner.spawns[1].args.join(" ")).toContain("cam1@1a");
+    sup.stop();
+  });
+
+  it("stop() before the stagger elapses cancels the pending spawn", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup(spawner, 60);
+    sup.start();
+    sup.stop();
+    await delay(120);
+    expect(spawner.spawns.length).toBe(1);
+  });
+
+  it("staggerMs 0 spawns all cameras synchronously (old behavior)", () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup(spawner, 0);
+    sup.start();
+    expect(spawner.spawns.length).toBe(2);
+    sup.stop();
+  });
+});
+
+describe("RecordingManager boot power staging (Phase 2)", () => {
+  let manager: RecordingManager | null = null;
+  afterEach(() => {
+    manager?.stop();
+    manager = null;
+  });
+
+  function writeBudget(dir: string, ma: number): string {
+    const path = join(dir, "max_current");
+    const buf = Buffer.alloc(4);
+    buf.writeUInt32BE(ma, 0);
+    writeFileSync(path, buf);
+    return path;
+  }
+
+  function makeManager(spawner: ReturnType<typeof fakeSpawner>, policy: BootDeferPolicy, events: string[]) {
+    return new RecordingManager({
+      deviceId: "dev-1",
+      sampleGroups: async () => ({}),
+      root: join(home, "recordings"),
+      pollMs: 60_000,
+      bootPolicy: policy,
+      onEvent: (_l, m) => events.push(m),
+      video: {
+        mediaEnabled: true,
+        cameras: () => [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+        shmDir: join(home, "shm"),
+        spawn: spawner.spawn,
+        stableMs: 50,
+        sweepPollMs: 3600_000,
+      },
+    });
+  }
+
+  it("defers to bridge-only, then flips to full capture when the modem settles", async () => {
+    const spawner = fakeSpawner();
+    const events: string[] = [];
+    const telemetryFile = join(home, "telemetry.json");
+    writeFileSync(
+      telemetryFile,
+      JSON.stringify({ timestamp: new Date().toISOString(), status: "connecting", reg: 0 }),
+    );
+    const policy = new BootDeferPolicy({
+      telemetryFile,
+      budgetPath: writeBudget(home, 3000),
+    });
+    saveSettings({ recording: { video: { enabled: true } } });
+    manager = makeManager(spawner, policy, events);
+    await manager.start();
+    await delay(20);
+
+    // Armed: recording wanted, but the child is bridge-only (no encoder).
+    expect(spawner.spawns.length).toBe(1);
+    expect(spawner.spawns[0].args.join(" ")).not.toContain("splitmuxsink");
+    expect(manager.status().bootDefer).toBe("deferring");
+    expect(events.some((m) => m.includes("boot-defer armed (psu budget 3000mA < 5000)"))).toBe(true);
+
+    // Poll tick with UNCHANGED settings must re-evaluate the policy.
+    manager.reapply();
+    await delay(20);
+    expect(spawner.spawns.length).toBe(1); // still deferring — no churn
+
+    writeFileSync(
+      telemetryFile,
+      JSON.stringify({ timestamp: new Date().toISOString(), status: "connected", reg: 1 }),
+    );
+    manager.reapply();
+    await delay(200); // serialized handover: bridge child exits, record child spawns
+    expect(spawner.spawns.length).toBe(2);
+    expect(spawner.spawns[1].args.join(" ")).toContain("splitmuxsink");
+    expect(manager.status().bootDefer).toBe("released:connected");
+    expect(events.some((m) => m.includes("boot-defer released (connected)"))).toBe(true);
+  });
+
+  it("skips the defer outright on a 5 A budget in auto mode", async () => {
+    const spawner = fakeSpawner();
+    const events: string[] = [];
+    const policy = new BootDeferPolicy({
+      telemetryFile: join(home, "absent-telemetry.json"),
+      budgetPath: writeBudget(home, 5000),
+    });
+    saveSettings({ recording: { video: { enabled: true } } });
+    manager = makeManager(spawner, policy, events);
+    await manager.start();
+    await delay(20);
+    expect(spawner.spawns.length).toBe(1);
+    expect(spawner.spawns[0].args.join(" ")).toContain("splitmuxsink");
+    expect(manager.status().bootDefer).toBe("skipped");
+    expect(events.some((m) => m.includes("boot-defer skipped: psu budget 5000mA >= 5000"))).toBe(true);
+  });
+
+  it("bootDefer=always arms even on a 5 A budget", async () => {
+    const spawner = fakeSpawner();
+    const policy = new BootDeferPolicy({
+      telemetryFile: join(home, "absent-telemetry.json"),
+      budgetPath: writeBudget(home, 5000),
+    });
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "always" } } });
+    manager = makeManager(spawner, policy, []);
+    await manager.start();
+    await delay(20);
+    expect(spawner.spawns[0].args.join(" ")).not.toContain("splitmuxsink");
+    expect(manager.status().bootDefer).toBe("deferring");
+  });
+
+  it("shortening bootDeferMaxSecs via settings releases an active defer (timeout)", async () => {
+    const spawner = fakeSpawner();
+    const telemetryFile = join(home, "telemetry.json");
+    writeFileSync(
+      telemetryFile,
+      JSON.stringify({ timestamp: new Date().toISOString(), status: "connecting", reg: 0 }),
+    );
+    let now = 1_000_000;
+    const policy = new BootDeferPolicy({
+      telemetryFile,
+      budgetPath: writeBudget(home, 3000),
+      now: () => {
+        now += 1000; // each evaluation advances 1 s of fake time
+        return now;
+      },
+    });
+    saveSettings({ recording: { video: { enabled: true } } });
+    manager = makeManager(spawner, policy, []);
+    await manager.start();
+    await delay(20);
+    expect(manager.status().bootDefer).toBe("deferring");
+
+    saveSettings({ recording: { video: { enabled: true, bootDeferMaxSecs: 1 } } });
+    manager.reapply();
+    await delay(200);
+    expect(manager.status().bootDefer).toBe("released:timeout");
+    expect(spawner.spawns.at(-1)!.args.join(" ")).toContain("splitmuxsink");
+  });
+
+  it("telemetry-only recording is never deferred", async () => {
+    const spawner = fakeSpawner();
+    const policy = new BootDeferPolicy({
+      telemetryFile: join(home, "absent-telemetry.json"),
+      budgetPath: writeBudget(home, 3000),
+    });
+    saveSettings({ recording: { telemetry: { enabled: true, rateHz: 20 } } });
+    manager = makeManager(spawner, policy, []);
+    await manager.start();
+    await delay(150);
+    expect(manager.status().enabled).toBe(true); // telemetry recorder running
+    expect(manager.status().bootDefer).toBeUndefined(); // policy never consulted
   });
 });

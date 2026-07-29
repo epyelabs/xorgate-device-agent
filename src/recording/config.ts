@@ -10,14 +10,31 @@ import { runtimeHome } from "../daemon/runtime.js";
 
 export interface ResolvedRecordingConfig {
   telemetry: { enabled: boolean; rateHz: number };
-  video: { enabled: boolean; preset: string; segmentSeconds: number };
+  video: {
+    enabled: boolean;
+    preset: string;
+    segmentSeconds: number;
+    /** Boot power staging knobs (Phase 2) — see RecordingSettings.video. */
+    bootDefer: "auto" | "always" | "off";
+    bootDeferMaxSecs: number;
+    bootDeferMinBudgetMa: number;
+    spawnStaggerSecs: number;
+  };
   upload: { mode: "auto" | "off" };
   retention: { maxBytes: number; minFreeBytes: number };
 }
 
 export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
   telemetry: { enabled: false, rateHz: 10 },
-  video: { enabled: false, preset: "1080p15-2mbps", segmentSeconds: 60 },
+  video: {
+    enabled: false,
+    preset: "1080p15-2mbps",
+    segmentSeconds: 60,
+    bootDefer: "auto",
+    bootDeferMaxSecs: 90,
+    bootDeferMinBudgetMa: 5000,
+    spawnStaggerSecs: 4,
+  },
   upload: { mode: "auto" },
   retention: { maxBytes: 10 * 1024 ** 3, minFreeBytes: 2 * 1024 ** 3 },
 };
@@ -33,6 +50,10 @@ export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecording
       enabled: s?.video?.enabled ?? d.video.enabled,
       preset: s?.video?.preset ?? d.video.preset,
       segmentSeconds: s?.video?.segmentSeconds ?? d.video.segmentSeconds,
+      bootDefer: s?.video?.bootDefer ?? d.video.bootDefer,
+      bootDeferMaxSecs: s?.video?.bootDeferMaxSecs ?? d.video.bootDeferMaxSecs,
+      bootDeferMinBudgetMa: s?.video?.bootDeferMinBudgetMa ?? d.video.bootDeferMinBudgetMa,
+      spawnStaggerSecs: s?.video?.spawnStaggerSecs ?? d.video.spawnStaggerSecs,
     },
     upload: { mode: s?.upload?.mode ?? d.upload.mode },
     retention: {

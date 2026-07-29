@@ -71,7 +71,11 @@ export async function probeTimeSource(): Promise<TimeSource> {
 export interface TimeSourceTracker {
   /** Last known value (never blocks; kicks a refresh when stale). */
   current(): TimeSource;
-  /** Force a probe now (used once at recorder start so the first header is right). */
+  /**
+   * Force a probe now. The manager AWAITS this (bounded) before its first
+   * apply(), so the first session headers/manifests carry the probed value
+   * rather than the pessimistic initial "unsynced".
+   */
   refresh(): Promise<TimeSource>;
 }
 

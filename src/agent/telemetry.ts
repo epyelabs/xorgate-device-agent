@@ -143,6 +143,12 @@ export interface RecordingStatus {
   droppedSegments: number;
   uploading: boolean;
   lastUploadAt: number | null;
+  /**
+   * Boot power staging verdict (optimize-system-process-cycle plan, Phase 2):
+   * "off" | "skipped" | "deferring" | "released:<why>". Absent until the video
+   * path first consulted the policy (and on agents predating the feature).
+   */
+  bootDefer?: string;
 }
 
 export type RunMode = "sim" | "real";

@@ -29,7 +29,13 @@ import {
 import { DiskManager } from "./disk.js";
 import { finalizeOrphanSegments } from "./segments.js";
 import { TelemetryRecorder } from "./telemetry-recorder.js";
-import { createTimeSourceTracker, mintSessionId, readBootId } from "./session.js";
+import { BootDeferPolicy, type BootDeferVerdict } from "./boot-policy.js";
+import {
+  createTimeSourceTracker,
+  mintSessionId,
+  readBootId,
+  type TimeSourceTracker,
+} from "./session.js";
 import { createTelemetrySource } from "./telemetry-source.js";
 import { createVideoSource } from "./video-source.js";
 import { Uploader, type PutFn, type SegmentSource } from "./uploader.js";
@@ -44,6 +50,12 @@ import { recoverOrphanVideoSessions } from "./video-segments.js";
 
 /** How often settings.json is re-checked for recording changes. */
 const SETTINGS_POLL_MS = 5_000;
+/**
+ * Cap on the startup timeSource probe await: a hung timedatectl must not delay
+ * recording start — on timeout we proceed with the tracker's current
+ * (pessimistic) value and the probe finishes in the background.
+ */
+const TIME_PROBE_TIMEOUT_MS = 2_000;
 /** Slow disk-pressure sweep; rotations also trigger enforcement directly. */
 const DISK_ENFORCE_MS = 60_000;
 
@@ -107,12 +119,17 @@ export interface RecordingManagerOptions {
   pollMs?: number;
   segmentMaxBytes?: number;
   segmentMaxAgeMs?: number;
+  timeSource?: TimeSourceTracker;
+  timeProbeTimeoutMs?: number;
+  /** Boot power staging policy override (tests inject fake telemetry/budget). */
+  bootPolicy?: BootDeferPolicy;
 }
 
 export class RecordingManager {
   private readonly opts: RecordingManagerOptions;
   private readonly root: string;
-  private readonly timeSource = createTimeSourceTracker();
+  private readonly timeSource: TimeSourceTracker;
+  private stopRequested = false;
   private cfg: ResolvedRecordingConfig;
   private recorder: TelemetryRecorder | null = null;
   private sessionId: string | null = null;
@@ -120,6 +137,10 @@ export class RecordingManager {
   private uploader: Uploader | null = null;
   private videoCapture: VideoCaptureSupervisor | null = null;
   private videoKey = "";
+  /** Boot power staging (Phase 2): may heavy encoders start yet? */
+  private readonly bootPolicy: BootDeferPolicy;
+  /** Last boot-defer status string that was logged/published (dedupe key). */
+  private bootDeferStatus: string | null = null;
   /** Serializes capture stop→start handovers (see applyVideo). */
   private videoTransition: Promise<void> = Promise.resolve();
   private pollTimer: NodeJS.Timeout | null = null;
@@ -128,6 +149,8 @@ export class RecordingManager {
 
   constructor(opts: RecordingManagerOptions) {
     this.opts = opts;
+    this.timeSource = opts.timeSource ?? createTimeSourceTracker();
+    this.bootPolicy = opts.bootPolicy ?? new BootDeferPolicy();
     this.root = opts.root ?? recordingsRoot();
     this.cfg = resolveRecordingConfig(loadSettings().recording);
     if (opts.upload) this.uploader = this.buildUploader(opts.upload);
@@ -174,8 +197,14 @@ export class RecordingManager {
     this.uploader.kick();
   }
 
-  /** Startup: crash-recover any earlier run's segments, then apply current settings. */
-  start(): void {
+  /**
+   * Startup: crash-recover any earlier run's segments, probe the time source,
+   * then apply current settings. The probe is awaited BEFORE the first apply()
+   * so the first session headers/manifests carry the real provenance instead of
+   * the tracker's pessimistic initial "unsynced" — but bounded by
+   * TIME_PROBE_TIMEOUT_MS so a hung timedatectl can never delay recording.
+   */
+  async start(): Promise<void> {
     // Only touch the tree if a previous run created it — a device that has
     // never recorded stays byte-identical to today (no dirs, no counters).
     if (existsSync(this.root)) {
@@ -192,8 +221,14 @@ export class RecordingManager {
       this.ensureDisk();
     }
     this.lastSettingsKey = this.settingsKey();
+    await Promise.race([
+      this.timeSource.refresh().catch(() => {}),
+      new Promise<void>((res) => {
+        setTimeout(res, this.opts.timeProbeTimeoutMs ?? TIME_PROBE_TIMEOUT_MS).unref();
+      }),
+    ]);
+    if (this.stopRequested) return; // stopped while awaiting the probe
     this.apply();
-    void this.timeSource.refresh().catch(() => {});
     this.pollTimer = setInterval(() => this.reapply(), this.opts.pollMs ?? SETTINGS_POLL_MS);
     this.pollTimer.unref();
     // Drain any backlog left by earlier runs (crash-recovered segments included).
@@ -213,14 +248,21 @@ export class RecordingManager {
   /** Re-read settings.json and apply if the recording namespace changed. */
   reapply(): void {
     const key = this.settingsKey();
-    if (key === this.lastSettingsKey) return;
-    this.lastSettingsKey = key;
-    this.cfg = resolveRecordingConfig(loadSettings().recording);
-    this.apply();
+    if (key !== this.lastSettingsKey) {
+      this.lastSettingsKey = key;
+      this.cfg = resolveRecordingConfig(loadSettings().recording);
+      this.apply();
+      return;
+    }
+    // Settings unchanged, but the boot-defer verdict can still flip on its own
+    // (modem settled, telemetry gone stale, hard cap elapsed) — re-run the
+    // video diff, which no-ops unless the effective tuple actually changed.
+    this.applyVideo();
   }
 
   /** Sync shutdown: finalize the active segment, stop all timers. */
   stop(): void {
+    this.stopRequested = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.diskTimer) clearInterval(this.diskTimer);
     this.pollTimer = null;
@@ -251,6 +293,9 @@ export class RecordingManager {
       droppedSegments: disk?.droppedSegments ?? 0,
       uploading: upload?.uploading ?? false,
       lastUploadAt: upload?.lastUploadAt ?? null,
+      // Boot power staging verdict (Phase 2); absent until the video path
+      // first consulted the policy (video off / no cameras / telemetry-only).
+      ...(this.bootDeferStatus !== null ? { bootDefer: this.bootDeferStatus } : {}),
     };
   }
 
@@ -287,13 +332,28 @@ export class RecordingManager {
     const vo = this.opts.video;
     if (!vo) return;
     const cameras = vo.mediaEnabled ? vo.cameras() : [];
-    const record = this.cfg.video.enabled;
+    // Boot power staging (Phase 2): while the modem is still bringing up LTE
+    // on a constrained supply budget, run bridge-only (record=false) so live
+    // streaming can attach but no x264 encoder competes with the attach/TX
+    // power draw. The policy latches its first allow — after that this is a
+    // plain pass-through of recording.video.enabled.
+    let record = this.cfg.video.enabled;
+    if (record && cameras.length > 0) {
+      const verdict = this.bootPolicy.evaluate({
+        mode: this.cfg.video.bootDefer,
+        maxSecs: this.cfg.video.bootDeferMaxSecs,
+        minBudgetMa: this.cfg.video.bootDeferMinBudgetMa,
+      });
+      record = verdict.allow;
+      this.noteBootDefer(verdict);
+    }
     const preset = resolveVideoPreset(this.cfg.video.preset);
     const key = JSON.stringify({
       cameras,
       record,
       preset: preset.name,
       seg: this.cfg.video.segmentSeconds,
+      stagger: this.cfg.video.spawnStaggerSecs,
     });
     if (key === this.videoKey) return;
     this.videoKey = key;
@@ -322,6 +382,27 @@ export class RecordingManager {
     });
   }
 
+  /**
+   * Log + publish boot-defer transitions exactly once per state change so a
+   * field drive can be audited from the journal/state.json afterwards.
+   */
+  private noteBootDefer(verdict: BootDeferVerdict): void {
+    const status = verdict.state === "released" ? `released:${verdict.why}` : verdict.state;
+    if (status === this.bootDeferStatus) return;
+    this.bootDeferStatus = status;
+    const msg =
+      verdict.state === "deferring"
+        ? `video boot-defer armed (${verdict.why}) — bridge-only until the modem settles ` +
+          `(cap ${this.cfg.video.bootDeferMaxSecs}s)`
+        : verdict.state === "skipped"
+          ? `video boot-defer skipped: ${verdict.why}`
+          : verdict.state === "released"
+            ? `video boot-defer released (${verdict.why}) — starting full capture`
+            : `video boot-defer off (${verdict.why})`;
+    this.opts.onEvent?.("info", msg);
+    this.notifyStatus();
+  }
+
   private startVideo(
     cameras: CaptureCamera[],
     record: boolean,
@@ -334,6 +415,7 @@ export class RecordingManager {
       record,
       preset,
       segmentSeconds: this.cfg.video.segmentSeconds,
+      staggerMs: this.cfg.video.spawnStaggerSecs * 1000,
       videoRoot: videoRoot(this.root),
       shmDir: vo.shmDir ?? shmDir(),
       timeSource: () => this.timeSource.current(),

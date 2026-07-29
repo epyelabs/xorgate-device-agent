@@ -29,7 +29,24 @@ import type { RunMode } from "../agent/telemetry.js";
  */
 export interface RecordingSettings {
   telemetry?: { enabled?: boolean; rateHz?: number };
-  video?: { enabled?: boolean; preset?: string; segmentSeconds?: number };
+  video?: {
+    enabled?: boolean;
+    preset?: string;
+    segmentSeconds?: number;
+    /**
+     * Boot power staging (optimize-system-process-cycle plan, Phase 2):
+     * "auto" (default) defers heavy encoders at boot only when the negotiated
+     * PSU budget is below bootDeferMinBudgetMa; "always" defers every boot;
+     * "off" is today's start-everything behavior.
+     */
+    bootDefer?: "auto" | "always" | "off";
+    /** Hard cap on the boot defer, seconds (default 90; 0 = feature off). */
+    bootDeferMaxSecs?: number;
+    /** `auto` skips the defer at/above this negotiated budget in mA (default 5000). */
+    bootDeferMinBudgetMa?: number;
+    /** Inter-camera spawn delay, seconds (default 4; 0 = simultaneous as before). */
+    spawnStaggerSecs?: number;
+  };
   upload?: { mode?: "auto" | "off" };
   retention?: { maxBytes?: number; minFreeBytes?: number };
 }
@@ -136,6 +153,24 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
     const segmentSeconds = (vid as { segmentSeconds?: unknown }).segmentSeconds;
     if (typeof segmentSeconds === "number" && Number.isFinite(segmentSeconds)) {
       o.segmentSeconds = Math.min(600, Math.max(10, Math.round(segmentSeconds)));
+    }
+    const bootDefer = (vid as { bootDefer?: unknown }).bootDefer;
+    if (bootDefer === "auto" || bootDefer === "always" || bootDefer === "off") {
+      o.bootDefer = bootDefer;
+    }
+    const bootDeferMaxSecs = (vid as { bootDeferMaxSecs?: unknown }).bootDeferMaxSecs;
+    if (typeof bootDeferMaxSecs === "number" && Number.isFinite(bootDeferMaxSecs)) {
+      // 0 stays meaningful (feature off); the cap keeps "recording is the
+      // product" honest — no defer may be configured past 10 minutes.
+      o.bootDeferMaxSecs = Math.min(600, Math.max(0, Math.round(bootDeferMaxSecs)));
+    }
+    const bootDeferMinBudgetMa = (vid as { bootDeferMinBudgetMa?: unknown }).bootDeferMinBudgetMa;
+    if (typeof bootDeferMinBudgetMa === "number" && Number.isFinite(bootDeferMinBudgetMa)) {
+      o.bootDeferMinBudgetMa = Math.min(10_000, Math.max(0, Math.round(bootDeferMinBudgetMa)));
+    }
+    const spawnStaggerSecs = (vid as { spawnStaggerSecs?: unknown }).spawnStaggerSecs;
+    if (typeof spawnStaggerSecs === "number" && Number.isFinite(spawnStaggerSecs)) {
+      o.spawnStaggerSecs = Math.min(30, Math.max(0, Math.round(spawnStaggerSecs)));
     }
     if (Object.keys(o).length > 0) out.video = o;
   }

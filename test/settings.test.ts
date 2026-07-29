@@ -63,6 +63,26 @@ describe("settings persistence", () => {
     expect(loadSettings()).toEqual({ lteRecovery: { deadZoneProfile: "conservative" } });
   });
 
+  it("round-trips the timeSync namespace (loadSettings must not drop it)", () => {
+    const timeSync = { offlineSources: false, stepThresholdSecs: 30, maxStepsPerBoot: 2 };
+    saveSettings({ mode: "real", timeSync });
+    expect(loadSettings()).toEqual({ mode: "real", timeSync });
+  });
+
+  it("clamps timeSync numbers and drops mistyped keys", () => {
+    writeFileSync(
+      settingsPath(),
+      JSON.stringify({
+        timeSync: { offlineSources: "yes", stepThresholdSecs: 0.4, maxStepsPerBoot: 999 },
+      }),
+    );
+    // threshold clamps up to the 2 s floor, cap clamps down to 20; the
+    // mistyped boolean is dropped.
+    expect(loadSettings()).toEqual({ timeSync: { stepThresholdSecs: 2, maxStepsPerBoot: 20 } });
+    writeFileSync(settingsPath(), JSON.stringify({ timeSync: { offlineSources: 1 } }));
+    expect(loadSettings()).toEqual({});
+  });
+
   it("returns {} when the file is missing", () => {
     expect(loadSettings()).toEqual({});
   });

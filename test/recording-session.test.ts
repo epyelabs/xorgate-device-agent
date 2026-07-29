@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { mintSessionId, probeTimeSource, readBootId } from "../src/recording/session.js";
+import {
+  createTimeSourceTracker,
+  mintSessionId,
+  probeTimeSource,
+  readBootId,
+} from "../src/recording/session.js";
 
 describe("mintSessionId", () => {
   it("produces valid UUIDv7-shaped ids", () => {
@@ -30,5 +35,35 @@ describe("boot id + time source", () => {
   it("probes to one of the three provenance values without throwing", async () => {
     const ts = await probeTimeSource();
     expect(["ntp", "rtc", "unsynced"]).toContain(ts);
+  });
+});
+
+describe("timeSource tracker with offline clock steps (Phase 4)", () => {
+  it("reports the stepped source over a weaker probe value, immediately and across refreshes", async () => {
+    const tracker = createTimeSourceTracker(60_000, async () => "rtc");
+    expect(await tracker.refresh()).toBe("rtc");
+    tracker.noteStep("gps");
+    expect(tracker.current()).toBe("gps"); // immediate — no probe round-trip
+    expect(await tracker.refresh()).toBe("gps"); // probe still rtc; step wins
+  });
+
+  it("lets NTP supersede a step for good", async () => {
+    let probed: "ntp" | "rtc" | "unsynced" = "unsynced";
+    const tracker = createTimeSourceTracker(60_000, async () => probed);
+    tracker.noteStep("nitz");
+    expect(await tracker.refresh()).toBe("nitz");
+    probed = "ntp";
+    expect(await tracker.refresh()).toBe("ntp");
+    // Back to a degraded probe (can't happen within a boot; belt-and-braces):
+    // the stepped state was discarded when NTP landed.
+    probed = "rtc";
+    expect(await tracker.refresh()).toBe("rtc");
+  });
+
+  it("never downgrades a current ntp value on a late noteStep", async () => {
+    const tracker = createTimeSourceTracker(60_000, async () => "ntp");
+    expect(await tracker.refresh()).toBe("ntp");
+    tracker.noteStep("gps");
+    expect(tracker.current()).toBe("ntp");
   });
 });

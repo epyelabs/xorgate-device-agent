@@ -48,11 +48,43 @@ const REOPEN_SILENT_MS = 30_000;
  * engine restart's dead air isn't billed as acquisition time. Null when the
  * collector never saw the acquiring state (e.g. agent started under a fix).
  */
-export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): Collector {
+/**
+ * A GPS UTC clock reading for the offline clock stepper (Phase 4): the last
+ * RMC-carried date+time, its mono-measured age (wall-clock-independent — the
+ * whole point is that the wall clock may be wrong), and whether the receiver
+ * reported a valid fix at that instant. Stratum-0 quality when valid.
+ */
+export interface GpsClockReading {
+  /** UTC epoch ms as reported by RMC, at the instant it arrived. */
+  utcMs: number;
+  /** Monotonic age of that reading, ms. */
+  ageMs: number;
+  /** RMC status was "A" (valid fix) on the sentence that carried this time. */
+  valid: boolean;
+}
+
+/** How old an RMC time reading may be before clock() reports none (NMEA is ~1 Hz). */
+const CLOCK_FRESH_MS = 10_000;
+
+export interface GpsCollector extends Collector {
+  /**
+   * Latest fresh RMC UTC time, or null when none/stale. Also keeps the NMEA
+   * stream open (like read()/sample()), so the clock stepper alone sustains
+   * GPS input on a device that is offline with recording off.
+   */
+  clock(): GpsClockReading | null;
+}
+
+export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): GpsCollector {
   let started = false;
   let latest: GpsFix | null = null;
   let lastFixAt = 0;
   let lastFixMono = 0n;
+  // Clock-step view: the last distinct RMC utcMs + its mono arrival stamp.
+  // utcMs advances every RMC (1 Hz), so "changed" is the fresh-RMC signal.
+  let clockUtcMs: number | null = null;
+  let clockMono = 0n;
+  let clockValid = false;
   let warned = false;
   let handle: GpsStreamHandle | null = null;
   let openedAt = 0;
@@ -91,6 +123,11 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
         latest = fix;
         lastFixAt = Date.now();
         lastFixMono = process.hrtime.bigint();
+        if (typeof fix.utcMs === "number" && fix.utcMs !== clockUtcMs) {
+          clockUtcMs = fix.utcMs;
+          clockMono = lastFixMono;
+          clockValid = fix.valid === true;
+        }
         noteFixQuality(fix, lastFixAt);
         warned = false; // streaming again — allow a fresh warning if it drops
       },
@@ -174,6 +211,13 @@ export function createGpsCollector(reopenSilentMs: number = REOPEN_SILENT_MS): C
       ensureStreaming();
       const fix = freshFix();
       return fix ? { fields: mapLatest(fix), updatedMono: lastFixMono } : null;
+    },
+    clock() {
+      ensureStreaming();
+      if (clockUtcMs === null) return null;
+      const ageMs = Number((process.hrtime.bigint() - clockMono) / 1_000_000n);
+      if (ageMs > CLOCK_FRESH_MS) return null;
+      return { utcMs: clockUtcMs, ageMs, valid: clockValid };
     },
   };
 }

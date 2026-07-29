@@ -38,15 +38,22 @@
  *   recording.powerShedding.maxShedsPerHour <0-60>
  * (powerShedding.* is the Phase 3 runtime undervoltage load-shedding ladder —
  * live streaming sheds first, recording last, restore with hysteresis.)
+ *
+ * `timeSync.*` dotted keys (Phase 4 offline time sources) are read live by the
+ * worker's clock stepper each tick (~30 s; no restart):
+ *   timeSync.offlineSources <on|off>       timeSync.stepThresholdSecs <2-600>
+ *   timeSync.maxStepsPerBoot <1-20>
  */
 import {
   loadSettings,
   parseRecordingSettings,
+  parseTimeSyncSettings,
   saveSettings,
   RECORDING_RATE_HZ_MAX,
   RECORDING_RATE_HZ_MIN,
   type AgentSettings,
   type RecordingSettings,
+  type TimeSyncSettings,
 } from "../daemon/settings.js";
 import { inspect, restart } from "../daemon/manager.js";
 import { setWifi } from "../daemon/radios.js";
@@ -59,7 +66,7 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, wifi <on|off> [--force], recording.<group>.<field> <value>)";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>)";
 
 /** Parse an on/off/true/false/1/0 CLI value; undefined when unrecognizable. */
 function parseBoolValue(v: string | undefined): boolean | undefined {
@@ -172,6 +179,63 @@ function setRecordingCommand(key: string, value: string | undefined): void {
   console.log("  the agent applies recording changes live within ~5 s (no restart needed)");
 }
 
+/**
+ * `xorgate set timeSync.<field> <value>` — validate one offline-time-sync knob,
+ * merge it into the persisted `timeSync` namespace, and let the worker's clock
+ * stepper pick it up on its next tick (~30 s; no restart). Cloud-delivered
+ * timeSync config overwrites local edits on the next retained delivery.
+ */
+function setTimeSyncCommand(key: string, value: string | undefined): void {
+  const parts = key.split(".");
+  const field = parts[1];
+  if (parts.length !== 2 || !field) {
+    console.error("timeSync keys are dotted paths, e.g. xorgate set timeSync.offlineSources off");
+    process.exitCode = 1;
+    return;
+  }
+
+  let raw: unknown;
+  if (field === "offlineSources") {
+    const bool = parseBoolValue(value);
+    if (bool === undefined) {
+      console.error(`${key} must be on|off, got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    raw = bool;
+  } else if (field === "stepThresholdSecs" || field === "maxStepsPerBoot") {
+    const num = value !== undefined && value !== "" ? Number(value) : NaN;
+    if (!Number.isFinite(num) || num < 0) {
+      console.error(`${key} must be a non-negative number, got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    raw = num;
+  } else {
+    console.error(
+      `unknown timeSync setting '${key}' (supported: offlineSources, stepThresholdSecs, maxStepsPerBoot)`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // Same validator loadSettings uses, so CLI writes never persist something
+  // the worker would drop on read (numbers come back clamped).
+  const patch = parseTimeSyncSettings({ [field]: raw });
+  const applied = patch?.[field as keyof TimeSyncSettings];
+  if (patch === undefined || applied === undefined) {
+    console.error(`unknown or invalid timeSync setting '${key}' = '${value ?? ""}'`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const settings: AgentSettings = { ...loadSettings() };
+  settings.timeSync = { ...settings.timeSync, ...patch };
+  saveSettings(settings);
+  console.log(`✓ ${key} = ${JSON.stringify(applied)} (persisted to settings.json)`);
+  console.log("  the agent's clock stepper reads it live within ~30 s (no restart needed)");
+}
+
 export async function setCommand(rest: string[]): Promise<void> {
   const noRestart = rest.includes("--no-restart");
   const force = rest.includes("--force");
@@ -194,6 +258,12 @@ export async function setCommand(rest: string[]): Promise<void> {
   // Recording keys are applied live by the worker's settings poll — no restart.
   if (key.startsWith("recording.")) {
     setRecordingCommand(key, value);
+    return;
+  }
+
+  // timeSync keys are read live by the worker's clock stepper — no restart.
+  if (key.startsWith("timeSync.")) {
+    setTimeSyncCommand(key, value);
     return;
   }
 
@@ -260,7 +330,7 @@ export async function setCommand(rest: string[]): Promise<void> {
     return;
   } else {
     console.error(
-      `unknown setting '${key}' (supported: mode, media, gps-antenna, gps-fix-reset-policy, deadzone-profile, wifi, recording.*)`,
+      `unknown setting '${key}' (supported: mode, media, gps-antenna, gps-fix-reset-policy, deadzone-profile, wifi, recording.*, timeSync.*)`,
     );
     process.exitCode = 1;
     return;

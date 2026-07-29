@@ -53,6 +53,17 @@ const MODEM_ASSETS: Array<[src: string, dest: string, mode: number]> = [
   ["modem/99-sim7600-unmanaged.conf", "/etc/NetworkManager/conf.d/99-sim7600-unmanaged.conf", 0o644],
 ];
 
+// System assets (Phase 4 offline time sources; mirrors the install script):
+// the root clock-step helper the agent invokes via sudo, and the cron drop-in
+// that tightens fake-hwclock's save cadence to 5 min. Unconditional (unlike
+// modem assets — these are useful on any device).
+const SYSTEM_ASSETS: Array<[src: string, dest: string, mode: number]> = [
+  ["system/xorgate-setclock", "/usr/local/bin/xorgate-setclock", 0o755],
+  ["system/xorgate-fake-hwclock.cron", "/etc/cron.d/xorgate-fake-hwclock", 0o644],
+];
+
+const CLOCK_SUDOERS_DEST = "/etc/sudoers.d/021_xorgate-clock";
+
 const log = (s: string): void => console.log(`[xorgate] ${s}`);
 const fail = (s: string): never => {
   console.error(`[xorgate] update failed: ${s}`);
@@ -62,6 +73,49 @@ const fail = (s: string): never => {
 function flagValue(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i !== -1 ? argv[i + 1] : undefined;
+}
+
+/**
+ * The user the agent service runs as, from install.sh's 10-user.conf drop-in.
+ * null when the drop-in is absent/unreadable (agent runs as the unit's
+ * User=root fallback and needs no sudoers entry).
+ */
+function serviceUser(): string | null {
+  try {
+    const text = readFileSync(`${UNIT_DEST}.d/10-user.conf`, "utf8");
+    const m = text.match(/^\s*User\s*=\s*(\S+)/m);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Install the sudoers drop-in that lets the (non-root) agent run the clock
+ * helper — and only that. Validated with visudo before install (a malformed
+ * sudoers file locks out sudo machine-wide); refusal is logged, never fatal:
+ * the agent's clock stepper just logs failed steps until the entry exists.
+ */
+async function installClockSudoers(): Promise<void> {
+  const user = serviceUser();
+  if (!user || user === "root") return; // root agent needs no sudo grant
+  const body =
+    `# Installed by xorgate. Allows the agent (running as ${user}) to apply an\n` +
+    `# offline GPS/NITZ clock step. See device-agent src/agent/clock-step.ts.\n` +
+    `${user} ALL=(root) NOPASSWD: /usr/local/bin/xorgate-setclock\n`;
+  const tmp = join(mkdtempSync(join(tmpdir(), "xg-sudoers-")), "021_xorgate-clock");
+  try {
+    writeFileSync(tmp, body, { mode: 0o440 });
+    const check = await run("visudo", ["-cf", tmp]);
+    if (check.failed || check.notFound) {
+      log("warning: clock sudoers drop-in failed visudo validation; offline clock steps will not work");
+      return;
+    }
+    copyFileSync(tmp, CLOCK_SUDOERS_DEST);
+    chmodSync(CLOCK_SUDOERS_DEST, 0o440);
+  } finally {
+    rmSync(join(tmp, ".."), { recursive: true, force: true });
+  }
 }
 
 /** Parse KEY=VALUE lines out of an env file (quotes/whitespace stripped). */
@@ -181,6 +235,16 @@ export async function updateCommand(argv: string[]): Promise<void> {
         );
       }
     }
+
+    // 5c. System assets (Phase 4): the sudo clock helper, the fake-hwclock
+    //     cadence cron drop-in, and the sudoers grant for the service user.
+    for (const [src, dest, mode] of SYSTEM_ASSETS) {
+      const from = join(INSTALL_PREFIX, src);
+      if (!existsSync(from)) continue;
+      copyFileSync(from, dest);
+      chmodSync(dest, mode);
+    }
+    await installClockSudoers();
   } catch (err) {
     // Roll back to the previous build so we never leave a broken install.
     rmSync(INSTALL_PREFIX, { recursive: true, force: true });

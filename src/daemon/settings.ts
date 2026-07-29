@@ -108,6 +108,47 @@ export function parseLteRecoverySettings(v: unknown): LteRecoverySettings | unde
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * Offline time sources (optimize-system-process-cycle plan, Phase 4) — the
+ * `timeSync` namespace in settings.json, read LIVE by the worker's clock
+ * stepper each tick. All optional; defaults in `src/agent/clock-step.ts`
+ * (offlineSources on, 10 s threshold, 4 steps/boot). `offlineSources: false`
+ * is the Q5 kill switch: the stepper never touches the clock. The stepper
+ * additionally self-disarms for the whole boot once NTP has ever synchronized
+ * (a future battery-backed RTC boots inside the threshold, making the feature
+ * a natural no-op with no config change).
+ */
+export interface TimeSyncSettings {
+  /** Master enable for GPS/NITZ clock stepping while NTP is unsynced (default on). */
+  offlineSources?: boolean;
+  /** Step only when |clock offset| exceeds this many seconds (default 10). */
+  stepThresholdSecs?: number;
+  /** Hard cap on clock steps per boot (default 4; caps a flapping source). */
+  maxStepsPerBoot?: number;
+}
+
+/**
+ * Validate an untrusted `timeSync` value, clamping numbers and dropping
+ * mistyped keys (same forgiving philosophy as parseRecordingSettings).
+ * Returns undefined when nothing valid remains.
+ */
+export function parseTimeSyncSettings(v: unknown): TimeSyncSettings | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const src = v as Record<string, unknown>;
+  const out: TimeSyncSettings = {};
+  if (typeof src.offlineSources === "boolean") out.offlineSources = src.offlineSources;
+  const threshold = src.stepThresholdSecs;
+  if (typeof threshold === "number" && Number.isFinite(threshold)) {
+    // Floor 2 s: below NITZ/NMEA-arrival granularity a threshold would flap.
+    out.stepThresholdSecs = Math.min(600, Math.max(2, Math.round(threshold)));
+  }
+  const maxSteps = src.maxStepsPerBoot;
+  if (typeof maxSteps === "number" && Number.isFinite(maxSteps)) {
+    out.maxStepsPerBoot = Math.min(20, Math.max(1, Math.round(maxSteps)));
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface AgentSettings {
   mode?: RunMode;
   /** Operator toggle for the KVS WebRTC media runtime (off unless explicitly enabled). */
@@ -136,6 +177,13 @@ export interface AgentSettings {
    * daemon's safe defaults (gpsFixResetPolicy defer, deadZoneProfile balanced).
    */
   lteRecovery?: LteRecoverySettings;
+  /**
+   * Offline time sources (see TimeSyncSettings). Set from the web device
+   * settings page (retained MQTT config -> worker) or `xorgate set`; read
+   * LIVE by the worker's clock stepper each tick. Absent = defaults
+   * (stepping on, 10 s threshold).
+   */
+  timeSync?: TimeSyncSettings;
 }
 
 /** Clamp `rateHz` to what the collectors can produce (IMU caps at 20 Hz). */
@@ -278,6 +326,8 @@ export function loadSettings(path: string = settingsPath()): AgentSettings {
       if (recording) out.recording = recording;
       const lteRecovery = parseLteRecoverySettings((obj as { lteRecovery?: unknown }).lteRecovery);
       if (lteRecovery) out.lteRecovery = lteRecovery;
+      const timeSync = parseTimeSyncSettings((obj as { timeSync?: unknown }).timeSync);
+      if (timeSync) out.timeSync = timeSync;
       return out;
     }
   } catch {

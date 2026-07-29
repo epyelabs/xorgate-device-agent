@@ -11,7 +11,9 @@
  *   { "v": 1, "gnssAntBias": boolean,
  *     "imuMount": { enabled, rollDeg, pitchDeg, yawDeg },
  *     "recording": { telemetry, video, upload, retention },
- *     "lteRecovery": { gpsFixResetPolicy, deadZoneProfile }, "ts": <epoch ms> }
+ *     "lteRecovery": { gpsFixResetPolicy, deadZoneProfile },
+ *     "timeSync": { offlineSources, stepThresholdSecs, maxStepsPerBoot },
+ *     "ts": <epoch ms> }
  * Future cloud-configurable knobs slot in as additional keys.
  *
  * `lteRecovery` (lte_gnss_recovery plan, R8) follows the same REPLACE
@@ -33,10 +35,12 @@ import {
   loadSettings,
   parseLteRecoverySettings,
   parseRecordingSettings,
+  parseTimeSyncSettings,
   saveSettings,
   settingsPath,
   type LteRecoverySettings,
   type RecordingSettings,
+  type TimeSyncSettings,
 } from "../daemon/settings.js";
 import { parseImuMount, type ImuMount } from "../lib/orientation.js";
 
@@ -56,6 +60,13 @@ export interface CloudConfig {
    * cloud-configured, leave local settings alone.
    */
   lteRecovery?: LteRecoverySettings | null;
+  /**
+   * Offline time sources (optimize-system-process-cycle plan, Phase 4). Same
+   * replace-whole-namespace semantics as `recording`: null = carried but
+   * nothing valid → remove the local key (stepper falls back to defaults);
+   * absent = never cloud-configured, leave local settings alone.
+   */
+  timeSync?: TimeSyncSettings | null;
   /**
    * Segment-upload S3 bucket (Phase 6.2 backfill for devices fielded before
    * Phase 2 provisioning). Persisted into kvs.json — NOT settings.json — by
@@ -98,6 +109,10 @@ export function parseCloudConfig(payload: Buffer | string): CloudConfig | null {
   const lteRecovery = (obj as { lteRecovery?: unknown }).lteRecovery;
   if (lteRecovery && typeof lteRecovery === "object" && !Array.isArray(lteRecovery)) {
     out.lteRecovery = parseLteRecoverySettings(lteRecovery) ?? null;
+  }
+  const timeSync = (obj as { timeSync?: unknown }).timeSync;
+  if (timeSync && typeof timeSync === "object" && !Array.isArray(timeSync)) {
+    out.timeSync = parseTimeSyncSettings(timeSync) ?? null;
   }
   return out;
 }
@@ -151,10 +166,19 @@ export function applyCloudConfig(
       lteRecoveryChange = target ? "set" : "clear";
     }
   }
+  // ... and for the offline time-sync namespace.
+  let timeSyncChange: "set" | "clear" | undefined;
+  if (config.timeSync !== undefined) {
+    const target = config.timeSync ?? undefined;
+    if (JSON.stringify(target) !== JSON.stringify(current.timeSync)) {
+      timeSyncChange = target ? "set" : "clear";
+    }
+  }
   if (
     Object.keys(next).length === 0 &&
     recordingChange === undefined &&
-    lteRecoveryChange === undefined
+    lteRecoveryChange === undefined &&
+    timeSyncChange === undefined
   ) {
     return { changed: false };
   }
@@ -163,6 +187,8 @@ export function applyCloudConfig(
   else if (recordingChange === "clear") delete merged.recording;
   if (lteRecoveryChange === "set") merged.lteRecovery = config.lteRecovery as LteRecoverySettings;
   else if (lteRecoveryChange === "clear") delete merged.lteRecovery;
+  if (timeSyncChange === "set") merged.timeSync = config.timeSync as TimeSyncSettings;
+  else if (timeSyncChange === "clear") delete merged.timeSync;
   saveSettings(merged, path);
   return { changed: true };
 }

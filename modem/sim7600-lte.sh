@@ -298,6 +298,11 @@ gnss_health_state() {
 #   "gnss_ant_bias": 0|1 last-applied antenna bias state, or null before first apply
 #   "modem_temp":   modem PMU temperature in °C (AT+CPMUTEMP), or null if
 #                   never read / unsupported by this firmware
+#   "modem_clock":  {"cclk": "yy/MM/dd,hh:mm:ss±zz", "read_at": epoch_secs}
+#                   raw AT+CCLK? value (NITZ-disciplined local time, zone in
+#                   quarter hours) + our clock at the read instant, refreshed
+#                   ~60 s; null before the first successful read. Consumed by
+#                   the agent's offline clock stepper (Phase 4).
 #   "gnss": {      GNSS engine observability. LAST-KNOWLEDGE values: the fix
 #                  probe runs only on healthy-LTE health ticks (10 min) and at
 #                  the CRESET gate — while LTE is down these go stale rather
@@ -385,6 +390,12 @@ write_telemetry() {
         last_gate_skip="{\"ts\": $(iso_or_null "$LAST_GATE_SKIP_AT"), \"context\": \"$LAST_GATE_SKIP_CONTEXT\", \"reason\": \"$LAST_GATE_SKIP_REASON\"}"
     fi
 
+    # Raw AT+CCLK? pair for the agent's offline clock stepper (Phase 4).
+    local modem_clock="null"
+    if [[ -n "$MODEM_CCLK" && -n "$MODEM_CCLK_READ_AT" ]]; then
+        modem_clock="{\"cclk\": \"$MODEM_CCLK\", \"read_at\": $MODEM_CCLK_READ_AT}"
+    fi
+
     # Write to temp file first, then atomically move into place
     # so readers never see a partial file
     local tmp="${TELEMETRY_FILE}.tmp"
@@ -402,6 +413,7 @@ write_telemetry() {
   "xtra_valid_min": ${XTRA_VALID_MIN:-null},
   "gnss_ant_bias": ${GNSS_BIAS_APPLIED:-null},
   "modem_temp": ${MODEM_TEMP:-null},
+  "modem_clock": $modem_clock,
   "gnss": {
     "engine_on": ${GNSS_ENGINE_ON:-null},
     "has_fix": ${GNSS_LAST_FIX:-null},
@@ -581,6 +593,30 @@ maybe_update_modem_temp() {
     (( SECONDS - MODEM_TEMP_AT >= MODEM_TEMP_INTERVAL )) || return 0
     MODEM_TEMP_AT=$SECONDS
     get_modem_temp
+}
+
+# --- Modem clock export (optimize-system-process-cycle plan, Phase 4) --------
+# The module clock is NITZ-disciplined by the carrier at registration (no data
+# path needed) and free-runs on the module's own RTC after that. Export the
+# raw AT+CCLK? value plus OUR epoch at the read instant into telemetry.json,
+# so the agent's offline clock stepper can compute the system-clock offset as
+# parse(cclk) - read_at (both captured at the same instant — the device
+# clock's own error cancels). The agent owns all parsing/validation (TZ
+# quarter-hours, never-NITZ'd bogus years); we just ship the raw pair.
+MODEM_CCLK=""
+MODEM_CCLK_READ_AT=""
+MODEM_CLOCK_AT=-9999      # negative so the first maybe_update fires immediately
+MODEM_CLOCK_INTERVAL="${SIM7600_MODEM_CLOCK_INTERVAL:-60}"
+
+maybe_update_modem_clock() {
+    (( SECONDS - MODEM_CLOCK_AT >= MODEM_CLOCK_INTERVAL )) || return 0
+    MODEM_CLOCK_AT=$SECONDS
+    local val
+    val=$(at_setting "AT+CCLK?" "CCLK" | tr -d '"' | tr -d '\r')
+    if [[ -n "$val" ]]; then
+        MODEM_CCLK="$val"
+        MODEM_CCLK_READ_AT=$(date +%s)
+    fi
 }
 
 # --- GPS / GNSS --------------------------------------------------------------
@@ -1494,6 +1530,7 @@ wait_for_stable_signal() {
         local csq dbm
         csq=$(get_csq)
         maybe_update_modem_temp
+        maybe_update_modem_clock
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
 
@@ -1586,6 +1623,7 @@ monitor_connection() {
         local csq dbm interval
         csq=$(get_csq)
         maybe_update_modem_temp
+        maybe_update_modem_clock
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
         prev_csq="$csq"

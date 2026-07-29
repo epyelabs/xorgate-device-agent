@@ -9,11 +9,13 @@
  *
  * Time provenance: devices may boot with a bad clock (not every unit has a
  * charged RTC), so every segment header records where wall-clock time came
- * from: `ntp` (systemd-timesyncd reports synchronized), `rtc` (not NTP-synced
- * but an RTC exists — time plausibly restored from it at boot), or `unsynced`
- * (neither — timestamps may be bogus and need cloud-side re-anchoring via
- * mono+bootId). The check shells out to timedatectl, so it is cached and
- * refreshed on a slow interval by the tracker.
+ * from: `ntp` (systemd-timesyncd reports synchronized), `gps`/`nitz` (offline
+ * clock stepper set the clock from a GNSS fix / the modem's NITZ clock this
+ * boot, NTP still pending), `rtc` (not NTP-synced but an RTC exists — time
+ * plausibly restored from it at boot), or `unsynced` (none of those —
+ * timestamps may be bogus and need cloud-side re-anchoring via mono+bootId).
+ * The check shells out to timedatectl, so it is cached and refreshed on a slow
+ * interval by the tracker.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -54,10 +56,23 @@ export function readBootId(): string {
   return cachedBootId;
 }
 
-export type TimeSource = "ntp" | "rtc" | "unsynced";
+export type TimeSource = "ntp" | "gps" | "nitz" | "rtc" | "unsynced";
 
-/** One uncached probe of the current time provenance. */
-export async function probeTimeSource(): Promise<TimeSource> {
+/**
+ * Where an offline clock step got its time (optimize-system-process-cycle
+ * plan, Phase 4): a valid GNSS fix ("gps", effectively stratum-0) or the
+ * modem's NITZ-disciplined clock ("nitz", carrier-dependent, second
+ * granularity). Provenance rank end-to-end (device → sidecar → cloud rank →
+ * badge): unsynced < rtc < nitz < gps < ntp.
+ */
+export type SteppedClockSource = "gps" | "nitz";
+
+/**
+ * One uncached probe of the current time provenance. Hardware-only view — the
+ * probe cannot see an offline GPS/NITZ step (that is per-process knowledge the
+ * tracker layers on via noteStep), so it returns the base taxonomy only.
+ */
+export async function probeTimeSource(): Promise<"ntp" | "rtc" | "unsynced"> {
   const res = await run("timedatectl", ["show", "-p", "NTPSynchronized", "--value"]);
   if (!res.notFound && !res.failed && res.stdout.trim() === "yes") return "ntp";
   try {
@@ -77,6 +92,15 @@ export interface TimeSourceTracker {
    * rather than the pessimistic initial "unsynced".
    */
   refresh(): Promise<TimeSource>;
+  /**
+   * The offline clock stepper just set the system clock from this source. The
+   * tracker reports it in place of the weaker probed rtc/unsynced until NTP
+   * lands ("ntp" always wins — once the probe sees NTPSynchronized the stepped
+   * state is discarded for good, mirroring the stepper's own stand-down).
+   * Process-local by design: an agent restart falls back to the honest probe
+   * value (the clock stays corrected either way).
+   */
+  noteStep(source: SteppedClockSource): void;
 }
 
 /**
@@ -84,15 +108,21 @@ export interface TimeSourceTracker {
  * up to 20 Hz, but the underlying probe execs timedatectl, so `current()`
  * returns the cache and re-probes at most every `refreshMs`.
  */
-export function createTimeSourceTracker(refreshMs = 60_000): TimeSourceTracker {
+export function createTimeSourceTracker(
+  refreshMs = 60_000,
+  probe: () => Promise<"ntp" | "rtc" | "unsynced"> = probeTimeSource,
+): TimeSourceTracker {
   let value: TimeSource = "unsynced";
+  let stepped: SteppedClockSource | null = null;
   let lastProbeAt = 0;
   let probing = false;
 
   async function refresh(): Promise<TimeSource> {
     probing = true;
     try {
-      value = await probeTimeSource();
+      const probed = await probe();
+      if (probed === "ntp") stepped = null; // NTP supersedes any offline step
+      value = probed === "ntp" ? probed : (stepped ?? probed);
       lastProbeAt = Date.now();
     } finally {
       probing = false;
@@ -109,5 +139,11 @@ export function createTimeSourceTracker(refreshMs = 60_000): TimeSourceTracker {
       return value;
     },
     refresh,
+    noteStep(source: SteppedClockSource): void {
+      stepped = source;
+      // Reflect immediately (segments finalizing this instant should carry it);
+      // never displace "ntp" — a stray late noteStep must not downgrade.
+      if (value !== "ntp") value = source;
+    },
   };
 }

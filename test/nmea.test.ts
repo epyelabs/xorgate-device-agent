@@ -58,6 +58,40 @@ describe("parseSentence", () => {
     expect(fix.course).toBeUndefined();
   });
 
+  it("parses RMC date+time into utcMs (Phase 4 clock-step source)", () => {
+    // 083745.000 on 130626 = 2026-06-13T08:37:45Z.
+    const fix = parseSentence(NMEA_LINES[1])!;
+    expect(fix.utcMs).toBe(Date.UTC(2026, 5, 13, 8, 37, 45));
+  });
+
+  it("carries fractional RMC seconds into utcMs", () => {
+    // Sentences without a checksum are tolerated by design — handy for fixtures.
+    const fix = parseSentence("$GPRMC,120000.250,A,,,,,0.0,,010126,,,A")!;
+    expect(fix.utcMs).toBe(Date.UTC(2026, 0, 1, 12, 0, 0, 250));
+  });
+
+  it("maps two-digit RMC years into 2000–2099 (century handling)", () => {
+    expect(parseSentence("$GPRMC,000000.00,A,,,,,0.0,,010100,,,A")!.utcMs).toBe(
+      Date.UTC(2000, 0, 1),
+    );
+    expect(parseSentence("$GPRMC,235959.00,A,,,,,0.0,,311299,,,A")!.utcMs).toBe(
+      Date.UTC(2099, 11, 31, 23, 59, 59),
+    );
+  });
+
+  it("still parses utcMs from a void RMC (validity gating is the consumer's job)", () => {
+    const fix = parseSentence(RMC_VOID)!;
+    expect(fix.valid).toBe(false);
+    expect(fix.utcMs).toBe(Date.UTC(2026, 5, 13, 8, 37, 46));
+  });
+
+  it("leaves utcMs undefined when the RMC date is missing or malformed", () => {
+    expect(parseSentence("$GPRMC,083745.000,A,,,,,0.0,,,,,A")!.utcMs).toBeUndefined();
+    // Month 13 / hour 24: field-slot corruption must not mint a bogus time.
+    expect(parseSentence("$GPRMC,083745.000,A,,,,,0.0,,011326,,,A")!.utcMs).toBeUndefined();
+    expect(parseSentence("$GPRMC,240000.00,A,,,,,0.0,,010126,,,A")!.utcMs).toBeUndefined();
+  });
+
   it("parses GSA fix type and hdop", () => {
     const fix = parseSentence(GSA_3D)!;
     expect(fix.fixType).toBe(3);

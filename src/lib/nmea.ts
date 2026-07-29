@@ -36,6 +36,16 @@ export interface GpsFix {
   valid?: boolean;
   /** UTC time HH:MM:SS as reported. */
   utcTime?: string;
+  /**
+   * Full UTC date+time from RMC (time-of-day + ddmmyy date fields) as epoch
+   * milliseconds — the offline clock-step source (optimize-system-process-cycle
+   * plan, Phase 4). GGA alone can't provide this (no date field). NMEA years
+   * are two-digit; they map to 2000–2099 (GNSS won't report pre-2000 dates,
+   * and the consumer's plausibility bounds reject anything outside its own
+   * window anyway). Present on every RMC that carries both fields, valid fix
+   * or not — gating on fix validity is the consumer's job.
+   */
+  utcMs?: number;
   /** GSA fix type: 1 = none, 2 = 2D, 3 = 3D. */
   fixType?: number;
   /** Horizontal dilution of precision (GSA); lower = tighter geometry. */
@@ -61,6 +71,25 @@ function nmeaCoordToDecimal(value: string, hemisphere: string): number | undefin
 function formatUtc(raw: string): string | undefined {
   if (!raw || raw.length < 6) return undefined;
   return `${raw.slice(0, 2)}:${raw.slice(2, 4)}:${raw.slice(4, 6)}`;
+}
+
+/**
+ * RMC hhmmss[.sss] time + ddmmyy date → UTC epoch ms, or undefined when either
+ * field is missing/malformed. Two-digit years map to 2000+yy (see GpsFix.utcMs).
+ */
+function parseRmcUtcMs(time: string, date: string): number | undefined {
+  if (!time || time.length < 6 || !date || date.length !== 6) return undefined;
+  const hh = Number(time.slice(0, 2));
+  const mi = Number(time.slice(2, 4));
+  const ss = Number(time.slice(4)); // seconds incl. optional fraction
+  const dd = Number(date.slice(0, 2));
+  const mo = Number(date.slice(2, 4));
+  const yy = Number(date.slice(4, 6));
+  if ([hh, mi, ss, dd, mo, yy].some(Number.isNaN)) return undefined;
+  // Bounds catch field-slot corruption (e.g. a coordinate landing in the date
+  // slot). ss < 61 tolerates a leap second.
+  if (hh > 23 || mi > 59 || ss >= 61 || dd < 1 || dd > 31 || mo < 1 || mo > 12) return undefined;
+  return Date.UTC(2000 + yy, mo - 1, dd, hh, mi, 0) + Math.round(ss * 1000);
 }
 
 /** Verify the `*HH` checksum when present; tolerate sentences without one. */
@@ -104,6 +133,7 @@ export function parseSentence(line: string): Partial<GpsFix> | null {
     const course = fields[8] ? parseFloat(fields[8]) : NaN;
     return {
       utcTime: formatUtc(fields[1]),
+      utcMs: parseRmcUtcMs(fields[1], fields[9]),
       valid: fields[2] === "A",
       latitude: nmeaCoordToDecimal(fields[3], fields[4]),
       longitude: nmeaCoordToDecimal(fields[5], fields[6]),

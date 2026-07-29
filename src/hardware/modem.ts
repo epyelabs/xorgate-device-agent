@@ -77,6 +77,16 @@ export interface ModemTelemetry {
   ip: string | null;
   /** Modem PMU temperature in °C (AT+CPMUTEMP), or null/absent when never read. */
   modem_temp?: number | null;
+  /**
+   * Modem clock export for the offline NITZ clock step (Phase 4): the raw
+   * AT+CCLK? value ("yy/MM/dd,hh:mm:ss±zz", local time + zone in quarter
+   * hours) and the daemon-clock epoch seconds at the instant it was read.
+   * Consumers compute the clock offset as parse(cclk) − read_at·1000 — both
+   * sides captured at the same instant, so the device clock's own error
+   * cancels out. Absent/null on daemons predating Phase 4 or before the
+   * first successful read.
+   */
+  modem_clock?: { cclk: string; read_at: number } | null;
   /** GNSS observability (absent on daemons predating the lte_gnss_recovery plan). */
   gnss?: ModemGnssTelemetry;
   /** Recovery observability (absent on daemons predating the lte_gnss_recovery plan). */

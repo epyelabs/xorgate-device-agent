@@ -2,7 +2,7 @@ import type { TelemetryReading } from "../telemetry.js";
 import type { MediaConfig } from "../config.js";
 import type { PowerSampleReading } from "../../recording/boot-policy.js";
 import { createImuCollector } from "./imu.js";
-import { createGpsCollector } from "./gps.js";
+import { createGpsCollector, type GpsClockReading } from "./gps.js";
 import { createLteCollector } from "./lte.js";
 import { createSystemCollector } from "./system.js";
 import { createMediaCollector, type MediaSupervisor } from "./media.js";
@@ -65,11 +65,18 @@ export function createCollector(
    * null when the system group is off or vcgencmd is unavailable (dev box).
    */
   samplePower(): Promise<PowerSampleReading | null>;
+  /**
+   * Latest fresh GPS UTC time for the offline clock stepper (Phase 4), from
+   * the gps collector's NMEA stream (which it keeps open). null when the gps
+   * capability is off or no fresh RMC time exists.
+   */
+  gpsClock(): GpsClockReading | null;
 } {
   const collectors: Collector[] = [];
   const system = ioCapabilities.system ? createSystemCollector() : null;
+  const gps = ioCapabilities.comm?.gps ? createGpsCollector() : null;
   if (ioCapabilities.sensors?.imu) collectors.push(createImuCollector());
-  if (ioCapabilities.comm?.gps) collectors.push(createGpsCollector());
+  if (gps) collectors.push(gps);
   if (ioCapabilities.comm?.signal) collectors.push(createLteCollector());
   if (system) collectors.push(system);
 
@@ -126,6 +133,9 @@ export function createCollector(
       } catch {
         return null;
       }
+    },
+    gpsClock(): GpsClockReading | null {
+      return gps?.clock() ?? null;
     },
   };
 }

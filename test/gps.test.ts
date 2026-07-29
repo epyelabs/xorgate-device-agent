@@ -100,6 +100,31 @@ describe("createGpsCollector", () => {
     }
   });
 
+  it("exposes a fresh RMC UTC time via clock() (Phase 4 clock-step source)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xorgate-gps-"));
+    const file = join(dir, "nmea.txt");
+    await writeFile(file, NMEA);
+
+    vi.stubEnv("GPS_NMEA_PORT", file);
+    vi.resetModules();
+    const { createGpsCollector } = await import("../src/agent/collectors/gps.js");
+    const collector = createGpsCollector();
+
+    // clock() alone must sustain the stream (no read()/sample() needed).
+    let reading = collector.clock();
+    for (let i = 0; i < 50 && reading === null; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      reading = collector.clock();
+    }
+    // Fixture RMC: 083745.000 on 130626, valid.
+    expect(reading?.utcMs).toBe(Date.UTC(2026, 5, 13, 8, 37, 45));
+    expect(reading?.valid).toBe(true);
+    expect(reading!.ageMs).toBeGreaterThanOrEqual(0);
+    expect(reading!.ageMs).toBeLessThan(5_000);
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("drops the stale position (not the group) after the lock is lost", async () => {
     const dir = await mkdtemp(join(tmpdir(), "xorgate-gps-"));
     const file = join(dir, "nmea.txt");

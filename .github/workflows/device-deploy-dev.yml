@@ -30,6 +30,7 @@ on:
       - "src/**"
       - "systemd/**"
       - "modem/**"
+      - "system/**"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/device-deploy-dev.yml"
@@ -76,7 +77,7 @@ jobs:
           # the install script provisions for LTE uplink + GPS;
           # `media/` ships the KVS WebRTC runtime binary (+ user-supplied .so libs
           # under media/lib) the media collector supervises.
-          tar -czf "$TARBALL" dist package.json package-lock.json systemd python modem media
+          tar -czf "$TARBALL" dist package.json package-lock.json systemd python modem media system
           echo "Contents:"
           tar -tzf "$TARBALL" | head -30
           # install.sh extracts to /opt/xorgate and expects these entries.

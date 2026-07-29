@@ -13,6 +13,10 @@
  */
 import { loadConfig } from "./agent/config.js";
 import { applyCloudConfig, parseCloudConfig } from "./agent/cloud-config.js";
+import { createClockStepper, resolveTimeSyncConfig } from "./agent/clock-step.js";
+import type { GpsClockReading } from "./agent/collectors/gps.js";
+import { createTimeSourceTracker } from "./recording/session.js";
+import { loadSettings } from "./daemon/settings.js";
 import {
   claimCommand,
   executeCommand,
@@ -54,6 +58,7 @@ const source: {
   restartMediaChannel?: (streamKey: string) => void;
   setLiveShed?: (shed: boolean) => void;
   samplePower?: () => Promise<PowerSampleReading | null>;
+  gpsClock?: () => GpsClockReading | null;
 } =
   config.mode === "real"
     ? createCollector(
@@ -159,10 +164,16 @@ function buildUploadOptions(): RecordingUploadOptions | undefined {
   };
 }
 
+// Shared time-provenance tracker: the recording manager stamps sessions and
+// sidecars from it, and the offline clock stepper (Phase 4) feeds GPS/NITZ
+// steps into it so post-step segments carry the honest "gps"/"nitz" value.
+const timeSource = createTimeSourceTracker();
+
 // On-device recording (offline telemetry plan, Phase 1). Runs independently of
 // MQTT connectivity — its own sampling interval, applied live from settings.json.
 const recording = new RecordingManager({
   deviceId: config.deviceId,
+  timeSource,
   upload: buildUploadOptions(),
   // Video capture (Phase 3): only bridged streams are eligible — a stream
   // whose .gst still owns its camera directly is left to the KVS master
@@ -199,6 +210,31 @@ const recording = new RecordingManager({
 // Awaited: the bounded (≤2 s) time-source probe inside start() must land
 // before the first capture spawn so first sessions aren't stamped "unsynced".
 await recording.start();
+
+// Offline clock stepper (Phase 4): while NTP is unsynced this boot, step the
+// wall clock from GPS (preferred) or the modem's NITZ clock, then persist to
+// RTC/fake-hwclock via the sudo helper. Self-disarms once NTP syncs; the
+// timeSync.offlineSources setting is the kill switch. Real mode only — the
+// simulator has no GPS/modem, and a dev box must never have its clock touched.
+if (config.mode === "real") {
+  const clockStepper = createClockStepper({
+    config: () => resolveTimeSyncConfig(loadSettings().timeSync),
+    gpsClock: () => source.gpsClock?.() ?? null,
+    onStepped: (stepSource) => {
+      // Stamp future segment finalizations honestly; kick a probe so the
+      // cached value stays coherent if NTP happens to land at the same time.
+      timeSource.noteStep(stepSource);
+      void timeSource.refresh().catch(() => {});
+    },
+    onEvent: (level, msg) => {
+      const t = Date.now();
+      console[level === "warn" ? "warn" : "log"](`[agent] ${msg}`);
+      store.event(level, msg, t);
+      store.flush(t, true);
+    },
+  });
+  clockStepper.start();
+}
 
 let seq = 0;
 let shuttingDown = false;

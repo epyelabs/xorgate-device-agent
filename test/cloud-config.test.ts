@@ -182,4 +182,28 @@ describe("applyCloudConfig", () => {
     expect(loadSettings().lteRecovery).toBeUndefined();
     expect(applyCloudConfig({ lteRecovery: null })).toEqual({ changed: false });
   });
+
+  it("replaces the timeSync namespace with the cloud value (Phase 4 kill-switch conduit)", () => {
+    saveSettings({ mode: "real", timeSync: { stepThresholdSecs: 30 } });
+    expect(applyCloudConfig({ timeSync: { offlineSources: false } })).toEqual({ changed: true });
+    // REPLACE, not merge: the locally-set threshold is gone, cloud is authoritative.
+    expect(loadSettings()).toEqual({ mode: "real", timeSync: { offlineSources: false } });
+    expect(applyCloudConfig({ timeSync: { offlineSources: false } })).toEqual({ changed: false });
+    // null clears; absent leaves alone.
+    expect(applyCloudConfig({ timeSync: null })).toEqual({ changed: true });
+    expect(loadSettings().timeSync).toBeUndefined();
+    expect(applyCloudConfig({})).toEqual({ changed: false });
+  });
+
+  it("parses a timeSync namespace (clamped numbers; all-invalid → null)", () => {
+    expect(
+      parseCloudConfig(
+        JSON.stringify({ v: 1, timeSync: { offlineSources: true, stepThresholdSecs: 1 } }),
+      ),
+    ).toEqual({ timeSync: { offlineSources: true, stepThresholdSecs: 2 } });
+    expect(parseCloudConfig(JSON.stringify({ v: 1, timeSync: { offlineSources: "yes" } }))).toEqual(
+      { timeSync: null },
+    );
+    expect(parseCloudConfig(JSON.stringify({ v: 1, timeSync: [] }))).toEqual({});
+  });
 });

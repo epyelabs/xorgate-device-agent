@@ -59,6 +59,8 @@ export function createCollector(
   restartMediaChannel(streamKey: string): void;
   /** Park/release the live KVS masters (load shedding rung 1 — see MediaSupervisor). */
   setLiveShed(shed: boolean): void;
+  /** Hold down the masters of cameras disabled in settings (Phase 6 per-camera capacity). */
+  setDisabledStreams(streamKeys: readonly string[]): void;
   /**
    * Power reading for the shed policy, from the system collector's 1 Hz sample
    * cache (shared with the telemetry recorder — no extra vcgencmd poller).
@@ -121,6 +123,9 @@ export function createCollector(
     },
     setLiveShed(shed: boolean): void {
       media?.setShed(shed);
+    },
+    setDisabledStreams(streamKeys: readonly string[]): void {
+      media?.setDisabledStreams(streamKeys);
     },
     async samplePower(): Promise<PowerSampleReading | null> {
       if (!system?.sample) return null;

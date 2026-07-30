@@ -108,6 +108,14 @@ export interface RecordingVideoOptions {
    * down until released. Absent on hosts without live streaming.
    */
   setLiveShed?: (shed: boolean) => void;
+  /**
+   * Per-camera capacity (Phase 6): stream keys the operator turned OFF via
+   * `recording.video.cameras`. The worker parks those KVS masters so a
+   * disabled camera has no pipeline anywhere — not even live streaming (which
+   * would otherwise keep the sensor and an encoder alive). Absent on hosts
+   * without live streaming.
+   */
+  setDisabledCameras?: (streamKeys: string[]) => void;
   /** Overrides for tests. */
   shmDir?: string;
   spawn?: CaptureSpawn;
@@ -164,7 +172,12 @@ export class RecordingManager {
   private disk: DiskManager | null = null;
   private uploader: Uploader | null = null;
   private videoCapture: VideoCaptureSupervisor | null = null;
+  /** Effective video tuple EXCLUDING the camera set (a change replaces the supervisor). */
   private videoKey = "";
+  /** Effective camera set (a change alone is applied in place — see applyVideo). */
+  private videoCamerasKey = "";
+  /** Last disabled-camera set published to the live-stream supervisor (dedupe key). */
+  private disabledCamerasKey = "";
   /** Boot power staging (Phase 2): may heavy encoders start yet? */
   private readonly bootPolicy: BootDeferPolicy;
   /** Last boot-defer status string that was logged/published (dedupe key). */
@@ -314,6 +327,7 @@ export class RecordingManager {
     this.videoCapture?.stop();
     this.videoCapture = null;
     this.videoKey = "";
+    this.videoCamerasKey = "";
   }
 
   /** Video state for the worker's media block + state.json. */
@@ -383,7 +397,28 @@ export class RecordingManager {
   private applyVideo(): void {
     const vo = this.opts.video;
     if (!vo) return;
-    const cameras = vo.mediaEnabled ? vo.cameras() : [];
+    // Per-camera capacity (Phase 6): an explicitly disabled camera gets NO
+    // pipeline at all. Recording/bridge is dropped here; the live KVS master is
+    // parked through the worker (the settings map is authoritative even for a
+    // stream whose .gst is still direct — nothing about it should be running).
+    const disabled = Object.entries(this.cfg.video.cameras)
+      .filter(([, on]) => on === false)
+      .map(([streamKey]) => streamKey)
+      .sort();
+    const disabledKey = disabled.join(",");
+    if (disabledKey !== this.disabledCamerasKey) {
+      this.disabledCamerasKey = disabledKey;
+      vo.setDisabledCameras?.(disabled);
+      if (disabled.length > 0) {
+        this.opts.onEvent?.(
+          "info",
+          `camera(s) disabled by settings: ${disabled.join(", ")} — no capture, bridge or live stream`,
+        );
+      }
+    }
+    const cameras = (vo.mediaEnabled ? vo.cameras() : []).filter(
+      (c) => this.cfg.video.cameras[c.streamKey] !== false,
+    );
     // Runtime undervoltage shedding (Phase 3): armed only while a bridged
     // camera exists (the heavy-load case this protects); null = feature inert,
     // behave exactly as today.
@@ -413,35 +448,49 @@ export class RecordingManager {
     if (record && shed !== null && shed.level >= 2) record = false;
     const preset = resolveVideoPreset(this.cfg.video.preset);
     const key = JSON.stringify({
-      cameras,
       record,
       preset: preset.name,
       seg: this.cfg.video.segmentSeconds,
       stagger: this.cfg.video.spawnStaggerSecs,
     });
-    if (key === this.videoKey) return;
+    const camerasKey = JSON.stringify(cameras);
+    if (key === this.videoKey && camerasKey === this.videoCamerasKey) return;
+    const shapeChanged = key !== this.videoKey;
     this.videoKey = key;
+    this.videoCamerasKey = camerasKey;
 
-    const prev = this.videoCapture;
-    this.videoCapture = null;
     if (cameras.length === 0) {
+      const prev = this.videoCapture;
+      this.videoCapture = null;
       if (prev) this.videoTransition = this.videoTransition.then(() => prev.stopAndWait());
       if (record) {
         this.opts.onEvent?.(
           "warn",
           "recording.video.enabled is on but no bridged camera is available " +
-            "(media off, or no `xorgate pipeline bridge <streamKey>` run) — video recording idle",
+            "(media off, every camera disabled, or no `xorgate pipeline bridge <streamKey>` run) " +
+            "— video recording idle",
         );
       }
       return;
     }
     if (record) this.ensureDisk();
+    // Camera-set-only change: apply it IN PLACE so enabling/disabling one
+    // camera never ends the other camera's session.
+    if (!shapeChanged && this.videoCapture) {
+      const live = this.videoCapture;
+      this.videoTransition = this.videoTransition.then(() => live.setCameras(cameras));
+      return;
+    }
+
+    const prev = this.videoCapture;
+    this.videoCapture = null;
     // Serialize the handover: the old children MUST be gone before the new
     // ones bind the shm sockets (an exiting shmsink unlinks its socket path,
     // which would tear the fresh one down — hardware-verified race).
     this.videoTransition = this.videoTransition.then(async () => {
       if (prev) await prev.stopAndWait();
-      if (this.videoKey !== key) return; // superseded by a newer config change
+      // Superseded by a newer config/camera change while we were stopping.
+      if (this.videoKey !== key || this.videoCamerasKey !== camerasKey) return;
       this.startVideo(cameras, record, preset);
     });
   }

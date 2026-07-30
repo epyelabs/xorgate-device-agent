@@ -31,6 +31,8 @@ const PARKED_RETRY_MS = 60_000; // parked channels re-attempt this often instead
 interface ChannelSupervisor {
   streamKey: string;
   channelName: string;
+  /** Camera turned off by `recording.video.cameras` — held down like a shed. */
+  disabled: boolean;
   state: MediaStream["state"];
   handle: StreamHandle | null;
   startedAt: number;
@@ -61,6 +63,15 @@ export interface MediaSupervisor {
    * Reversible, unlike stop().
    */
   setShed(shed: boolean): void;
+  /**
+   * Per-camera capacity (optimize-system-process-cycle plan, Phase 6): stream
+   * keys whose camera the operator turned off in `recording.video.cameras`.
+   * Those masters are parked (SIGINT, no respawn) so a disabled camera has no
+   * pipeline at all — the sensor path stays cold instead of feeding a live
+   * encoder nobody asked for. Every other channel is unaffected. Remembered
+   * even when called before the runtime has started (lazy first read).
+   */
+  setDisabledStreams(streamKeys: readonly string[]): void;
 }
 
 const IDLE: TelemetryMedia = {
@@ -74,6 +85,8 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
   let stopped = false;
   /** Load-shedding park: while true, nothing spawns (see setShed). */
   let shed = false;
+  /** Per-camera park: stream keys disabled by settings (see setDisabledStreams). */
+  let disabledStreams = new Set<string>();
   let warned = false;
   let manifest: KvsManifest | null = null;
   const channels = new Map<string, ChannelSupervisor>();
@@ -124,7 +137,8 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
       channels.set(ch.channelName, {
         streamKey: ch.streamKey,
         channelName: ch.channelName,
-        state: shed ? "stopped" : "starting",
+        disabled: disabledStreams.has(ch.streamKey),
+        state: shed || disabledStreams.has(ch.streamKey) ? "stopped" : "starting",
         handle: null,
         startedAt: 0,
         backoffMs: BASE_BACKOFF_MS,
@@ -138,7 +152,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
 
   function spawn(channelName: string): void {
     const c = channels.get(channelName);
-    if (!c || stopped || shed || !manifest) return;
+    if (!c || stopped || shed || c.disabled || !manifest) return;
 
     // Each channel/camera gets its own pipeline: <pipelineDir>/<streamKey>.gst,
     // falling back to the global KVS_GST_PIPELINE, then the runtime's default.
@@ -202,7 +216,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
       c.stableTimer = null;
     }
     c.handle = null;
-    if (stopped || shed) {
+    if (stopped || shed || c.disabled) {
       c.state = "stopped";
       return;
     }
@@ -280,11 +294,36 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
       // Release: respawn everything from a clean slate (fresh backoff — the
       // previous exits were ours, not failures).
       for (const c of channels.values()) {
+        if (c.disabled) continue; // a disabled camera stays down, shed or not
         c.quickFailures = 0;
         c.backoffMs = BASE_BACKOFF_MS;
         if (!c.handle && !c.restartTimer) spawn(c.channelName);
       }
       if (channels.size > 0) console.log("[media] live masters released (power load shedding over)");
+    },
+    setDisabledStreams(streamKeys: readonly string[]): void {
+      if (stopped) return;
+      const next = new Set(streamKeys);
+      disabledStreams = next;
+      for (const c of channels.values()) {
+        const want = next.has(c.streamKey);
+        if (want === c.disabled) continue;
+        c.disabled = want;
+        if (want) {
+          if (c.stableTimer) clearTimeout(c.stableTimer);
+          if (c.restartTimer) clearTimeout(c.restartTimer);
+          c.stableTimer = null;
+          c.restartTimer = null;
+          c.state = "stopped";
+          c.handle?.stop("SIGINT");
+          console.warn(`[media ${c.channelName}] master stopped (camera disabled in settings)`);
+        } else {
+          c.quickFailures = 0;
+          c.backoffMs = BASE_BACKOFF_MS;
+          console.log(`[media ${c.channelName}] camera re-enabled in settings; starting master`);
+          if (!shed && !c.handle && !c.restartTimer) spawn(c.channelName);
+        }
+      }
     },
     restartChannel(streamKey: string): void {
       if (stopped || shed) return;

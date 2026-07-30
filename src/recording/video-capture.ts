@@ -255,6 +255,8 @@ export interface VideoCaptureOptions {
 interface CameraRun {
   cam: CaptureCamera;
   state: CaptureState;
+  /** Being removed by setCameras: stop cleanly, never respawn, then forget. */
+  retiring: boolean;
   handle: StreamHandle | null;
   sessionId: string | null;
   sessionDir: string | null;
@@ -286,12 +288,55 @@ export class VideoCaptureSupervisor {
 
   start(): void {
     mkdirSync(this.opts.shmDir, { recursive: true });
+    this.launch(this.opts.cameras);
+  }
+
+  /**
+   * Per-camera capacity changes (Phase 6): bring the running set to exactly
+   * `cameras` WITHOUT disturbing the cameras that stay. A removed camera is
+   * SIGINT-ed (EOS → its last fragment finalizes and sweeps like any clean
+   * stop) and forgotten; an added one spawns fresh. The manager uses this
+   * instead of replacing the supervisor so toggling cam1 never cuts cam0's
+   * session — everything else about the video tuple (preset, record, segment
+   * length) still means a full replacement.
+   */
+  async setCameras(cameras: readonly CaptureCamera[]): Promise<void> {
+    if (this.stopped) return;
+    mkdirSync(this.opts.shmDir, { recursive: true });
+    const wanted = new Map(cameras.map((c) => [c.streamKey, c]));
+    const retired: Promise<unknown>[] = [];
+    for (const [streamKey, run] of [...this.runs]) {
+      if (wanted.has(streamKey)) continue;
+      run.retiring = true;
+      if (run.stableTimer) clearTimeout(run.stableTimer);
+      if (run.restartTimer) clearTimeout(run.restartTimer);
+      run.stableTimer = null;
+      run.restartTimer = null;
+      this.stopWatching(run);
+      if (run.handle) {
+        // onExit finalizes + sweeps, then drops the run from the map.
+        retired.push(run.handle.done);
+        run.handle.stop("SIGINT");
+      } else {
+        this.finalSweep(run, true);
+        this.runs.delete(streamKey);
+      }
+      this.opts.onEvent?.("info", `video capture stopped: ${streamKey} (camera disabled)`);
+    }
+    this.launch(cameras.filter((c) => !this.runs.has(c.streamKey)));
+    this.opts.onStatus?.();
+    await Promise.all(retired);
+  }
+
+  /** Create + (staggered) spawn a set of runs. Shared by start() and setCameras(). */
+  private launch(cameras: readonly CaptureCamera[]): void {
     const staggerMs = this.opts.staggerMs ?? 0;
     let index = 0;
-    for (const cam of this.opts.cameras) {
+    for (const cam of cameras) {
       const run: CameraRun = {
         cam,
         state: "starting",
+        retiring: false,
         handle: null,
         sessionId: null,
         sessionDir: null,
@@ -391,7 +436,7 @@ export class VideoCaptureSupervisor {
 
   private spawn(streamKey: string): void {
     const run = this.runs.get(streamKey);
-    if (!run || this.stopped) return;
+    if (!run || this.stopped || run.retiring) return;
 
     let args: string[];
     if (this.opts.record) {
@@ -499,7 +544,7 @@ export class VideoCaptureSupervisor {
     // Close out whatever the child left: clean stop (EOS ran) → the last
     // fragment is finalized; crash → it may be truncated. Either way it gets a
     // sidecar; `finalized` records which case we believe we're in.
-    const cleanStop = this.stopped;
+    const cleanStop = this.stopped || run.retiring;
     this.finalSweep(run, cleanStop);
     const endedSession = run.sessionId;
     run.sessionId = null;
@@ -507,6 +552,14 @@ export class VideoCaptureSupervisor {
     run.manifest = null;
     this.opts.onActiveSegment?.(streamKey, null);
 
+    if (run.retiring) {
+      // Disabled camera (setCameras): its session is finalized and swept —
+      // drop it entirely so status() stops reporting a stream that has no
+      // pipeline at all.
+      this.runs.delete(streamKey);
+      this.opts.onStatus?.();
+      return;
+    }
     if (this.stopped) {
       run.state = "stopped";
       this.opts.onStatus?.();

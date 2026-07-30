@@ -24,6 +24,9 @@ function inputs(over: Partial<BootDeferInputs> = {}): BootDeferInputs {
     telemetry: { timestamp: new Date(now - 1000).toISOString(), status: "connecting", reg: 0 },
     nowMs: now,
     elapsedMs: 10_000,
+    // Freshly-rewritten file by default: the clock-step guard is exercised
+    // explicitly in its own cases below.
+    telemetryUnchangedMs: 0,
     staleMs: TELEMETRY_STALE_MS,
     ...over,
   };
@@ -106,12 +109,42 @@ describe("decideBootDefer", () => {
     expect(
       decideBootDefer(
         CFG,
-        inputs({ telemetry: { timestamp: staleTs, status: "connecting", reg: 0 } }),
+        inputs({
+          telemetry: { timestamp: staleTs, status: "connecting", reg: 0 },
+          telemetryUnchangedMs: TELEMETRY_STALE_MS + 5000,
+        }),
       ),
     ).toMatchObject({ allow: true, state: "released", why: "stale" });
     expect(
       decideBootDefer(CFG, inputs({ telemetry: { timestamp: 42, status: "connecting" } })),
     ).toMatchObject({ allow: true, why: "stale" });
+  });
+
+  it("a clock STEP cannot forge a dead daemon (Phase 6 monotonic guard)", () => {
+    // The iteration-1 field case: the wall clock jumped decades forward, so
+    // telemetry.json's stamp reads ancient — but the daemon is alive and keeps
+    // rewriting it, which the monotonic arm sees.
+    const now = inputs().nowMs;
+    const ancient = new Date(now - 53 * 365 * 24 * 3600_000).toISOString();
+    expect(
+      decideBootDefer(
+        CFG,
+        inputs({
+          telemetry: { timestamp: ancient, status: "connecting", reg: 0 },
+          telemetryUnchangedMs: 2_000,
+        }),
+      ),
+    ).toMatchObject({ allow: false, state: "deferring" });
+    // Same file, now genuinely stagnant → the daemon really is gone.
+    expect(
+      decideBootDefer(
+        CFG,
+        inputs({
+          telemetry: { timestamp: ancient, status: "connecting", reg: 0 },
+          telemetryUnchangedMs: TELEMETRY_STALE_MS + 1,
+        }),
+      ),
+    ).toMatchObject({ allow: true, state: "released", why: "stale" });
   });
 
   it("missing file gets the stale grace window, then fails open", () => {
@@ -172,7 +205,12 @@ describe("BootDeferPolicy", () => {
       status: "connecting",
       reg: 0,
     });
-    const policy = new BootDeferPolicy({ telemetryFile, budgetPath, now: () => now });
+    const policy = new BootDeferPolicy({
+      telemetryFile,
+      budgetPath,
+      now: () => now,
+      monoMs: () => now,
+    });
 
     expect(policy.evaluate(CFG).allow).toBe(false);
     expect(policy.statusString()).toBe("deferring");
@@ -205,6 +243,7 @@ describe("BootDeferPolicy", () => {
       telemetryFile,
       budgetPath: join(dir, "absent"),
       now: () => now,
+      monoMs: () => now,
     });
     expect(policy.evaluate(CFG).allow).toBe(false);
     // ...and the missing-file grace still fails open at the stale window.
@@ -227,6 +266,7 @@ describe("LoadShedPolicy (Phase 3 runtime undervoltage shedding)", () => {
     railLowVolts: 4.85,
     railLowSecs: 15,
     escalateDwellSecs: 60,
+    escalateDutyPct: 70,
     restoreSecs: 120,
     railRestoreVolts: 4.95,
     maxShedsPerHour: 4,
@@ -235,7 +275,7 @@ describe("LoadShedPolicy (Phase 3 runtime undervoltage shedding)", () => {
   /** Fake-clocked policy + a tick() that mimics the manager's 1 Hz loop. */
   function makePolicy() {
     const clock = { now: 0 };
-    const policy = new LoadShedPolicy({ now: () => clock.now });
+    const policy = new LoadShedPolicy({ monoMs: () => clock.now });
     const tick = (secs: number, reading: PowerSampleReading, cfg: ShedConfig = CFG) => {
       let last!: ShedVerdict;
       const events: string[] = [];
@@ -311,14 +351,85 @@ describe("LoadShedPolicy (Phase 3 runtime undervoltage shedding)", () => {
     expect(policy.statusString()).toBe("bridge-only");
   });
 
-  it("a trigger break resets the escalation dwell", () => {
+  it("a mostly-clean rung does not escalate (duty stays under the threshold)", () => {
     const { tick } = makePolicy();
     tick(3, { uv: true, railV: 5.0 }); // shed
     tick(35, { uv: false, railV: 5.0 }); // trigger drops (UV ages out), <120 s so no restore
     let r = tick(3, { uv: true, railV: 5.0 }); // trigger returns
-    expect(r.last.level).toBe(1); // still rung 1 — dwell restarted
-    r = tick(61, { uv: true, railV: 5.0 });
+    expect(r.last.level).toBe(1);
+    // 60 s after the shed the trailing window is only ~⅓ triggered — under 70 %.
+    r = tick(20, { uv: true, railV: 5.0 });
+    expect(r.last.level).toBe(1);
+    // Once the dirty stretch dominates the window again, it escalates.
+    r = tick(30, { uv: true, railV: 5.0 });
     expect(r.last.level).toBe(2);
+  });
+
+  /**
+   * The Phase 6 safety fix, against the 2026-07-30 field evidence: rung 1
+   * engaged and the device crashed 13 min later without ever escalating,
+   * because the rail bounced back over the threshold every few seconds
+   * (recorded 1 Hz samples: ~74 % of samples low, longest UNBROKEN low run
+   * 40 s < the 60 s continuous dwell, peaks to 4.96 V so no threshold makes it
+   * continuous). This trace reproduces those statistics.
+   */
+  function bouncingRailTrace(): PowerSampleReading[] {
+    const LOW = { uv: false, railV: 4.78 }; // below railLowVolts
+    const HIGH = { uv: false, railV: 4.93 }; // bounces back above it
+    const out: PowerSampleReading[] = [];
+    for (const [low, high] of [
+      [40, 11],
+      [30, 11],
+      [23, 10],
+    ] as const) {
+      for (let i = 0; i < low; i++) out.push(LOW);
+      for (let i = 0; i < high; i++) out.push(HIGH);
+    }
+    return out; // 125 samples: 93 low (74 %), longest unbroken low run 40 s
+  }
+
+  it("escalates on a BOUNCING rail (duty cycle) — the iteration-2 crash case", () => {
+    const { policy, tick } = makePolicy();
+    // Rung 1 the way the field drive got there: sustained low past railLowSecs.
+    const shed = tick(16, { uv: false, railV: 4.78 });
+    expect(shed.last.level).toBe(1);
+
+    let level = 1;
+    for (const s of bouncingRailTrace()) {
+      const r = tick(1, s);
+      level = r.last.level;
+      if (level === 2) break;
+    }
+    expect(level).toBe(2);
+    expect(policy.statusString()).toBe("bridge-only");
+  });
+
+  it("escalateDutyPct=100 reproduces the old continuous-dwell semantics", () => {
+    const strict: ShedConfig = { ...CFG, escalateDutyPct: 100 };
+
+    // Same bouncing rail: never escalates, exactly as the field observed.
+    const bouncing = makePolicy();
+    bouncing.tick(16, { uv: false, railV: 4.78 }, strict);
+    for (const s of bouncingRailTrace()) bouncing.tick(1, s, strict);
+    expect(bouncing.policy.statusString()).toBe("no-live");
+
+    // A genuinely continuous trigger still escalates at the dwell.
+    const steady = makePolicy();
+    expect(steady.tick(16, { uv: false, railV: 4.78 }, strict).last.level).toBe(1);
+    expect(steady.tick(59, { uv: false, railV: 4.78 }, strict).last.level).toBe(1);
+    expect(steady.tick(2, { uv: false, railV: 4.78 }, strict).last.level).toBe(2);
+  });
+
+  it("a rung is always observed for a full window before the next one engages", () => {
+    // Even a trigger that has been continuously true for ten minutes cannot
+    // skip a rung: the duty window is anchored on the rung change.
+    const { tick } = makePolicy();
+    const r = tick(600, { uv: false, railV: 4.7 });
+    expect(r.last.level).toBe(2);
+    // rung 1 at ~t=15, rung 2 no earlier than t=75.
+    const events = r.events.filter((m) => m.includes("power shed →"));
+    expect(events).toHaveLength(2);
+    expect(events[1]).toContain("triggered 100% of the last 60s");
   });
 
   it("restores one rung per clean interval; a sub-restore rail blocks it", () => {

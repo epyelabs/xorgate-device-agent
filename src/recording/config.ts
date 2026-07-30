@@ -20,6 +20,13 @@ export interface ResolvedRecordingConfig {
     bootDeferMaxSecs: number;
     bootDeferMinBudgetMa: number;
     spawnStaggerSecs: number;
+    /**
+     * Per-camera enable (Phase 6), keyed by streamKey. ABSENT KEY = ENABLED,
+     * so `{}` (the default) means "every detected camera", and a camera added
+     * to the manifest later is on without a config change. Only an explicit
+     * `false` turns a camera off — and then it gets no pipeline at all.
+     */
+    cameras: Record<string, boolean>;
   };
   upload: { mode: "auto" | "off" };
   retention: { maxBytes: number; minFreeBytes: number };
@@ -37,6 +44,7 @@ export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
     bootDeferMaxSecs: 90,
     bootDeferMinBudgetMa: 5000,
     spawnStaggerSecs: 4,
+    cameras: {},
   },
   upload: { mode: "auto" },
   retention: { maxBytes: 10 * 1024 ** 3, minFreeBytes: 2 * 1024 ** 3 },
@@ -48,6 +56,7 @@ export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
     railLowVolts: 4.85,
     railLowSecs: 15,
     escalateDwellSecs: 60,
+    escalateDutyPct: 70,
     restoreSecs: 120,
     railRestoreVolts: 4.95,
     maxShedsPerHour: 4,
@@ -69,6 +78,7 @@ export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecording
       bootDeferMaxSecs: s?.video?.bootDeferMaxSecs ?? d.video.bootDeferMaxSecs,
       bootDeferMinBudgetMa: s?.video?.bootDeferMinBudgetMa ?? d.video.bootDeferMinBudgetMa,
       spawnStaggerSecs: s?.video?.spawnStaggerSecs ?? d.video.spawnStaggerSecs,
+      cameras: s?.video?.cameras ?? d.video.cameras,
     },
     upload: { mode: s?.upload?.mode ?? d.upload.mode },
     retention: {
@@ -82,6 +92,7 @@ export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecording
       railLowVolts: s?.powerShedding?.railLowVolts ?? d.powerShedding.railLowVolts,
       railLowSecs: s?.powerShedding?.railLowSecs ?? d.powerShedding.railLowSecs,
       escalateDwellSecs: s?.powerShedding?.escalateDwellSecs ?? d.powerShedding.escalateDwellSecs,
+      escalateDutyPct: s?.powerShedding?.escalateDutyPct ?? d.powerShedding.escalateDutyPct,
       restoreSecs: s?.powerShedding?.restoreSecs ?? d.powerShedding.restoreSecs,
       railRestoreVolts: s?.powerShedding?.railRestoreVolts ?? d.powerShedding.railRestoreVolts,
       maxShedsPerHour: s?.powerShedding?.maxShedsPerHour ?? d.powerShedding.maxShedsPerHour,

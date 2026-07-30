@@ -29,9 +29,24 @@
  *
  * Everything fails open: unreadable budget arms the defer (the cap still
  * bounds it), unreadable/stale telemetry releases it.
+ *
+ * TIME (Phase 6, 2026-07-30): every INTERVAL in this module is measured on a
+ * monotonic clock. Wall-clock interval math is a field-proven hazard here — a
+ * device that boots from a stale fake-hwclock and then gets an NTP (or GPS/NITZ)
+ * step forward saw its boot-defer timers "expire" instantly (iteration 1: a
+ * +53 y step made the defer release `timeout` at real +33 s and `stale` at real
+ * +64 s). Wall clock is used for exactly one thing: comparing telemetry.json's
+ * own wall-clock stamp, and even there the staleness verdict additionally
+ * requires that the file stopped CHANGING for the stale window (measured
+ * monotonically), so a clock step can no longer forge a dead daemon.
  */
 import { readFileSync } from "node:fs";
 import { LTE_TELEMETRY_FILE } from "../hardware/modem.js";
+
+/** Monotonic milliseconds (never steps; see the TIME note above). */
+export function monotonicMs(): number {
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
 
 /** Arming mode for the boot defer (device setting `recording.video.bootDefer`). */
 export type BootDeferMode = "auto" | "always" | "off";
@@ -77,10 +92,16 @@ export interface BootDeferInputs {
   budgetMa: number | null;
   /** Parsed telemetry.json; null = file missing or unparseable. */
   telemetry: PolicyTelemetry | null;
-  /** Wall clock (for telemetry.json age). */
+  /** Wall clock (for telemetry.json's own wall-clock stamp). */
   nowMs: number;
-  /** Time since the policy started watching (missing-file grace + hard cap). */
+  /** MONOTONIC time since the policy started watching (missing-file grace + hard cap). */
   elapsedMs: number;
+  /**
+   * MONOTONIC time since telemetry.json's `timestamp` last CHANGED (null = no
+   * file / never seen a stamp). The clock-step guard: a daemon that keeps
+   * rewriting the file is alive no matter what the wall clock claims.
+   */
+  telemetryUnchangedMs: number | null;
   staleMs: number;
 }
 
@@ -101,8 +122,15 @@ export function decideBootDefer(cfg: BootDeferConfig, input: BootDeferInputs): B
   if (t !== null) {
     // Freshness first only for the DEAD-daemon shape (old timestamp while the
     // status still claims activity); a terminal status wins either way.
+    // "Old" needs BOTH arms: the stamp reads old in wall-clock terms AND the
+    // file has not been rewritten for the stale window (monotonic). A clock
+    // step forward trips only the first arm, so it can no longer forge a dead
+    // daemon; a genuinely dead daemon trips both within the same window.
     const ts = typeof t.timestamp === "string" ? Date.parse(t.timestamp) : NaN;
-    const stale = !Number.isFinite(ts) || input.nowMs - ts > input.staleMs;
+    const stale =
+      !Number.isFinite(ts) ||
+      (input.nowMs - ts > input.staleMs &&
+        (input.telemetryUnchangedMs ?? Number.POSITIVE_INFINITY) > input.staleMs);
     if (t.status === "connected" || t.status === "dead_zone") {
       return { allow: true, state: "released", why: t.status };
     }
@@ -132,7 +160,10 @@ export interface BootDeferPolicyOptions {
   telemetryFile?: string;
   budgetPath?: string;
   staleMs?: number;
+  /** Wall clock — telemetry.json's own stamp only. */
   now?: () => number;
+  /** Monotonic clock — every interval (grace window, hard cap, file freshness). */
+  monoMs?: () => number;
 }
 
 /**
@@ -146,9 +177,13 @@ export class BootDeferPolicy {
   private readonly budgetPath: string;
   private readonly staleMs: number;
   private readonly now: () => number;
-  private readonly startMs: number;
+  private readonly monoMs: () => number;
+  private readonly startMono: number;
   /** undefined = not read yet; null = unreadable (non-Pi / dev box). */
   private budgetMa: number | null | undefined;
+  /** Last telemetry.json stamp seen + when (monotonic) it changed to that value. */
+  private lastStamp: string | null | undefined;
+  private lastStampMono = 0;
   private latched: BootDeferVerdict | null = null;
   private last: BootDeferVerdict | null = null;
 
@@ -157,7 +192,8 @@ export class BootDeferPolicy {
     this.budgetPath = opts.budgetPath ?? MAX_CURRENT_PATH;
     this.staleMs = opts.staleMs ?? TELEMETRY_STALE_MS;
     this.now = opts.now ?? Date.now;
-    this.startMs = this.now();
+    this.monoMs = opts.monoMs ?? monotonicMs;
+    this.startMono = this.monoMs();
   }
 
   /**
@@ -167,16 +203,37 @@ export class BootDeferPolicy {
   evaluate(cfg: BootDeferConfig): BootDeferVerdict {
     if (this.latched) return this.latched;
     if (this.budgetMa === undefined) this.budgetMa = this.readBudgetMa();
+    const mono = this.monoMs();
+    const telemetry = this.readTelemetry();
     const verdict = decideBootDefer(cfg, {
       budgetMa: this.budgetMa,
-      telemetry: this.readTelemetry(),
+      telemetry,
       nowMs: this.now(),
-      elapsedMs: this.now() - this.startMs,
+      elapsedMs: mono - this.startMono,
+      telemetryUnchangedMs: this.noteStamp(telemetry, mono),
       staleMs: this.staleMs,
     });
     this.last = verdict;
     if (verdict.allow) this.latched = verdict;
     return verdict;
+  }
+
+  /**
+   * Track how long (monotonically) telemetry.json has carried the SAME stamp.
+   * A file we have only just started watching counts as fresh — same grace the
+   * missing-file path gets, and the hard cap still bounds it.
+   */
+  private noteStamp(t: PolicyTelemetry | null, mono: number): number | null {
+    if (t === null) {
+      this.lastStamp = undefined;
+      return null;
+    }
+    const stamp = typeof t.timestamp === "string" ? t.timestamp : null;
+    if (stamp !== this.lastStamp) {
+      this.lastStamp = stamp;
+      this.lastStampMono = mono;
+    }
+    return mono - this.lastStampMono;
   }
 
   /** Last verdict as a state.json-friendly string; null before first evaluate. */
@@ -237,8 +294,17 @@ export interface ShedConfig {
   /** ... OR the rail stays below this for railLowSecs straight. */
   railLowVolts: number;
   railLowSecs: number;
-  /** Continued trigger at a shed rung this long escalates to the next rung. */
+  /** Trailing window evaluated for escalation to the next rung. */
   escalateDwellSecs: number;
+  /**
+   * Phase 6 (2026-07-30): escalate when the supply was bad for at least this
+   * percentage of the trailing `escalateDwellSecs` window — "bad" being the
+   * shed trigger OR an individual unhealthy sample (see ShedSignals.dirty).
+   * 100 reproduces the old "continuously bad for the whole dwell" semantics,
+   * which the field proved unreachable on a real sagging rail (the samples
+   * bounce back above any usable threshold every few seconds).
+   */
+  escalateDutyPct: number;
   /** Clean interval (no UV, rail at/above railRestoreVolts) per restored rung. */
   restoreSecs: number;
   railRestoreVolts: number;
@@ -255,6 +321,7 @@ export interface PowerSampleReading {
 }
 
 interface PowerSample extends PowerSampleReading {
+  /** MONOTONIC ms at the reading (see the module TIME note). */
   tMs: number;
 }
 
@@ -268,6 +335,14 @@ export const POWER_SAMPLE_STALE_MS = 5_000;
 /** What the sample window currently says (pure, exported for tests). */
 export interface ShedSignals {
   trigger: boolean;
+  /**
+   * Is the NEWEST sample itself unhealthy by the trigger's own thresholds (UV
+   * bit set, or rail below railLowVolts)? This is the escalation duty-cycle's
+   * input (Phase 6): the debounced `trigger` drops out on every bounce back
+   * over the threshold, while the samples themselves stay predominantly bad —
+   * which is exactly the field state that crashed the device at rung 1.
+   */
+  dirty: boolean;
   /** Trigger rationale for the transition log; null when not triggering. */
   why: string | null;
   /** Newest "dirty" sample (UV, or rail below railRestoreVolts); null if none in window. */
@@ -303,13 +378,28 @@ export function computeShedSignals(
     if (s.uv || (s.railV !== null && s.railV < cfg.railRestoreVolts)) lastDirtyMs = s.tMs;
   }
 
+  const dirty =
+    fresh &&
+    newest !== undefined &&
+    (newest.uv || (newest.railV !== null && newest.railV < cfg.railLowVolts));
+
   const why =
     uvCount >= cfg.uvSamples
       ? `undervoltage ${uvCount}x in ${cfg.uvWindowSecs}s`
       : railLow
         ? `rail ${lastRail?.toFixed(2)}V < ${cfg.railLowVolts}V for ${cfg.railLowSecs}s`
         : null;
-  return { trigger: why !== null, why, lastDirtyMs };
+  return { trigger: why !== null, dirty, why, lastDirtyMs };
+}
+
+/**
+ * One trigger-state edge: the trigger became `on` at `tMs` and stayed that way
+ * until the next entry (or now). Only EDGES are stored, so a steady state costs
+ * one entry no matter how long it lasts.
+ */
+export interface TriggerEdge {
+  tMs: number;
+  on: boolean;
 }
 
 /** Ladder state — plain data so the transition core stays pure. */
@@ -319,14 +409,59 @@ export interface ShedState {
   parked: boolean;
   /** Last level transition (restore/escalate interval anchor). */
   lastChangeMs: number;
-  /** Start of the current continuous trigger streak; null when not triggering. */
-  triggerSinceMs: number | null;
+  /** Trigger history over (at least) the trailing escalation window. */
+  triggerLog: TriggerEdge[];
   /** Shed cycle starts (level 0 → 1) within the rolling hour. */
   shedStartsMs: number[];
 }
 
 export function initialShedState(nowMs: number): ShedState {
-  return { level: 0, parked: false, lastChangeMs: nowMs, triggerSinceMs: null, shedStartsMs: [] };
+  return { level: 0, parked: false, lastChangeMs: nowMs, triggerLog: [], shedStartsMs: [] };
+}
+
+/**
+ * Append this tick's trigger state, coalescing runs (only edges are kept), and
+ * drop history older than the trailing window — keeping the one entry that
+ * straddles the window start, since it describes the state at that instant.
+ */
+function appendTrigger(
+  log: readonly TriggerEdge[],
+  on: boolean,
+  nowMs: number,
+  windowMs: number,
+): TriggerEdge[] {
+  const out =
+    log.length > 0 && log[log.length - 1].on === on ? [...log] : [...log, { tMs: nowMs, on }];
+  const cutoff = nowMs - windowMs;
+  let keepFrom = 0;
+  for (let i = 0; i < out.length; i++) if (out[i].tMs <= cutoff) keepFrom = i;
+  return keepFrom > 0 ? out.slice(keepFrom) : out;
+}
+
+/**
+ * Fraction of the trailing `windowMs` during which the trigger was active
+ * (time-weighted, so an irregular evaluation cadence can't skew it). Returns
+ * null while the window is not yet fully covered since `sinceMs` (the rung
+ * change) — a rung must always be observed for a full window before the next
+ * one engages, exactly as the old continuous dwell required.
+ */
+export function triggerDutyCycle(
+  log: readonly TriggerEdge[],
+  sinceMs: number,
+  nowMs: number,
+  windowMs: number,
+): number | null {
+  if (windowMs <= 0) return 1;
+  const start = nowMs - windowMs;
+  if (start < sinceMs) return null;
+  let onMs = 0;
+  for (let i = 0; i < log.length; i++) {
+    const from = Math.max(log[i].tMs, start);
+    const to = i + 1 < log.length ? log[i + 1].tMs : nowMs;
+    // Time before the first edge counts as "not triggered" (unknown = clean).
+    if (to > from && log[i].on) onMs += to - from;
+  }
+  return onMs / windowMs;
 }
 
 export interface ShedEvent {
@@ -337,9 +472,15 @@ export interface ShedEvent {
 const HOUR_MS = 3_600_000;
 
 /**
- * Pure ladder transition core: one evaluation tick. Escalation dwell is
- * measured from the later of "trigger started" and "last rung change", so a
- * long-standing trigger cannot skip straight past a rung.
+ * Pure ladder transition core: one evaluation tick.
+ *
+ * Escalation (Phase 6) is DUTY-CYCLE based: the trigger must have been active
+ * for at least `escalateDutyPct` of the trailing `escalateDwellSecs`, measured
+ * from the rung change — so a long-standing trigger still cannot skip past a
+ * rung, but a bouncing rail (the field reality: 74 % low samples, longest
+ * unbroken low run 40 s) does reach the next rung instead of crashing at the
+ * first one. The check runs on triggered ticks only, which at worst delays an
+ * escalation to the next dirty sample.
  */
 export function decideShedTransition(
   cfg: ShedConfig,
@@ -347,10 +488,17 @@ export function decideShedTransition(
   sig: ShedSignals,
   nowMs: number,
 ): { state: ShedState; event: ShedEvent | null } {
-  const s: ShedState = { ...prev, shedStartsMs: prev.shedStartsMs.filter((t) => nowMs - t <= HOUR_MS) };
+  const dwellMs = cfg.escalateDwellSecs * 1000;
+  // What counts as "still bad" for escalation: the debounced trigger OR a
+  // single unhealthy sample. The rail arm's 15 s debounce is right for DECIDING
+  // to shed and wrong for measuring how bad the supply stays afterwards.
+  const s: ShedState = {
+    ...prev,
+    shedStartsMs: prev.shedStartsMs.filter((t) => nowMs - t <= HOUR_MS),
+    triggerLog: appendTrigger(prev.triggerLog, sig.trigger || sig.dirty, nowMs, dwellMs),
+  };
 
   if (sig.trigger) {
-    s.triggerSinceMs = prev.triggerSinceMs ?? nowMs;
     if (s.level === 0) {
       s.level = 1;
       s.lastChangeMs = nowMs;
@@ -362,21 +510,25 @@ export function decideShedTransition(
       }
       return { state: s, event: { level: "warn", msg } };
     }
-    if (s.level === 1 && nowMs - Math.max(s.triggerSinceMs, s.lastChangeMs) >= cfg.escalateDwellSecs * 1000) {
-      s.level = 2;
-      s.lastChangeMs = nowMs;
-      return {
-        state: s,
-        event: {
-          level: "warn",
-          msg: `power shed → bridge-only (${sig.why}, continued ${cfg.escalateDwellSecs}s past no-live): video recording off, telemetry recording continues`,
-        },
-      };
+    if (s.level === 1) {
+      const duty = triggerDutyCycle(s.triggerLog, s.lastChangeMs, nowMs, dwellMs);
+      if (duty !== null && duty * 100 >= cfg.escalateDutyPct) {
+        s.level = 2;
+        s.lastChangeMs = nowMs;
+        return {
+          state: s,
+          event: {
+            level: "warn",
+            msg:
+              `power shed → bridge-only (${sig.why}, triggered ${Math.round(duty * 100)}% of the ` +
+              `last ${cfg.escalateDwellSecs}s past no-live): video recording off, telemetry recording continues`,
+          },
+        };
+      }
     }
     return { state: s, event: null };
   }
 
-  s.triggerSinceMs = null;
   if (s.level > 0 && !s.parked) {
     // Fail open: with no dirty sample on record (sampler gone quiet), the
     // clean interval alone restores — shedding must never strand a healthy
@@ -405,8 +557,13 @@ export interface ShedVerdict {
 }
 
 export interface LoadShedPolicyOptions {
-  /** Test seam. */
-  now?: () => number;
+  /**
+   * Monotonic clock (test seam). EVERY timestamp this policy stores — sample
+   * ages, rung changes, the escalation window, the rolling-hour cap — lives on
+   * this clock, so an NTP/GPS clock step mid-drive cannot expire a dwell or
+   * age out the cycle cap.
+   */
+  monoMs?: () => number;
 }
 
 /**
@@ -422,7 +579,7 @@ export class LoadShedPolicy {
   private state: ShedState;
 
   constructor(opts: LoadShedPolicyOptions = {}) {
-    this.now = opts.now ?? Date.now;
+    this.now = opts.monoMs ?? monotonicMs;
     this.state = initialShedState(this.now());
   }
 

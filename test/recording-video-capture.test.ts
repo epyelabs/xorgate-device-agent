@@ -520,6 +520,195 @@ describe("camera spawn stagger (Phase 2 staged boot)", () => {
   });
 });
 
+describe("VideoCaptureSupervisor.setCameras (Phase 6)", () => {
+  const twoCams = [
+    { streamKey: "cam0", cameraName: "/base/cam0@1a" },
+    { streamKey: "cam1", cameraName: "/base/cam1@1a" },
+  ];
+
+  function makeSup(spawner: ReturnType<typeof fakeSpawner>) {
+    return new VideoCaptureSupervisor({
+      deviceId: "dev-1",
+      cameras: twoCams,
+      record: true,
+      preset,
+      segmentSeconds: 60,
+      videoRoot: join(home, "recordings", "video"),
+      shmDir: join(home, "shm"),
+      timeSource: () => "ntp",
+      spawn: spawner.spawn,
+      stableMs: 3600_000,
+      sweepPollMs: 3600_000,
+    });
+  }
+
+  it("removes a camera cleanly (final sweep, forgotten) and leaves the rest alone", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup(spawner);
+    sup.start();
+    const cam0 = sup.status().find((s) => s.streamKey === "cam0")!;
+    const dir = join(home, "recordings", "video", "cam1", sup.status()[1].sessionId!);
+    writeFileSync(join(dir, "00000.mp4"), Buffer.alloc(64, 1));
+
+    await sup.setCameras([twoCams[0]]);
+    expect(spawner.spawns[1].stopped).toBe("SIGINT"); // cam1 EOS-stopped
+    expect(spawner.spawns[0].stopped).toBeNull(); // cam0 untouched
+    expect(sup.status()).toHaveLength(1);
+    expect(sup.status()[0].sessionId).toBe(cam0.sessionId);
+    // cam1's last fragment got its sidecar (finalized) before it went away.
+    expect(existsSync(join(dir, "00000.json"))).toBe(true);
+    expect(JSON.parse(readFileSync(join(dir, "00000.json"), "utf8")).finalized).toBe(true);
+    sup.stop();
+  });
+
+  it("adds a camera without disturbing the running one", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup(spawner);
+    sup.start();
+    await sup.setCameras([twoCams[0]]);
+    const cam0Session = sup.status()[0].sessionId;
+    await sup.setCameras(twoCams);
+    expect(sup.status().map((s) => s.streamKey).sort()).toEqual(["cam0", "cam1"]);
+    expect(sup.status().find((s) => s.streamKey === "cam0")!.sessionId).toBe(cam0Session);
+    expect(spawner.spawns).toHaveLength(3); // cam0, cam1, cam1-again
+    sup.stop();
+  });
+
+  it("is inert after stop()", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup(spawner);
+    sup.start();
+    sup.stop();
+    await sup.setCameras(twoCams);
+    expect(spawner.spawns).toHaveLength(2);
+  });
+});
+
+describe("per-camera enables (Phase 6 capacity control)", () => {
+  const twoCams = [
+    { streamKey: "cam0", cameraName: "/base/cam0@1a" },
+    { streamKey: "cam1", cameraName: "/base/cam1@1a" },
+  ];
+  let manager: RecordingManager | null = null;
+  afterEach(() => {
+    manager?.stop();
+    manager = null;
+  });
+
+  function makeManager(spawner: ReturnType<typeof fakeSpawner>, disabled: string[][]) {
+    return new RecordingManager({
+      deviceId: "dev-1",
+      sampleGroups: async () => ({}),
+      root: join(home, "recordings"),
+      pollMs: 60_000,
+      video: {
+        mediaEnabled: true,
+        cameras: () => twoCams,
+        shmDir: join(home, "shm"),
+        spawn: spawner.spawn,
+        stableMs: 50,
+        sweepPollMs: 3600_000,
+        setDisabledCameras: (keys) => disabled.push([...keys]),
+      },
+    });
+  }
+
+  /** Which cameras have a LIVE (unstopped) capture child right now. */
+  function liveCams(spawner: ReturnType<typeof fakeSpawner>): string[] {
+    return spawner.spawns
+      .filter((s) => s.stopped === null)
+      .map((s) => (s.args.join(" ").includes("cam0@1a") ? "cam0" : "cam1"));
+  }
+
+  it("a disabled camera gets no pipeline; the other camera keeps its session", async () => {
+    const spawner = fakeSpawner();
+    const disabled: string[][] = [];
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off", spawnStaggerSecs: 0 } } });
+    manager = makeManager(spawner, disabled);
+    await manager.start();
+    await delay(20);
+    expect(liveCams(spawner)).toEqual(["cam0", "cam1"]);
+    const cam0Session = manager.videoStatus().streams.find((s) => s.streamKey === "cam0")!.sessionId;
+    expect(disabled).toEqual([]); // nothing published while every camera is on
+
+    // Turn cam1 off: its child stops, cam0 is NOT restarted (same session).
+    saveSettings({
+      recording: { video: { enabled: true, bootDefer: "off", spawnStaggerSecs: 0, cameras: { cam1: false } } },
+    });
+    manager.reapply();
+    await delay(100);
+    expect(liveCams(spawner)).toEqual(["cam0"]);
+    expect(spawner.spawns.length).toBe(2); // no respawn of cam0
+    expect(manager.videoStatus().streams.map((s) => s.streamKey)).toEqual(["cam0"]);
+    expect(manager.videoStatus().streams[0].sessionId).toBe(cam0Session);
+    // ...and the live KVS master is parked too (no pipeline anywhere).
+    expect(disabled).toEqual([["cam1"]]);
+
+    // Back on: cam1 returns with a fresh session, cam0 still untouched.
+    saveSettings({
+      recording: { video: { enabled: true, bootDefer: "off", spawnStaggerSecs: 0, cameras: { cam1: true } } },
+    });
+    manager.reapply();
+    await delay(100);
+    expect(liveCams(spawner)).toEqual(["cam0", "cam1"]);
+    expect(spawner.spawns.length).toBe(3);
+    expect(manager.videoStatus().streams[0].sessionId).toBe(cam0Session);
+    expect(disabled).toEqual([["cam1"], []]);
+  });
+
+  it("disabling every camera leaves no capture at all", async () => {
+    const spawner = fakeSpawner();
+    const disabled: string[][] = [];
+    saveSettings({
+      recording: {
+        video: { enabled: true, bootDefer: "off", spawnStaggerSecs: 0, cameras: { cam0: false, cam1: false } },
+      },
+    });
+    manager = makeManager(spawner, disabled);
+    await manager.start();
+    await delay(20);
+    expect(spawner.spawns.length).toBe(0);
+    expect(manager.videoStatus().streams).toEqual([]);
+    expect(disabled).toEqual([["cam0", "cam1"]]);
+  });
+
+  it("an unknown/absent camera key is inert (a camera unplugged since is just gone)", async () => {
+    const spawner = fakeSpawner();
+    saveSettings({
+      recording: {
+        // cam2 is configured on but not present in the manifest; cam0 absent
+        // from the map = enabled (the default).
+        video: { enabled: true, bootDefer: "off", spawnStaggerSecs: 0, cameras: { cam2: true } },
+      },
+    });
+    manager = makeManager(spawner, []);
+    await manager.start();
+    await delay(20);
+    expect(liveCams(spawner)).toEqual(["cam0", "cam1"]);
+  });
+
+  it("a camera-set change while recording keeps recording (no shape change)", async () => {
+    const spawner = fakeSpawner();
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off", spawnStaggerSecs: 0 } } });
+    manager = makeManager(spawner, []);
+    await manager.start();
+    await delay(20);
+    expect(spawner.spawns[0].args.join(" ")).toContain("splitmuxsink");
+
+    saveSettings({
+      recording: { video: { enabled: true, bootDefer: "off", spawnStaggerSecs: 0, cameras: { cam0: false } } },
+    });
+    manager.reapply();
+    await delay(100);
+    // cam1's child is the original one, still in record mode.
+    const live = spawner.spawns.filter((s) => s.stopped === null);
+    expect(live).toHaveLength(1);
+    expect(live[0].args.join(" ")).toContain("cam1@1a");
+    expect(live[0].args.join(" ")).toContain("splitmuxsink");
+    expect(manager.videoStatus().recording).toBe(true);
+  });
+});
+
 describe("RecordingManager boot power staging (Phase 2)", () => {
   let manager: RecordingManager | null = null;
   afterEach(() => {
@@ -636,7 +825,8 @@ describe("RecordingManager boot power staging (Phase 2)", () => {
     const policy = new BootDeferPolicy({
       telemetryFile,
       budgetPath: writeBudget(home, 3000),
-      now: () => {
+      now: () => now,
+      monoMs: () => {
         now += 1000; // each evaluation advances 1 s of fake time
         return now;
       },
@@ -705,7 +895,7 @@ describe("RecordingManager power load shedding (Phase 3)", () => {
       sampleGroups: async () => ({}),
       root: join(home, "recordings"),
       pollMs: 60_000,
-      shedPolicy: new LoadShedPolicy({ now: () => clock.now }),
+      shedPolicy: new LoadShedPolicy({ monoMs: () => clock.now }),
       shedSampleMs: 10,
       powerSample:
         opts.powerSample === false

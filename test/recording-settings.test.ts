@@ -99,6 +99,7 @@ describe("parseRecordingSettings", () => {
       railLowVolts: 4.85,
       railLowSecs: 15,
       escalateDwellSecs: 60,
+      escalateDutyPct: 70,
       restoreSecs: 120,
       railRestoreVolts: 4.95,
       maxShedsPerHour: 4,
@@ -145,6 +146,7 @@ describe("parseRecordingSettings", () => {
       railLowVolts: 4.85,
       railLowSecs: 15,
       escalateDwellSecs: 60,
+      escalateDutyPct: 70,
       restoreSecs: 120,
       railRestoreVolts: 4.95,
       maxShedsPerHour: 4,
@@ -172,6 +174,28 @@ describe("parseRecordingSettings", () => {
     expect(parseRecordingSettings("on")).toBeUndefined();
     expect(parseRecordingSettings({ bogus: true })).toBeUndefined();
     expect(parseRecordingSettings({ telemetry: { enabled: "x" } })).toBeUndefined();
+  });
+
+  it("clamps escalateDutyPct into [50, 100] (Phase 6 duty-cycle escalation)", () => {
+    expect(parseRecordingSettings({ powerShedding: { escalateDutyPct: 10 } })).toEqual({
+      powerShedding: { escalateDutyPct: 50 },
+    });
+    expect(parseRecordingSettings({ powerShedding: { escalateDutyPct: 250 } })).toEqual({
+      powerShedding: { escalateDutyPct: 100 },
+    });
+    expect(resolveRecordingConfig(undefined).powerShedding.escalateDutyPct).toBe(70);
+  });
+
+  it("keeps per-camera enables keyed by streamKey, drops junk keys/values", () => {
+    expect(
+      parseRecordingSettings({
+        video: { cameras: { cam0: true, cam1: false, "bad key!": true, cam2: "off" } },
+      }),
+    ).toEqual({ video: { cameras: { cam0: true, cam1: false } } });
+    // Absent map = every detected camera enabled (today's behavior).
+    expect(resolveRecordingConfig(undefined).video.cameras).toEqual({});
+    expect(parseRecordingSettings({ video: { cameras: {} } })).toBeUndefined();
+    expect(parseRecordingSettings({ video: { cameras: [true] } })).toBeUndefined();
   });
 
   it("clamps segmentSeconds into [10, 600]", () => {

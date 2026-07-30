@@ -57,6 +57,7 @@ const source: {
   stop?: () => void;
   restartMediaChannel?: (streamKey: string) => void;
   setLiveShed?: (shed: boolean) => void;
+  setDisabledStreams?: (streamKeys: readonly string[]) => void;
   samplePower?: () => Promise<PowerSampleReading | null>;
   gpsClock?: () => GpsClockReading | null;
 } =
@@ -190,6 +191,9 @@ const recording = new RecordingManager({
     onCaptureSpawned: (streamKey) => source.restartMediaChannel?.(streamKey),
     // Load shedding rung 1 (Phase 3): park/release the live KVS masters.
     setLiveShed: (shed) => source.setLiveShed?.(shed),
+    // Per-camera capacity (Phase 6): a camera turned off in settings keeps no
+    // pipeline at all — its live master is held down alongside its capture.
+    setDisabledCameras: (streamKeys) => source.setDisabledStreams?.(streamKeys),
   },
   sampleGroups: () => source.sampleGroups(),
   // ~1 Hz power reading for the shed policy — the system collector's cached

@@ -30,14 +30,19 @@
  *   recording.video.spawnStaggerSecs <0-30>
  * (bootDefer* / spawnStaggerSecs are the Phase 2 boot power staging knobs —
  * optimize-system-process-cycle plan.)
+ *   recording.video.cameras.<streamKey> <on|off>
+ * (Phase 6 per-camera capacity: `off` gives that camera NO pipeline at all —
+ * no capture, no shm bridge, no KVS master. Absent = on.)
  *   recording.powerShedding.enabled <on|off>
  *   recording.powerShedding.uvSamples <1-60>        recording.powerShedding.uvWindowSecs <5-300>
  *   recording.powerShedding.railLowVolts <4-5.2>    recording.powerShedding.railLowSecs <3-120>
  *   recording.powerShedding.escalateDwellSecs <5-600>
+ *   recording.powerShedding.escalateDutyPct <50-100>
  *   recording.powerShedding.restoreSecs <10-3600>   recording.powerShedding.railRestoreVolts <4-5.4>
  *   recording.powerShedding.maxShedsPerHour <0-60>
  * (powerShedding.* is the Phase 3 runtime undervoltage load-shedding ladder —
- * live streaming sheds first, recording last, restore with hysteresis.)
+ * live streaming sheds first, recording last, restore with hysteresis;
+ * escalateDutyPct is the Phase 6 duty-cycle escalation rule.)
  *
  * `timeSync.*` dotted keys (Phase 4 offline time sources) are read live by the
  * worker's clock stepper each tick (~30 s; no restart):
@@ -51,6 +56,7 @@ import {
   saveSettings,
   RECORDING_RATE_HZ_MAX,
   RECORDING_RATE_HZ_MIN,
+  STREAM_KEY_RE,
   type AgentSettings,
   type RecordingSettings,
   type TimeSyncSettings,
@@ -83,6 +89,11 @@ function parseBoolValue(v: string | undefined): boolean | undefined {
 function setRecordingCommand(key: string, value: string | undefined): void {
   const parts = key.split(".");
   const [, section, field] = parts;
+  // Per-camera enables are one level deeper: recording.video.cameras.<streamKey>.
+  if (parts.length === 4 && section === "video" && field === "cameras") {
+    setCameraEnable(key, parts[3], value);
+    return;
+  }
   if (parts.length !== 3 || !section || !field) {
     console.error(
       "recording keys are dotted paths, e.g. xorgate set recording.telemetry.enabled on",
@@ -125,6 +136,7 @@ function setRecordingCommand(key: string, value: string | undefined): void {
     field === "railLowVolts" ||
     field === "railLowSecs" ||
     field === "escalateDwellSecs" ||
+    field === "escalateDutyPct" ||
     field === "restoreSecs" ||
     field === "railRestoreVolts" ||
     field === "maxShedsPerHour"
@@ -177,6 +189,41 @@ function setRecordingCommand(key: string, value: string | undefined): void {
   saveSettings(settings);
   console.log(`✓ ${key} = ${JSON.stringify(patchedSection[field])} (persisted to settings.json)`);
   console.log("  the agent applies recording changes live within ~5 s (no restart needed)");
+}
+
+/**
+ * `xorgate set recording.video.cameras.<streamKey> <on|off>` (Phase 6) — the
+ * install-time capacity choice. `off` leaves that camera with no pipeline at
+ * all; the value is merged into the map (other cameras untouched) and applied
+ * live by the recording manager's 5 s poll.
+ */
+function setCameraEnable(key: string, streamKey: string, value: string | undefined): void {
+  const bool = parseBoolValue(value);
+  if (!STREAM_KEY_RE.test(streamKey)) {
+    console.error(`'${streamKey}' is not a valid stream key (see kvs.json channels)`);
+    process.exitCode = 1;
+    return;
+  }
+  if (bool === undefined) {
+    console.error(`${key} must be on|off, got '${value ?? ""}'`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const settings: AgentSettings = { ...loadSettings() };
+  const recording = settings.recording ?? {};
+  const video = recording.video ?? {};
+  settings.recording = {
+    ...recording,
+    video: { ...video, cameras: { ...video.cameras, [streamKey]: bool } },
+  };
+  saveSettings(settings);
+  console.log(`✓ ${key} = ${bool} (persisted to settings.json)`);
+  console.log(
+    bool
+      ? "  the agent applies recording changes live within ~5 s (no restart needed)"
+      : "  camera disabled: no capture, no live stream, no recording (live within ~5 s)",
+  );
 }
 
 /**

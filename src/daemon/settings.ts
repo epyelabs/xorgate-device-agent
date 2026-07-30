@@ -46,6 +46,16 @@ export interface RecordingSettings {
     bootDeferMinBudgetMa?: number;
     /** Inter-camera spawn delay, seconds (default 4; 0 = simultaneous as before). */
     spawnStaggerSecs?: number;
+    /**
+     * Per-camera enable, keyed by streamKey (optimize-system-process-cycle
+     * plan, Phase 6): `{"cam1": false}` turns camera 1 off entirely — no
+     * capture, no shm bridge, no KVS master, sensor path cold. An ABSENT key
+     * means enabled, so the default (`{}` / no key at all) is today's "every
+     * detected camera runs". Camera count is a deliberate install-time
+     * capacity choice (1 camera on a 3 A supply, 2 on 5 A), never something
+     * the load-shedding ladder toggles (Q9, 2026-07-30).
+     */
+    cameras?: Record<string, boolean>;
   };
   upload?: { mode?: "auto" | "off" };
   retention?: { maxBytes?: number; minFreeBytes?: number };
@@ -64,8 +74,15 @@ export interface RecordingSettings {
     /** ... OR the 5 V rail stays below this for railLowSecs straight. */
     railLowVolts?: number;
     railLowSecs?: number;
-    /** Continued trigger this long at a shed rung escalates to the next rung. */
+    /** Trailing window (seconds) evaluated for escalation to the next rung. */
     escalateDwellSecs?: number;
+    /**
+     * Escalate when the supply was bad (triggered, or an unhealthy sample) for
+     * at least this % of the trailing escalateDwellSecs window (Phase 6;
+     * default 70, clamp 50–100). 100 is the old "continuously bad" rule, which
+     * a bouncing rail never satisfies — the 2026-07-30 crash.
+     */
+    escalateDutyPct?: number;
     /** Clean interval (no UV, rail ≥ railRestoreVolts) per restored rung. */
     restoreSecs?: number;
     railRestoreVolts?: number;
@@ -191,6 +208,13 @@ export const RECORDING_RATE_HZ_MIN = 1;
 export const RECORDING_RATE_HZ_MAX = 20;
 
 /**
+ * Accepted `recording.video.cameras` keys: KVS stream keys (kvs.json
+ * `streamKey`, e.g. `cam0`). Same shape the pipeline/shm-socket filenames use,
+ * so anything outside it could never name a real camera anyway.
+ */
+export const STREAM_KEY_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
+/**
  * Validate an untrusted `recording` value into RecordingSettings, dropping
  * anything mistyped (same forgiving philosophy as the rest of loadSettings:
  * a partially-valid object still applies). Numbers are clamped, not rejected,
@@ -243,6 +267,17 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
     if (typeof spawnStaggerSecs === "number" && Number.isFinite(spawnStaggerSecs)) {
       o.spawnStaggerSecs = Math.min(30, Math.max(0, Math.round(spawnStaggerSecs)));
     }
+    // Per-camera enables (Phase 6): a map of streamKey -> boolean. Non-boolean
+    // values and implausible keys are dropped rather than rejected, and an
+    // absent key means enabled — a typo can never silently blind a camera.
+    const cams = (vid as { cameras?: unknown }).cameras;
+    if (cams && typeof cams === "object" && !Array.isArray(cams)) {
+      const c: Record<string, boolean> = {};
+      for (const [key, value] of Object.entries(cams as Record<string, unknown>)) {
+        if (typeof value === "boolean" && STREAM_KEY_RE.test(key)) c[key] = value;
+      }
+      if (Object.keys(c).length > 0) o.cameras = c;
+    }
     if (Object.keys(o).length > 0) out.video = o;
   }
 
@@ -264,6 +299,9 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
       ["uvWindowSecs", 5, 300],
       ["railLowSecs", 3, 120],
       ["escalateDwellSecs", 5, 600],
+      // 50 % floor: below "more triggered than not" the ladder would escalate
+      // off noise; 100 = the pre-Phase-6 continuous-dwell rule.
+      ["escalateDutyPct", 50, 100],
       ["restoreSecs", 10, 3600],
       ["maxShedsPerHour", 0, 60],
     ];

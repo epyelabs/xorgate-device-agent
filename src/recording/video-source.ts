@@ -123,7 +123,14 @@ export function createVideoSource(
             if (!opts.isSessionActive(sessionId)) {
               let manifestAge = Infinity;
               try {
-                manifestAge = now() - statSync(join(dir, SESSION_MANIFEST_NAME)).mtimeMs;
+                // |age|, not age: a manifest whose mtime is in the FUTURE was
+                // written under a wrong clock (a cold boot's fake-hwclock, or
+                // the 2026-07-29 NITZ excursion that stamped four session dirs
+                // "Jan 5 2080"). Signed age went negative there and the husks
+                // became immortal — still on the bench disk a day later. The
+                // magnitude is the honest "this is not a session we just
+                // minted" test either way.
+                manifestAge = Math.abs(now() - statSync(join(dir, SESSION_MANIFEST_NAME)).mtimeMs);
               } catch {
                 /* no manifest — an empty husk; age stays Infinity (reap) */
               }

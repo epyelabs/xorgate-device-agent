@@ -84,7 +84,7 @@ describe("buildSidecar", () => {
       manifest(),
       2,
       { sizeBytes: 123, birthtimeMs: T0 + 120_000, mtimeMs: T0 + 180_000 },
-      { finalized: true },
+      { finalized: true, clockPair: { wallMs: T0 + 180_000, monoMs: 500_000 + 180_000 } },
     );
     expect(sc).toMatchObject({
       seq: 2,
@@ -96,7 +96,8 @@ describe("buildSidecar", () => {
       codec: "h264",
       width: 1920,
     });
-    // startMono derives from the anchor pair: 500 s + (startTs - anchorTs).
+    // startMono is walked back from the sweep-time wall/mono pair, so with an
+    // undisturbed clock it still reads uptime-at-fragment-start.
     expect(sc.startMono).toBe(500_000 + 120_000);
   });
 
@@ -123,7 +124,11 @@ describe("buildSidecar", () => {
       manifest(),
       0,
       { sizeBytes: 9, birthtimeMs: T0, mtimeMs: T0 + 62_000 },
-      { finalized: true, boundaryEndMs: T0 + 62_000 },
+      {
+        finalized: true,
+        boundaryEndMs: T0 + 62_000,
+        clockPair: { wallMs: T0 + 62_000, monoMs: 500_000 + 62_000 },
+      },
     );
     expect(sc).toMatchObject({
       startTs: T0 + 2_000,
@@ -209,6 +214,99 @@ describe("sweepSessionDir", () => {
       closed: [],
       activePath: null,
     });
+  });
+
+  it("sidecars every closed fragment even when the clock stepped since spawn", () => {
+    // The manifest's anchor is 53 years in the future (the 2026-07-29 NITZ
+    // excursion); the sweep runs after the rewind. Nothing may be skipped.
+    const dir = sessionDir("cam0", "sess-step", 4);
+    const m = manifest({ anchorTs: Date.UTC(2080, 0, 6, 0, 0, 52) });
+    const res = sweepSessionDir(dir, m, {
+      includeNewest: true,
+      clockPair: { wallMs: T0 + 240_000, monoMs: 500_000 + 240_000 },
+    });
+    expect(res.closed.length).toBe(4);
+    for (let i = 0; i < 4; i++) {
+      const sc = JSON.parse(readFileSync(join(dir, `0000${i}.json`), "utf8")) as {
+        startTs: number;
+        startMono: number;
+      };
+      // Timestamps come from the CURRENT clock (file times), never from the
+      // poisoned anchor — nothing lands in 2080 and nothing goes negative.
+      expect(sc.startTs).toBeLessThan(Date.UTC(2030, 0, 1));
+      expect(sc.startMono).toBeGreaterThan(0);
+    }
+  });
+});
+
+/**
+ * Phase 8 DoD: a clock correction mid-session must cost ZERO segments and
+ * leave the session contiguous. Modelled at the anchor-math level because
+ * birthtimes cannot be forged portably: fragment 0 is anchored to the 0→1
+ * rotation boundary and every later fragment to its own birthtime, so all of
+ * them read a post-step clock; the pre-step anchor in session.json is never
+ * consulted for timing. This is the analysis that refuted the "pre-clock-
+ * correction video loss" field report (see PROGRESS Phase 8 facts) — pinned
+ * here so it stays true.
+ */
+describe("mid-session clock steps (Phase 8)", () => {
+  const M0 = 500_000; // uptime ms at capture spawn
+  const SEG = 60_000;
+
+  /** One session's sidecars, given a step of `deltaMs` applied at spawn+30 s. */
+  function sidecarsAcrossStep(deltaMs: number) {
+    const wrongSpawnWall = T0 - deltaMs; // what the clock read at spawn
+    const m = manifest({ anchorTs: wrongSpawnWall, anchorMono: String(BigInt(M0) * 1_000_000n) });
+    // Post-step wall/mono pair at sweep time (spawn + 4 min).
+    const pair = { wallMs: T0 + 4 * SEG, monoMs: M0 + 4 * SEG };
+    const out = [];
+    for (let seq = 0; seq < 4; seq++) {
+      // Fragment k rotates at spawn + (k+1)·60 s of real time, and the file
+      // times are read AFTER the step, so they are all on the corrected clock.
+      const birth = T0 + seq * SEG;
+      out.push(
+        buildSidecar(
+          m,
+          seq,
+          { sizeBytes: 1000, birthtimeMs: birth, mtimeMs: birth + SEG },
+          {
+            finalized: true,
+            ...(seq === 0 ? { boundaryEndMs: T0 + SEG } : {}),
+            clockPair: pair,
+          },
+        ),
+      );
+    }
+    return out;
+  }
+
+  for (const [label, delta] of [
+    ["forward (fake-hwclock behind → NTP)", 7 * 60_000 + 52_000],
+    ["backward (2080 → NTP rewind)", -(53 * 365 * 24 * 3600_000)],
+    ["small forward", 3_000],
+  ] as const) {
+    it(`loses no segment and stays contiguous after a ${label} step`, () => {
+      const scs = sidecarsAcrossStep(delta);
+      expect(scs.length).toBe(4);
+      for (let i = 0; i < scs.length; i++) {
+        // Sane wall timestamps: the poisoned anchor never leaks in.
+        expect(scs[i].startTs).toBe(T0 + i * SEG);
+        // Monotonic field stays in the boot's own frame and increases.
+        expect(scs[i].startMono).toBe(M0 + i * SEG);
+        if (i > 0) {
+          expect(scs[i].startTs - (scs[i - 1].startTs + scs[i - 1].durationMs)).toBe(0);
+        }
+      }
+    });
+  }
+
+  it("keeps startMono positive where the old anchor-difference math went negative", () => {
+    const scs = sidecarsAcrossStep(-(53 * 365 * 24 * 3600_000));
+    // Old formula: anchorMono + (startTs − anchorTs) ≈ −1.67e12 (the value the
+    // field sidecar actually carried).
+    const oldStyle = M0 + (scs[0].startTs - (T0 + 53 * 365 * 24 * 3600_000));
+    expect(oldStyle).toBeLessThan(0);
+    expect(scs[0].startMono).toBeGreaterThan(0);
   });
 });
 

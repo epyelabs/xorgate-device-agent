@@ -73,6 +73,11 @@ export interface ModemTelemetry {
   csq_interval: number;
   /** "connected" | "connecting" | "disconnected" | "dead_zone". */
   status: string;
+  /**
+   * Last seen 3GPP registration <stat>: 1 home, 5 roaming, 2 searching,
+   * 3 denied, 0 none, 99 unknown. Written at telemetry-snapshot time.
+   */
+  reg?: number;
   iface: string;
   ip: string | null;
   /** Modem PMU temperature in °C (AT+CPMUTEMP), or null/absent when never read. */
@@ -85,8 +90,13 @@ export interface ModemTelemetry {
    * sides captured at the same instant, so the device clock's own error
    * cancels out. Absent/null on daemons predating Phase 4 or before the
    * first successful read.
+   *
+   * `reg` is the registration <stat> AT THE READ INSTANT (optimize-system-
+   * process-cycle Phase 8): NITZ only exists after network attach, so the
+   * stepper refuses a reading that is not 1/5. Absent on daemons predating
+   * Phase 8 — consumers fall back to the top-level `reg`.
    */
-  modem_clock?: { cclk: string; read_at: number } | null;
+  modem_clock?: { cclk: string; read_at: number; reg?: number } | null;
   /** GNSS observability (absent on daemons predating the lte_gnss_recovery plan). */
   gnss?: ModemGnssTelemetry;
   /** Recovery observability (absent on daemons predating the lte_gnss_recovery plan). */

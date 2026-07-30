@@ -115,6 +115,16 @@ describe("video segment source", () => {
     expect(existsSync(dir)).toBe(false);
   });
 
+  it("reaps a drained session whose manifest mtime is in the FUTURE (Phase 8)", () => {
+    // The 2026-07-29 NITZ excursion stamped four session dirs "Jan 5 2080".
+    // Signed age went negative, so `age >= 10 min` was never true and the
+    // husks were immortal — still on the bench disk a day later.
+    const path = manifest("cam0", S1, Date.UTC(2080, 0, 5));
+    src([], Date.UTC(2026, 6, 30)).listClosed();
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(join(root, "cam0", S1))).toBe(false);
+  });
+
   it("does NOT reap empty sessions that are active or too young", () => {
     manifest("cam0", S1, 1_000); // old but active
     manifest("cam0", S2, 5_000); // inactive but young

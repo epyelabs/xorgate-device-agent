@@ -46,6 +46,11 @@ function makeRecorder(samples: Record<string, GroupSample>, timeSource = fakeTim
     rateHz: 10,
     sampleGroups: async () => ({ ...samples }),
     timeSource,
+    // Cadence gating and segment rotation run on the MONOTONIC clock (Phase 8).
+    // These tests drive time with vi.setSystemTime, which vitest does not
+    // extend to process.hrtime — so the seam mirrors the fake wall clock, and
+    // a test that wants them to DIVERGE (a clock step) overrides it.
+    monoMs: () => Date.now(),
     writer: { dir, header, maxAgeMs: 3_600_000 }, // no time rotation unless a test forces it
   });
   return { rec, dir };
@@ -145,6 +150,7 @@ describe("TelemetryRecorder freshness gating", () => {
       rateHz: 10,
       sampleGroups: async () => ({ ...samples }),
       timeSource: fakeTimeSource(),
+      monoMs: () => Date.now(),
       writer: {
         dir,
         maxAgeMs: 500,
@@ -165,5 +171,64 @@ describe("TelemetryRecorder freshness gating", () => {
     await rec.tick(); // no write, but the age rotation must still fire
     expect(readdirSync(dir).some((n) => n.endsWith(".jsonl.gz"))).toBe(true);
     rec.stop();
+  });
+
+  it("keeps sampling and rolling across a backward clock step (Phase 8)", async () => {
+    // The 2026-07-29 field wedge: a +53 y NITZ step, then the NTP rewind. With
+    // wall-clock gaps, every group's `now - lastAt` went negative and the
+    // recorder wrote NOTHING for the rest of the boot, while the roller's
+    // segment age went negative too — 1 segment per drive instead of ~18.
+    const dir = join(home, "recordings", "telemetry", "session-x");
+    const samples: Record<string, GroupSample> = {
+      imu: { fields: { a: { value: 1 } }, updatedMono: 1n },
+    };
+    let mono = 0;
+    const rec = new TelemetryRecorder({
+      rateHz: 10,
+      sampleGroups: async () => ({ ...samples }),
+      timeSource: fakeTimeSource(),
+      monoMs: () => mono,
+      writer: {
+        dir,
+        maxAgeMs: 1_000,
+        header: () => ({
+          type: "header",
+          v: 1,
+          deviceId: "d",
+          sessionId: "session-x",
+          bootId: "b",
+          timeSource: "ntp",
+          rateHz: 10,
+          startedAt: Date.now(),
+        }),
+      },
+    });
+
+    const future = Date.UTC(2080, 0, 6, 0, 0, 52);
+    vi.setSystemTime(future);
+    await rec.tick(); // one sample under the bogus clock
+
+    // 2 s of REAL time later, NTP rewinds the clock 53 years.
+    mono = 2_000;
+    vi.setSystemTime(10_000);
+    samples.imu = { fields: { a: { value: 2 } }, updatedMono: 2n };
+    await rec.tick();
+    mono = 4_000;
+    samples.imu = { fields: { a: { value: 3 } }, updatedMono: 3n };
+    await rec.tick();
+    rec.stop();
+
+    // Both post-rewind samples landed, and the roller kept rolling: three
+    // segments (the 2080-named one, the rewound one, plus the final flush).
+    const gz = readdirSync(dir).filter((n) => n.endsWith(".jsonl.gz"));
+    expect(gz.length).toBeGreaterThanOrEqual(2);
+    const all = gz.flatMap((n) =>
+      gunzipSync(readFileSync(join(dir, n)))
+        .toString("utf8")
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>),
+    );
+    expect(all.filter((l) => l.type !== "header")).toHaveLength(3);
   });
 });

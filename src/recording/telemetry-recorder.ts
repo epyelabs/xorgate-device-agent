@@ -9,8 +9,15 @@
  * (`updatedMono`) since the last written sample AND its native cadence allows
  * another write — so at rateHz=10, IMU (20 Hz native) lands ~10×/s while
  * GPS/LTE/system (1 Hz native) land ~1×/s instead of 10 duplicated rows.
+ *
+ * The cadence gate is measured on the MONOTONIC clock (optimize-system-
+ * process-cycle Phase 8). It used to compare wall-clock stamps, so a backward
+ * clock correction — the normal end of every battery-less boot — made every
+ * gap negative and silently starved the recorder of samples for the rest of
+ * the boot (field-observed 2026-07-29 after a 2080→2026 NTP rewind).
  */
 import type { GroupSample } from "../agent/collectors/index.js";
+import { monotonicMs } from "./boot-policy.js";
 import { SegmentWriter, type SegmentWriterOptions } from "./segments.js";
 import type { TimeSourceTracker } from "./session.js";
 
@@ -33,6 +40,8 @@ export interface TelemetryRecorderOptions {
   writer: SegmentWriterOptions;
   /** Unknown groups fall back to being capped at rateHz; override for tests. */
   nativeCadenceHz?: Record<string, number>;
+  /** Monotonic ms clock (test seam) — drives the per-group cadence gate. */
+  monoMs?: () => number;
 }
 
 export class TelemetryRecorder {
@@ -44,11 +53,14 @@ export class TelemetryRecorder {
   private stopped = false;
   private seq = 0;
   private lastWrittenMono = new Map<string, bigint>();
-  private lastWriteAtMs = new Map<string, number>();
+  /** Monotonic ms of each group's last written sample (never wall clock). */
+  private lastWriteAtMono = new Map<string, number>();
+  private readonly monoMs: () => number;
 
   constructor(opts: TelemetryRecorderOptions) {
     this.opts = opts;
-    this.writer = new SegmentWriter(opts.writer);
+    this.monoMs = opts.monoMs ?? monotonicMs;
+    this.writer = new SegmentWriter({ ...opts.writer, monoMs: opts.writer.monoMs ?? this.monoMs });
     this.cadence = opts.nativeCadenceHz ?? NATIVE_CADENCE_HZ;
   }
 
@@ -82,6 +94,7 @@ export class TelemetryRecorder {
       const groups = await this.opts.sampleGroups();
       if (this.stopped) return; // stop() ran during the await — segment is finalized
       const now = Date.now();
+      const nowMono = this.monoMs();
       const metrics: Record<string, unknown> = {};
 
       for (const [group, s] of Object.entries(groups)) {
@@ -89,11 +102,11 @@ export class TelemetryRecorder {
         if (lastMono !== undefined && s.updatedMono <= lastMono) continue;
         const nativeHz = this.cadence[group] ?? this.opts.rateHz;
         const minGapMs = (1000 / Math.min(nativeHz, this.opts.rateHz)) * CADENCE_SLACK;
-        const lastAt = this.lastWriteAtMs.get(group);
-        if (lastAt !== undefined && now - lastAt < minGapMs) continue;
+        const lastAt = this.lastWriteAtMono.get(group);
+        if (lastAt !== undefined && nowMono - lastAt < minGapMs) continue;
         metrics[group] = s.fields;
         this.lastWrittenMono.set(group, s.updatedMono);
-        this.lastWriteAtMs.set(group, now);
+        this.lastWriteAtMono.set(group, nowMono);
       }
 
       this.writer.noteTimeSource(this.opts.timeSource.current());
@@ -103,7 +116,7 @@ export class TelemetryRecorder {
           now,
         );
       }
-      this.writer.maybeRotate(now);
+      this.writer.maybeRotate();
     } catch (err) {
       console.error(`[recording] tick failed: ${(err as Error).message}`);
     } finally {

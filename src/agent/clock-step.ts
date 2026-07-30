@@ -21,6 +21,11 @@
  *    waits HOLD_OFF_MS; at most `maxStepsPerBoot` successful steps per boot.
  *  - Plausibility: a target outside [2025, 2100) is never applied (rejects a
  *    never-NITZ'd modem clock at 1980 and garbled parses).
+ *  - NITZ trust gate (Phase 8, after the field 2080 incident): the modem's
+ *    clock is trusted only while the modem is network-REGISTERED, and CCLK
+ *    2-digit years 80–99 map to 19xx so the SIM7600's factory default
+ *    (1980-01-06, the GPS epoch) fails plausibility on its own. Either guard
+ *    alone would have prevented the incident; both ship.
  *
  * The step itself runs via `sudo -n /usr/local/bin/xorgate-setclock <epoch>` —
  * the agent runs as the provisioning user, not root (systemd drop-in
@@ -74,10 +79,27 @@ const MAX_PLAUSIBLE_MS = Date.UTC(2100, 0, 1);
 export const SETCLOCK_HELPER = "/usr/local/bin/xorgate-setclock";
 
 /**
+ * Registration <stat> values that mean "attached to a network" (3GPP 27.007):
+ * 1 = registered home, 5 = registered roaming. NITZ is a network-originated
+ * message, so a modem that has never been registered CANNOT have a
+ * NITZ-disciplined clock — whatever AT+CCLK? returns then is its own RTC.
+ */
+const REGISTERED_STATS = new Set([1, 5]);
+
+/**
  * Parse an AT+CCLK? value ("yy/MM/dd,hh:mm:ss±zz", zz = zone offset in
  * quarter hours, time is LOCAL) into UTC epoch ms. Returns null on any
  * malformation — including a missing zone, without which local time cannot be
  * anchored to UTC (SIM7600 includes it once NITZ has ever landed).
+ *
+ * Century mapping (Phase 8, field-proven): 2-digit years 80–99 map to 19xx,
+ * 00–79 to 20xx — the POSIX/RFC 2822 sliding-window convention. This matters
+ * because a cold-power-cut SIM7600 serves its factory default 80/01/06 (the
+ * GPS epoch, 1980-01-06) until network attach; mapping that to **2080** made
+ * it pass the [2025, 2100) plausibility window and step a correct clock
+ * +53 years, twice, on the 2026-07-29 drive. As 1980 it fails plausibility on
+ * its own — half of the defence in depth, the other half being the
+ * registration gate in readModemClock().
  */
 export function parseCclkUtcMs(cclk: string): number | null {
   const m = /^(\d{2})\/(\d{2})\/(\d{2}),(\d{2}):(\d{2}):(\d{2})([+-]\d{1,2})$/.exec(cclk.trim());
@@ -87,7 +109,8 @@ export function parseCclkUtcMs(cclk: string): number | null {
   const day = Number(dd);
   if (month < 1 || month > 12 || day < 1 || day > 31) return null;
   if (Number(hh) > 23 || Number(mi) > 59 || Number(ss) > 60) return null;
-  const localAsUtc = Date.UTC(2000 + Number(yy), month - 1, day, Number(hh), Number(mi), Number(ss));
+  const year = Number(yy) >= 80 ? 1900 + Number(yy) : 2000 + Number(yy);
+  const localAsUtc = Date.UTC(year, month - 1, day, Number(hh), Number(mi), Number(ss));
   return localAsUtc - Number(zone) * 15 * 60_000;
 }
 
@@ -102,6 +125,15 @@ export interface ModemClockReading {
  * Freshness is judged with the same (possibly wrong) device clock that
  * stamped read_at, so the comparison is consistent; a read_at in the future
  * (we stepped the clock backwards since the read) is treated as stale.
+ *
+ * Trust gate (Phase 8): the reading is used ONLY when the modem was
+ * network-registered — `modem_clock.reg` (captured at the CCLK read instant by
+ * daemons from Phase 8 on), falling back to the snapshot's top-level `reg` for
+ * older daemons. This is deliberately fail-CLOSED, unlike the plan's usual
+ * fail-open stance: "no evidence of registration" is exactly the state in
+ * which the modem serves its un-NITZ'd factory clock, so trusting it is the
+ * bug. The cost of being wrong here is only "no NITZ step" — GPS and NTP are
+ * untouched.
  */
 export async function readModemClock(
   now: number = Date.now(),
@@ -110,6 +142,8 @@ export async function readModemClock(
   const t = await read();
   const mc = t?.modem_clock;
   if (!mc || typeof mc.cclk !== "string" || typeof mc.read_at !== "number") return null;
+  const reg = typeof mc.reg === "number" ? mc.reg : t?.reg;
+  if (typeof reg !== "number" || !REGISTERED_STATS.has(reg)) return null;
   const readAtMs = mc.read_at * 1000;
   const age = now - readAtMs;
   if (age < -5_000 || age > MODEM_CLOCK_FRESH_MS) return null;

@@ -34,24 +34,45 @@ describe("parseCclkUtcMs", () => {
     expect(parseCclkUtcMs("26/07/29,24:26:30-16")).toBeNull(); // hour 24
   });
 
-  it("parses a never-NITZ'd 1980 clock (plausibility rejection is the stepper's)", () => {
-    // The SIM7600 default epoch parses fine — year 80 maps into 2080, which
-    // the stepper's [2025, 2100) window happens to allow numerically; the
-    // stepper additionally never sees it because the offset would be decades.
-    expect(parseCclkUtcMs("80/01/06,00:00:00+00")).toBe(Date.UTC(2080, 0, 6));
+  it("maps a never-NITZ'd 1980 clock to 19xx so plausibility rejects it (Phase 8)", () => {
+    // The SIM7600's factory default is the GPS epoch. Mapping year 80 into
+    // 2080 made it PASS the stepper's [2025, 2100) window and step a correct
+    // clock +53 years, twice, on the 2026-07-29 drive.
+    expect(parseCclkUtcMs("80/01/06,00:00:00+00")).toBe(Date.UTC(1980, 0, 6));
+    expect(parseCclkUtcMs("99/12/31,23:59:59+00")).toBe(Date.UTC(1999, 11, 31, 23, 59, 59));
+    // The 00–79 half is unchanged.
+    expect(parseCclkUtcMs("79/06/01,00:00:00+00")).toBe(Date.UTC(2079, 5, 1));
+    expect(parseCclkUtcMs("00/01/01,00:00:00+00")).toBe(Date.UTC(2000, 0, 1));
   });
 });
 
 describe("readModemClock", () => {
   const NOW = Date.UTC(2026, 6, 29, 19, 30, 0);
-  const telemetryWith = (mc: ModemTelemetry["modem_clock"]): (() => Promise<ModemTelemetry | null>) =>
+  const telemetryWith = (
+    mc: ModemTelemetry["modem_clock"],
+    top?: Partial<ModemTelemetry>,
+  ): (() => Promise<ModemTelemetry | null>) =>
     async () =>
-      ({ timestamp: "", csq: 20, rssi_dbm: -73, csq_interval: 30, status: "connected", iface: "usb0", ip: null, modem_clock: mc }) as ModemTelemetry;
+      ({
+        timestamp: "",
+        csq: 20,
+        rssi_dbm: -73,
+        csq_interval: 30,
+        status: "connected",
+        reg: 1,
+        iface: "usb0",
+        ip: null,
+        modem_clock: mc,
+        ...top,
+      }) as ModemTelemetry;
 
   it("reduces a fresh cclk + read_at pair to a clock offset", async () => {
     // Modem says 19:26:35Z at device-clock 19:26:30 → offset +5 s.
     const readAt = Math.floor(Date.UTC(2026, 6, 29, 19, 26, 30) / 1000);
-    const r = await readModemClock(NOW, telemetryWith({ cclk: "26/07/29,15:26:35-16", read_at: readAt }));
+    const r = await readModemClock(
+      NOW,
+      telemetryWith({ cclk: "26/07/29,15:26:35-16", read_at: readAt, reg: 5 }),
+    );
     expect(r?.offsetMs).toBe(5000);
   });
 
@@ -63,6 +84,27 @@ describe("readModemClock", () => {
     expect(await readModemClock(NOW, telemetryWith(null))).toBeNull();
     expect(await readModemClock(NOW, async () => null)).toBeNull();
     expect(await readModemClock(NOW, telemetryWith({ cclk: "garbage", read_at: Math.floor(NOW / 1000) }))).toBeNull();
+  });
+
+  it("refuses a reading taken while the modem was not registered (Phase 8)", async () => {
+    const readAt = Math.floor(Date.UTC(2026, 6, 29, 19, 26, 30) / 1000);
+    const cclk = { cclk: "26/07/29,15:26:35-16", read_at: readAt };
+    // 2 = searching, 0 = none, 99 = unknown: NITZ cannot have landed yet.
+    for (const reg of [0, 2, 3, 99]) {
+      expect(await readModemClock(NOW, telemetryWith({ ...cclk, reg }))).toBeNull();
+    }
+    expect(await readModemClock(NOW, telemetryWith({ ...cclk, reg: 1 }))).not.toBeNull();
+    expect(await readModemClock(NOW, telemetryWith({ ...cclk, reg: 5 }))).not.toBeNull();
+  });
+
+  it("falls back to the snapshot's top-level reg on a pre-Phase-8 daemon", async () => {
+    const readAt = Math.floor(Date.UTC(2026, 6, 29, 19, 26, 30) / 1000);
+    const cclk = { cclk: "26/07/29,15:26:35-16", read_at: readAt }; // no reg in the pair
+    expect(await readModemClock(NOW, telemetryWith(cclk, { reg: 5 }))).not.toBeNull();
+    expect(await readModemClock(NOW, telemetryWith(cclk, { reg: 2 }))).toBeNull();
+    // Fail CLOSED when neither is present: no evidence of registration is
+    // exactly the state in which the modem serves its own un-NITZ'd clock.
+    expect(await readModemClock(NOW, telemetryWith(cclk, { reg: undefined }))).toBeNull();
   });
 });
 
@@ -229,6 +271,46 @@ describe("createClockStepper", () => {
     await h.stepper.tick();
     expect(h.applied).toHaveLength(0);
     expect(h.events.filter((e) => e.includes("implausible"))).toHaveLength(1);
+  });
+
+  it("takes no step from a cold-booted, unregistered modem (Phase 8, end to end)", async () => {
+    // The exact 2026-07-29 field state: power was cut, so the SIM7600's RTC
+    // reset to the GPS epoch and it has not attached yet. Driven through the
+    // REAL readModemClock so both guards are exercised together.
+    const applied: number[] = [];
+    const snapshot = (reg: number): ModemTelemetry =>
+      ({
+        timestamp: "",
+        csq: 99,
+        rssi_dbm: null,
+        csq_interval: 30,
+        status: "connecting",
+        reg,
+        iface: "usb0",
+        ip: null,
+        modem_clock: { cclk: "80/01/06,00:00:52+00", read_at: Math.floor(BASE / 1000), reg },
+      }) as ModemTelemetry;
+    let reg = 2; // searching
+    const stepper = createClockStepper({
+      config: () => TIME_SYNC_DEFAULTS,
+      gpsClock: () => null,
+      modemClock: (n) => readModemClock(n, async () => snapshot(reg)),
+      probeNtpSynced: async () => false,
+      applyStep: async (t) => {
+        applied.push(t);
+        return { ok: true, detail: "" };
+      },
+      now: () => BASE,
+      monoMs: () => 100_000,
+    });
+    await stepper.tick();
+    expect(applied).toHaveLength(0); // reg gate: reading refused outright
+
+    // Even if a firmware quirk reported it registered, 1980 is now implausible.
+    reg = 1;
+    await stepper.tick();
+    expect(applied).toHaveLength(0);
+    expect(stepper.status().steps).toBe(0);
   });
 
   it("logs a failed apply (missing sudoers) without counting a step, then holds off", async () => {

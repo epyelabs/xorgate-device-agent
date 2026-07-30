@@ -327,11 +327,16 @@ gnss_health_state() {
 #   "gnss_ant_bias": 0|1 last-applied antenna bias state, or null before first apply
 #   "modem_temp":   modem PMU temperature in °C (AT+CPMUTEMP), or null if
 #                   never read / unsupported by this firmware
-#   "modem_clock":  {"cclk": "yy/MM/dd,hh:mm:ss±zz", "read_at": epoch_secs}
+#   "modem_clock":  {"cclk": "yy/MM/dd,hh:mm:ss±zz", "read_at": epoch_secs,
+#                    "reg": <stat>}
 #                   raw AT+CCLK? value (NITZ-disciplined local time, zone in
 #                   quarter hours) + our clock at the read instant, refreshed
 #                   ~60 s; null before the first successful read. Consumed by
-#                   the agent's offline clock stepper (Phase 4).
+#                   the agent's offline clock stepper (Phase 4). `reg` is the
+#                   registration <stat> at the READ instant (Phase 8) — the
+#                   stepper trusts the value only while it is 1/5, because an
+#                   unregistered modem has never been NITZ'd and serves its
+#                   factory default (80/01/06).
 #   "gnss": {      GNSS engine observability. LAST-KNOWLEDGE values: the fix
 #                  probe runs only on healthy-LTE health ticks (10 min) and at
 #                  the CRESET gate — while LTE is down these go stale rather
@@ -422,7 +427,7 @@ write_telemetry() {
     # Raw AT+CCLK? pair for the agent's offline clock stepper (Phase 4).
     local modem_clock="null"
     if [[ -n "$MODEM_CCLK" && -n "$MODEM_CCLK_READ_AT" ]]; then
-        modem_clock="{\"cclk\": \"$MODEM_CCLK\", \"read_at\": $MODEM_CCLK_READ_AT}"
+        modem_clock="{\"cclk\": \"$MODEM_CCLK\", \"read_at\": $MODEM_CCLK_READ_AT, \"reg\": ${MODEM_CCLK_REG:-99}}"
     fi
 
     # Write to temp file first, then atomically move into place
@@ -632,8 +637,16 @@ maybe_update_modem_temp() {
 # parse(cclk) - read_at (both captured at the same instant — the device
 # clock's own error cancels). The agent owns all parsing/validation (TZ
 # quarter-hours, never-NITZ'd bogus years); we just ship the raw pair.
+#
+# Phase 8 addition: also ship the registration <stat> AT THE READ INSTANT.
+# NITZ is network-originated, so an unregistered modem's CCLK is just its own
+# RTC — which reads the factory default 80/01/06 after a cold power cut and
+# once cost a drive a +53-year clock step. The agent refuses a reading whose
+# `reg` is not 1/5; the top-level `reg` is a different instant (telemetry
+# write time), so the pair carries its own.
 MODEM_CCLK=""
 MODEM_CCLK_READ_AT=""
+MODEM_CCLK_REG=""
 MODEM_CLOCK_AT=-9999      # negative so the first maybe_update fires immediately
 MODEM_CLOCK_INTERVAL="${SIM7600_MODEM_CLOCK_INTERVAL:-60}"
 
@@ -645,6 +658,7 @@ maybe_update_modem_clock() {
     if [[ -n "$val" ]]; then
         MODEM_CCLK="$val"
         MODEM_CCLK_READ_AT=$(date +%s)
+        MODEM_CCLK_REG="${LAST_REG:-99}"
     fi
 }
 
@@ -893,7 +907,14 @@ gps_stop() {
 # session, and only when the engine has just come up under the module's own
 # restore — is worth the restart: there is no acquisition progress to lose yet,
 # and assisted mode is the entire point of configuring a SUPL server.
-GNSS_MODE_FIX_DONE=0         # one mode-correcting engine restart per modem boot
+GNSS_MODE_FIX_DONE=0         # a mode-correcting engine restart COMPLETED this modem boot
+# The once-per-modem-boot guard used to latch on the ATTEMPT, so a corrective
+# stop that merely ran out of GNSS_STOP_SETTLE_MAX_SECS burned the single
+# chance and the leg ran standalone (1 of 5 cold boots, 2026-07-30 field
+# drive). "Stopped, corrected" and "could not stop" are different outcomes:
+# only the first is done, the second gets one bounded retry.
+GNSS_MODE_FIX_STOP_FAILS=0
+GNSS_MODE_FIX_MAX_STOP_FAILS=1
 
 # Stop an engine that is running in the WRONG mode so a start can be re-issued.
 # Returns 0 when the engine is confirmed off (caller should start it), 1 when it
@@ -908,12 +929,21 @@ GNSS_MODE_FIX_DONE=0         # one mode-correcting engine restart per modem boot
 gps_mode_correct() {
     local running="$1" mode="$2" desc="$3"
     (( GNSS_MODE_FIX_DONE )) && return 1
-    GNSS_MODE_FIX_DONE=1
+    if (( GNSS_MODE_FIX_STOP_FAILS > GNSS_MODE_FIX_MAX_STOP_FAILS )); then
+        return 1
+    fi
     log "GNSS engine is running as +CGPS: $running, but $desc ($mode) is configured — the module restores GNSS from NV on its own after a reboot and refuses a mode change while running. Stopping it once so the assisted start is accepted."
     if gps_stop_confirmed; then
+        # Latch only on a CONFIRMED stop: the engine is now ours to restart.
+        GNSS_MODE_FIX_DONE=1
         return 0
     fi
-    warn "GNSS engine did not stop — leaving it in +CGPS: $running for this session."
+    GNSS_MODE_FIX_STOP_FAILS=$(( GNSS_MODE_FIX_STOP_FAILS + 1 ))
+    if (( GNSS_MODE_FIX_STOP_FAILS > GNSS_MODE_FIX_MAX_STOP_FAILS )); then
+        warn "GNSS engine did not stop after $GNSS_MODE_FIX_STOP_FAILS corrective attempts — leaving it in +CGPS: $running for this session."
+    else
+        warn "GNSS engine did not stop within ${GNSS_STOP_SETTLE_MAX_SECS}s — leaving it in +CGPS: $running for now; one more corrective attempt is allowed this modem boot."
+    fi
     return 1
 }
 
@@ -1517,6 +1547,7 @@ creset_note_fired() {
     # restore the engine as plain 1,1 again on the way back up (F11), and this
     # session's earlier correction says nothing about the new one.
     GNSS_MODE_FIX_DONE=0
+    GNSS_MODE_FIX_STOP_FAILS=0
 }
 
 # Record a CRESET gate refusal for telemetry (the R7 log line is the primary

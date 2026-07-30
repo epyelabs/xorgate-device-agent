@@ -41,19 +41,23 @@ function gzLines(path: string): Record<string, unknown>[] {
 describe("SegmentWriter", () => {
   it("opens lazily, writes a header first, and rotates by age into a gz", () => {
     const closed: string[] = [];
+    let mono = 1000; // rotation age is monotonic (Phase 8), naming stays wall
     const w = new SegmentWriter({
       dir: sessionDir(),
       header,
       maxAgeMs: 1000,
+      monoMs: () => mono,
       onSegmentClosed: (p) => closed.push(p),
     });
     expect(existsSync(sessionDir())).toBe(false); // nothing until the first sample
 
     w.writeLine({ ts: 1000, mono: 1, seq: 0, metrics: { imu: { a: 1 } } }, 1000);
+    mono = 1100;
     w.writeLine({ ts: 1100, mono: 2, seq: 1, metrics: { imu: { a: 2 } } }, 1100);
     expect(w.activePath()).toMatch(/seg-1000-00000\.jsonl$/);
 
     // Crossing maxAgeMs rotates BEFORE the next write, which opens segment #2.
+    mono = 2500;
     w.writeLine({ ts: 2500, mono: 3, seq: 2, metrics: { imu: { a: 3 } } }, 2500);
     expect(closed).toHaveLength(1);
     expect(closed[0]).toMatch(/seg-1000-00000\.jsonl\.gz$/);
@@ -70,16 +74,46 @@ describe("SegmentWriter", () => {
 
   it("applies default rotation limits when options are passed as undefined (manager path)", () => {
     const closed: string[] = [];
+    let mono = 1000;
     const w = new SegmentWriter({
       dir: sessionDir(),
       header,
       maxBytes: undefined, // exactly how RecordingManager forwards absent overrides
       maxAgeMs: undefined,
+      monoMs: () => mono,
       onSegmentClosed: (p) => closed.push(p),
     });
     w.writeLine({ ts: 1000, mono: 1, seq: 0, metrics: { imu: { a: 1 } } }, 1000);
+    mono = 62_000;
     w.writeLine({ ts: 62_000, mono: 2, seq: 1, metrics: { imu: { a: 2 } } }, 62_000); // > default 60 s
     expect(closed).toHaveLength(1);
+  });
+
+  it("keeps rolling after the wall clock jumps backwards (Phase 8)", () => {
+    // Field case (2026-07-29): the stepper put the clock in 2080, then NTP
+    // rewound it 53 years mid-segment. With wall-clock age, `now - openedAt`
+    // went hugely negative and the roller never rolled again for the rest of
+    // the boot — one segment per drive instead of ~18.
+    const closed: string[] = [];
+    let mono = 0;
+    const w = new SegmentWriter({
+      dir: sessionDir(),
+      header,
+      maxAgeMs: 60_000,
+      monoMs: () => mono,
+      onSegmentClosed: (p) => closed.push(p),
+    });
+    const future = Date.UTC(2080, 0, 6, 0, 0, 52);
+    w.writeLine({ ts: future, mono: 1, seq: 0, metrics: { imu: { a: 1 } } }, future);
+    // 60 s of real time later the clock has been rewound to 2026.
+    mono = 60_000;
+    const rewound = Date.UTC(2026, 6, 29, 23, 24, 54);
+    w.writeLine({ ts: rewound, mono: 2, seq: 1, metrics: { imu: { a: 2 } } }, rewound);
+    expect(closed).toHaveLength(1);
+    // ...and it keeps rolling on the monotonic cadence afterwards.
+    mono = 120_000;
+    w.writeLine({ ts: rewound + 60_000, mono: 3, seq: 2, metrics: { imu: { a: 3 } } }, rewound + 60_000);
+    expect(closed).toHaveLength(2);
   });
 
   it("rotates by size", () => {

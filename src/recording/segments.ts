@@ -14,6 +14,13 @@
  * both the gz file and its directory. Crash tolerance: on startup,
  * finalizeOrphanSegments() gzips any leftover `.jsonl` from a previous run,
  * truncating a torn last line.
+ *
+ * Clock stance (optimize-system-process-cycle Phase 8): the wall clock names
+ * segments and stamps samples, but it never SCHEDULES anything. Rotation age
+ * is measured on the monotonic clock, because a battery-less device corrects
+ * its clock minutes into every boot — and a backward correction made
+ * `now - openedAt` negative, which wedged the roller for the rest of the boot
+ * (field-observed 2026-07-29: 1 segment per drive instead of ~18).
  */
 import {
   closeSync,
@@ -30,6 +37,7 @@ import {
 import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { fsyncDir } from "../lib/atomicWrite.js";
+import { monotonicMs } from "./boot-policy.js";
 import type { TimeSource } from "./session.js";
 
 /** Rotate on whichever comes first: ~1 MB of JSONL or 60 s of age (plan: min(60 s, ~1 MB)). */
@@ -61,6 +69,11 @@ export interface SegmentWriterOptions {
   header: () => SegmentHeader;
   maxBytes?: number;
   maxAgeMs?: number;
+  /**
+   * Monotonic ms clock — the ONLY thing rotation age is measured on (Phase 8).
+   * Test seam; defaults to the process monotonic clock.
+   */
+  monoMs?: () => number;
   /** Fired with the closed .jsonl.gz path after each rotation (disk-manager hook). */
   onSegmentClosed?: (gzPath: string) => void;
 }
@@ -77,9 +90,11 @@ export class SegmentWriter {
   private path: string | null = null;
   private bytes = 0;
   private sampleLines = 0;
-  private openedAt = 0;
+  /** Monotonic ms at segment open — rotation age is measured from here. */
+  private openedAtMono = 0;
   private segSeq = 0;
   private lastTimeSource: TimeSource | null = null;
+  private readonly monoMs: () => number;
 
   constructor(opts: SegmentWriterOptions) {
     // ?? per field (not a spread) so an explicitly-undefined option can never
@@ -89,6 +104,7 @@ export class SegmentWriter {
       maxBytes: opts.maxBytes ?? SEGMENT_MAX_BYTES,
       maxAgeMs: opts.maxAgeMs ?? SEGMENT_MAX_AGE_MS,
     };
+    this.monoMs = opts.monoMs ?? monotonicMs;
   }
 
   /** Path of the active plain .jsonl, or null when no segment is open. */
@@ -98,7 +114,7 @@ export class SegmentWriter {
 
   /** Segments are opened lazily on the first sample, so idle sessions leave no files. */
   writeLine(line: SampleLine, now: number = Date.now()): void {
-    if (this.fd !== null && this.shouldRotate(now)) this.rotate();
+    if (this.fd !== null && this.shouldRotate()) this.rotate();
     if (this.fd === null) this.open(now);
     this.append(JSON.stringify(line));
     this.sampleLines++;
@@ -118,9 +134,12 @@ export class SegmentWriter {
     this.append(JSON.stringify({ ...this.opts.header(), timeSource: ts }));
   }
 
-  /** Age/size check without a write — lets an idle recorder still close segments on time. */
-  maybeRotate(now: number = Date.now()): void {
-    if (this.fd !== null && this.shouldRotate(now)) this.rotate();
+  /**
+   * Age/size check without a write — lets an idle recorder still close
+   * segments on time. Takes no clock: age is monotonic (Phase 8).
+   */
+  maybeRotate(): void {
+    if (this.fd !== null && this.shouldRotate()) this.rotate();
   }
 
   /** Close + gzip the active segment (shutdown / recording-off path). Safe to re-call. */
@@ -128,8 +147,10 @@ export class SegmentWriter {
     if (this.fd !== null) this.rotate();
   }
 
-  private shouldRotate(now: number): boolean {
-    return this.bytes >= this.opts.maxBytes || now - this.openedAt >= this.opts.maxAgeMs;
+  private shouldRotate(): boolean {
+    return (
+      this.bytes >= this.opts.maxBytes || this.monoMs() - this.openedAtMono >= this.opts.maxAgeMs
+    );
   }
 
   private open(now: number): void {
@@ -140,7 +161,7 @@ export class SegmentWriter {
     this.fd = openSync(this.path, "w", 0o600);
     this.bytes = 0;
     this.sampleLines = 0;
-    this.openedAt = now;
+    this.openedAtMono = this.monoMs();
     this.lastTimeSource = header.timeSource;
     this.append(JSON.stringify(header));
   }

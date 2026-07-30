@@ -11,8 +11,19 @@
  * back to `anchor + seq × segmentSeconds` when the fs gives no birthtime) and
  * durationMs from mtime − birthtime (last write ≈ fragment close). Accuracy is
  * well inside the plan's ±1 s MVP bound — splitmuxsink opens the file at
- * fragment start and last-writes it at finalize. startMono is derived from the
- * anchor pair so cloud-side re-anchoring (D6) stays possible.
+ * fragment start and last-writes it at finalize. startMono is derived from a
+ * wall/mono pair read AT SIDECAR-WRITE TIME (Phase 8 — not from the session
+ * anchor, which predates any clock correction this boot) so cloud-side
+ * re-anchoring (D6) stays possible.
+ *
+ * Clock steps (Phase 8, field-analysed): a correction between capture start
+ * and finalize costs no footage. Fragment 0 is anchored to the 0→1 rotation
+ * boundary and every later fragment to its own birthtime, so all of them read
+ * their timestamps from the CURRENT clock — after a +7m52s NTP step at
+ * T+37 s, the 2026-07-30 boot's fragment 0 landed within 1.5 s of the truth
+ * and the session was contiguous. The residue is a mid-session discontinuity
+ * (fragments either side of a late step disagree by the step size), which
+ * `startMono` + `bootId` exist to let the cloud repair.
  *
  * Crash recovery: on startup, any `.mp4` without a sidecar in a non-active
  * session gets a best-effort sidecar from `session.json` + file stats — playable
@@ -25,6 +36,7 @@ import { readdirSync, statSync, unlinkSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "../lib/atomicWrite.js";
+import { monotonicMs } from "./boot-policy.js";
 import type { TimeSource } from "./session.js";
 
 /** Per-session capture metadata, written once at capture-daemon spawn. */
@@ -57,6 +69,16 @@ export interface VideoSidecar {
   sessionId: string;
   seq: number;
   startTs: number;
+  /**
+   * Monotonic-clock ms of the fragment start, in this boot's frame
+   * (`session.json.bootId` scopes it). Derived from a wall/mono pair read at
+   * SIDECAR-WRITE time, not from the session's spawn anchor: both readings
+   * then sit on the same side of any clock correction, so a step between
+   * spawn and finalize can no longer make this nonsense (Phase 8; the field
+   * produced values like −1686357360550). This is the primitive cloud-side
+   * re-anchoring (D6) would use, so it has to survive exactly the case that
+   * re-anchoring exists for.
+   */
   startMono: number;
   durationMs: number;
   sizeBytes: number;
@@ -131,6 +153,14 @@ export function buildSidecar(
      * session), the manifest's spawn-time value is the best we know.
      */
     timeSource?: TimeSource;
+    /**
+     * Wall/monotonic pair read at sidecar-write time — `startMono` is derived
+     * from THIS, not from the manifest's spawn anchor (Phase 8). Both halves
+     * are read within microseconds of each other, so the pair is internally
+     * consistent no matter how the clock has moved since spawn. Test seam;
+     * defaults to reading both clocks now.
+     */
+    clockPair?: { wallMs: number; monoMs: number };
   },
 ): VideoSidecar {
   // ext4 gives real birthtimes; a zero/bogus one (some tmpfs, copied trees)
@@ -156,7 +186,15 @@ export function buildSidecar(
     durationMs = manifest.segmentSeconds * 1000;
     anchor = "computed";
   }
-  const anchorMonoMs = Number(BigInt(manifest.anchorMono) / 1_000_000n);
+  // startMono from a fresh wall/mono PAIR, never from the spawn anchor: the
+  // manifest's anchorTs was stamped under whatever clock the boot started
+  // with, so `anchorMono + (startTs − anchorTs)` charged every clock
+  // correction since spawn into a monotonic field. startTs itself is a wall
+  // reading (file birthtime), so pairing it with a wall reading taken now and
+  // converting through the mono reading taken now keeps both sides in one
+  // frame — a step BEFORE this sweep is absorbed entirely, and a step during
+  // the sweep costs at most that sweep's own duration.
+  const pair = opts.clockPair ?? { wallMs: Date.now(), monoMs: monotonicMs() };
   return {
     v: 1,
     deviceId: manifest.deviceId,
@@ -164,7 +202,7 @@ export function buildSidecar(
     sessionId: manifest.sessionId,
     seq,
     startTs,
-    startMono: anchorMonoMs + (startTs - manifest.anchorTs),
+    startMono: Math.round(pair.monoMs - (pair.wallMs - startTs)),
     durationMs,
     sizeBytes: stat.sizeBytes,
     timeSource: opts.timeSource ?? manifest.timeSource,
@@ -197,7 +235,13 @@ export interface SweepResult {
 export function sweepSessionDir(
   dir: string,
   manifest: VideoSessionManifest,
-  opts: { includeNewest: boolean; finalized?: boolean; timeSource?: TimeSource },
+  opts: {
+    includeNewest: boolean;
+    finalized?: boolean;
+    timeSource?: TimeSource;
+    /** Wall/mono pair for startMono (test seam); read once per sweep. */
+    clockPair?: { wallMs: number; monoMs: number };
+  },
 ): SweepResult {
   let names: string[];
   try {
@@ -214,6 +258,9 @@ export function sweepSessionDir(
   const sidecars = new Set(names.filter((n) => n.endsWith(".json")));
   const newest = frags[frags.length - 1];
   const closed: string[] = [];
+  // One pair for the whole sweep — every sidecar written in this pass shares
+  // the same wall↔mono frame.
+  const clockPair = opts.clockPair ?? { wallMs: Date.now(), monoMs: monotonicMs() };
 
   for (let i = 0; i < frags.length; i++) {
     const f = frags[i];
@@ -260,7 +307,12 @@ export function sweepSessionDir(
       { sizeBytes: st.size, birthtimeMs: st.birthtimeMs, mtimeMs: st.mtimeMs },
       // The newest fragment of a dead session may have been cut mid-write; all
       // others were finalized by splitmuxsink before it opened the next one.
-      { finalized: opts.finalized ?? !isNewest, boundaryEndMs, timeSource: opts.timeSource },
+      {
+        finalized: opts.finalized ?? !isNewest,
+        boundaryEndMs,
+        timeSource: opts.timeSource,
+        clockPair,
+      },
     );
     try {
       atomicWriteJson(sidecarPathFor(mp4Path), sidecar);

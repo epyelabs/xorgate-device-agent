@@ -23,6 +23,18 @@
  *    connecting; telemetry.json stale/missing >60 s (fail open — daemon absent
  *    or dead must never keep a healthy device from recording); the
  *    `bootDeferMaxSecs` hard cap.
+ *
+ * STAGE 2 — the GPS/LTE video gate (Phase 7, Q8, 2026-07-30). On a constrained
+ * budget the boot window is not over when the modem attaches: GNSS is still
+ * cold-acquiring, and the field showed ~25 min TTFF on 3 A drives where video
+ * took the power back after 90 s. So `recording.video.gpsGate` extends the same
+ * policy to hold video (recording AND live) until the modem stops converting
+ * power into value — releasing on LTE-connected + GPS fix, a declared dead
+ * zone, a sustained no-RF sky (a fix is not coming), the `gpsGateMaxSecs`
+ * give-up cap (0 = no time cap), or the same fail-open rules. Stage 2 arms
+ * exactly like stage 1 (budget-gated `auto` / `always` / `off`) and supersedes
+ * stage 1 while armed — this is ONE policy with two stages, deliberately not a
+ * second policy fighting over applyVideo().
  *  - One-shot per process: any allow verdict LATCHES. Once encoders were
  *    allowed to start, the boot window is over — runtime reactions are
  *    Phase 3's job, not this module's.
@@ -42,6 +54,7 @@
  */
 import { readFileSync } from "node:fs";
 import { LTE_TELEMETRY_FILE } from "../hardware/modem.js";
+import type { GnssView } from "../lib/sky-state.js";
 
 /** Monotonic milliseconds (never steps; see the TIME note above). */
 export function monotonicMs(): number {
@@ -51,16 +64,23 @@ export function monotonicMs(): number {
 /** Arming mode for the boot defer (device setting `recording.video.bootDefer`). */
 export type BootDeferMode = "auto" | "always" | "off";
 
-/** The three Q1/Q2 knobs, resolved from settings on every evaluation. */
+/** The Q1/Q2 knobs plus the Q8 gate knobs, resolved from settings per evaluation. */
 export interface BootDeferConfig {
   mode: BootDeferMode;
-  /** Hard cap on the defer, seconds; <=0 = feature off (today's behavior). */
+  /** Hard cap on the stage-1 defer, seconds; <=0 = stage 1 off (today's behavior). */
   maxSecs: number;
-  /** `auto` arms only below this negotiated budget (mA). */
+  /** `auto` arms only below this negotiated budget (mA); shared by both stages. */
   minBudgetMa: number;
+  /**
+   * Stage 2 arming (device setting `recording.video.gpsGate`, Phase 7/Q8):
+   * hold video until the modem has finished converting power into value.
+   */
+  gateMode: BootDeferMode;
+  /** Stage-2 give-up cap, seconds; 0 = no time cap (Q8: both behaviors required). */
+  gateMaxSecs: number;
 }
 
-export type BootDeferState = "off" | "skipped" | "deferring" | "released";
+export type BootDeferState = "off" | "skipped" | "deferring" | "gating" | "released";
 
 export interface BootDeferVerdict {
   /** May heavy encoders start yet? */
@@ -68,10 +88,18 @@ export interface BootDeferVerdict {
   state: BootDeferState;
   /**
    * Stable detail: the release reason ("connected" | "dead_zone" | "reg" |
-   * "stale" | "timeout"), the skip/arm rationale (budget comparison), or
-   * "disabled". Kept tick-stable so callers can log on change.
+   * "stale" | "timeout" | "gps-fix" | "no-rf" | "gate-timeout"), the skip/arm
+   * rationale (budget comparison), or "disabled". Kept tick-stable so callers
+   * can log on change.
    */
   why: string;
+  /**
+   * Should live streaming be held down too? True only while STAGE 2 is what is
+   * deferring: the GPS/LTE gate covers recording AND live (Q8), whereas the
+   * stage-1 modem-settle defer deliberately leaves live alone (Phase 2 — the
+   * KVS masters start lazily after MQTT anyway).
+   */
+  holdLive: boolean;
 }
 
 /** Q2: telemetry.json older (or absent longer) than this = daemon dead → fail open. */
@@ -103,56 +131,121 @@ export interface BootDeferInputs {
    */
   telemetryUnchangedMs: number | null;
   staleMs: number;
+  /**
+   * GNSS view for stage 2 (Phase 7). null = no GNSS collector on this host, in
+   * which case the gate cannot arm: a device with no receiver would otherwise
+   * hold video for the whole give-up cap on every boot, waiting for a fix that
+   * is not coming (README principle 5, fail open).
+   */
+  gnss: GnssView | null;
 }
 
 /**
  * Pure decision core (exported for tests). Evaluates one tick; latching is the
  * caller's job.
+ *
+ * Two stages of one policy (Phase 7 supersedes the Phase 2 shape rather than
+ * adding a second policy that would fight over applyVideo()):
+ *  - stage 1, "deferring": the modem-settle defer — hold heavy encoders while
+ *    the modem enumerates/attaches, bounded by `maxSecs`.
+ *  - stage 2, "gating": the GPS/LTE gate — hold video (recording AND live)
+ *    until the modem stops converting power into value, bounded by
+ *    `gateMaxSecs` (0 = unbounded by time; the other release paths still hold).
+ *
+ * When stage 2 is armed it SUPERSEDES stage 1 outright — a gated boot never
+ * releases on `reg` or the stage-1 cap, because those mean "LTE is coming up",
+ * which is precisely what the gate is waiting through.
  */
 export function decideBootDefer(cfg: BootDeferConfig, input: BootDeferInputs): BootDeferVerdict {
-  if (cfg.mode === "off" || cfg.maxSecs <= 0) {
-    return { allow: true, state: "off", why: "disabled" };
-  }
   const budgetText = input.budgetMa === null ? "psu budget unknown" : `psu budget ${input.budgetMa}mA`;
-  if (cfg.mode === "auto" && input.budgetMa !== null && input.budgetMa >= cfg.minBudgetMa) {
-    return { allow: true, state: "skipped", why: `${budgetText} >= ${cfg.minBudgetMa}` };
+  const highBudget = input.budgetMa !== null && input.budgetMa >= cfg.minBudgetMa;
+
+  const settleOff = cfg.mode === "off" || cfg.maxSecs <= 0;
+  const settleArmed = !settleOff && !(cfg.mode === "auto" && highBudget);
+  const gateOff = cfg.gateMode === "off" || input.gnss === null;
+  const gateArmed = !gateOff && !(cfg.gateMode === "auto" && highBudget);
+
+  if (!settleArmed && !gateArmed) {
+    return settleOff && gateOff
+      ? { allow: true, state: "off", why: "disabled", holdLive: false }
+      : {
+          allow: true,
+          state: "skipped",
+          why: `${budgetText} >= ${cfg.minBudgetMa}`,
+          holdLive: false,
+        };
   }
 
   const t = input.telemetry;
+  // "Stale" needs BOTH arms: the stamp reads old in wall-clock terms AND the
+  // file has not been rewritten for the stale window (monotonic). A clock step
+  // forward trips only the first arm, so it can no longer forge a dead daemon;
+  // a genuinely dead daemon trips both within the same window. With no file at
+  // all, the daemon gets the same grace — it writes telemetry.json only once it
+  // reaches its signal loop, so absence right after boot is normal.
+  let stale: boolean;
   if (t !== null) {
-    // Freshness first only for the DEAD-daemon shape (old timestamp while the
-    // status still claims activity); a terminal status wins either way.
-    // "Old" needs BOTH arms: the stamp reads old in wall-clock terms AND the
-    // file has not been rewritten for the stale window (monotonic). A clock
-    // step forward trips only the first arm, so it can no longer forge a dead
-    // daemon; a genuinely dead daemon trips both within the same window.
     const ts = typeof t.timestamp === "string" ? Date.parse(t.timestamp) : NaN;
-    const stale =
+    stale =
       !Number.isFinite(ts) ||
       (input.nowMs - ts > input.staleMs &&
         (input.telemetryUnchangedMs ?? Number.POSITIVE_INFINITY) > input.staleMs);
-    if (t.status === "connected" || t.status === "dead_zone") {
-      return { allow: true, state: "released", why: t.status };
+  } else {
+    stale = input.elapsedMs > input.staleMs;
+  }
+
+  const armText = gateArmed
+    ? cfg.gateMode === "always"
+      ? "mode=always"
+      : `${budgetText} < ${cfg.minBudgetMa}`
+    : cfg.mode === "always"
+      ? "mode=always"
+      : `${budgetText} < ${cfg.minBudgetMa}`;
+
+  if (gateArmed) {
+    // Release on the FIRST of (Q8, in order): the modem gave up on LTE; LTE is
+    // up AND the fix landed; the daemon is gone (fail open); the sky says a fix
+    // is not coming; the give-up cap.
+    if (t !== null && t.status === "dead_zone") {
+      return { allow: true, state: "released", why: "dead_zone", holdLive: false };
+    }
+    if (t !== null && t.status === "connected" && input.gnss?.fix === true) {
+      return { allow: true, state: "released", why: "gps-fix", holdLive: false };
     }
     if (stale) {
-      return { allow: true, state: "released", why: "stale" };
+      return { allow: true, state: "released", why: "stale", holdLive: false };
+    }
+    if (input.gnss?.sky === "no-rf") {
+      return { allow: true, state: "released", why: "no-rf", holdLive: false };
+    }
+    if (cfg.gateMaxSecs > 0 && input.elapsedMs >= cfg.gateMaxSecs * 1000) {
+      return { allow: true, state: "released", why: "gate-timeout", holdLive: false };
+    }
+    return { allow: false, state: "gating", why: armText, holdLive: true };
+  }
+
+  if (t !== null) {
+    // A terminal status wins over freshness either way.
+    if (t.status === "connected" || t.status === "dead_zone") {
+      return { allow: true, state: "released", why: t.status, holdLive: false };
+    }
+    if (stale) {
+      return { allow: true, state: "released", why: "stale", holdLive: false };
     }
     if (t.status === "connecting" && (t.reg === 1 || t.reg === 5)) {
-      return { allow: true, state: "released", why: "reg" };
+      return { allow: true, state: "released", why: "reg", holdLive: false };
     }
-  } else if (input.elapsedMs > input.staleMs) {
-    // The daemon writes telemetry.json only once it reaches its signal loop —
-    // absence right after boot is normal. Absence past the stale window means
-    // the daemon isn't there at all (unit disabled, modem never enumerated).
-    return { allow: true, state: "released", why: "stale" };
+  } else if (stale) {
+    // Absence past the stale window means the daemon isn't there at all (unit
+    // disabled, modem never enumerated).
+    return { allow: true, state: "released", why: "stale", holdLive: false };
   }
 
   if (input.elapsedMs >= cfg.maxSecs * 1000) {
-    return { allow: true, state: "released", why: "timeout" };
+    return { allow: true, state: "released", why: "timeout", holdLive: false };
   }
 
-  const armText = cfg.mode === "always" ? "mode=always" : `${budgetText} < ${cfg.minBudgetMa}`;
-  return { allow: false, state: "deferring", why: armText };
+  return { allow: false, state: "deferring", why: armText, holdLive: false };
 }
 
 export interface BootDeferPolicyOptions {
@@ -164,6 +257,11 @@ export interface BootDeferPolicyOptions {
   now?: () => number;
   /** Monotonic clock — every interval (grace window, hard cap, file freshness). */
   monoMs?: () => number;
+  /**
+   * GNSS view for the stage-2 gate (Phase 7). Omit on hosts without a GPS
+   * collector: the gate then never arms (see BootDeferInputs.gnss).
+   */
+  gnss?: () => GnssView | null;
 }
 
 /**
@@ -178,6 +276,7 @@ export class BootDeferPolicy {
   private readonly staleMs: number;
   private readonly now: () => number;
   private readonly monoMs: () => number;
+  private readonly gnss: () => GnssView | null;
   private readonly startMono: number;
   /** undefined = not read yet; null = unreadable (non-Pi / dev box). */
   private budgetMa: number | null | undefined;
@@ -193,6 +292,7 @@ export class BootDeferPolicy {
     this.staleMs = opts.staleMs ?? TELEMETRY_STALE_MS;
     this.now = opts.now ?? Date.now;
     this.monoMs = opts.monoMs ?? monotonicMs;
+    this.gnss = opts.gnss ?? (() => null);
     this.startMono = this.monoMs();
   }
 
@@ -212,6 +312,7 @@ export class BootDeferPolicy {
       elapsedMs: mono - this.startMono,
       telemetryUnchangedMs: this.noteStamp(telemetry, mono),
       staleMs: this.staleMs,
+      gnss: this.gnss(),
     });
     this.last = verdict;
     if (verdict.allow) this.latched = verdict;

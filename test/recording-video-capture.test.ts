@@ -844,7 +844,91 @@ describe("RecordingManager boot power staging (Phase 2)", () => {
     expect(spawner.spawns.at(-1)!.args.join(" ")).toContain("splitmuxsink");
   });
 
-  it("telemetry-only recording is never deferred", async () => {
+  /**
+   * Phase 7 stage 2: the gate must hold BOTH pipelines (bridge-only capture +
+   * parked live masters) and release them together — one boolean into the media
+   * supervisor, so it can never fight the shed ladder over the same control.
+   */
+  it("the GPS gate parks live streaming too, and releases both on a fix", async () => {
+    const spawner = fakeSpawner();
+    const events: string[] = [];
+    const shedCalls: boolean[] = [];
+    const telemetryFile = join(home, "telemetry.json");
+    const writeConnected = () =>
+      writeFileSync(
+        telemetryFile,
+        JSON.stringify({ timestamp: new Date().toISOString(), status: "connected", reg: 1 }),
+      );
+    writeConnected();
+    let fix = false;
+    const policy = new BootDeferPolicy({
+      telemetryFile,
+      budgetPath: writeBudget(home, 3000),
+      gnss: () => ({ fix, sky: "clear" }),
+    });
+    saveSettings({ recording: { video: { enabled: true, gpsGate: "auto" } } });
+    manager = new RecordingManager({
+      deviceId: "dev-1",
+      sampleGroups: async () => ({}),
+      root: join(home, "recordings"),
+      pollMs: 60_000,
+      bootPolicy: policy,
+      onEvent: (_l, m) => events.push(m),
+      video: {
+        mediaEnabled: true,
+        cameras: () => [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+        shmDir: join(home, "shm"),
+        spawn: spawner.spawn,
+        stableMs: 50,
+        sweepPollMs: 3600_000,
+        setLiveShed: (shed) => shedCalls.push(shed),
+      },
+    });
+    await manager.start();
+    await delay(20);
+    // LTE is already connected — stage 1 would have released here; the gate
+    // holds because there is no fix yet.
+    expect(manager.status().bootDefer).toBe("gating");
+    expect(spawner.spawns[0].args.join(" ")).not.toContain("splitmuxsink");
+    expect(shedCalls).toEqual([true]);
+    expect(events.some((m) => m.includes("gps gate armed") && m.includes("cap 600s"))).toBe(true);
+
+    fix = true;
+    writeConnected();
+    manager.reapply();
+    await delay(200);
+    expect(manager.status().bootDefer).toBe("released:gps-fix");
+    expect(shedCalls).toEqual([true, false]); // live released alongside capture
+    expect(spawner.spawns.at(-1)!.args.join(" ")).toContain("splitmuxsink");
+    expect(events.some((m) => m.includes("released (gps-fix)"))).toBe(true);
+  });
+
+  it("a no-RF sky releases the gate without a fix", async () => {
+    const spawner = fakeSpawner();
+    const telemetryFile = join(home, "telemetry-norf.json");
+    writeFileSync(
+      telemetryFile,
+      JSON.stringify({ timestamp: new Date().toISOString(), status: "connected", reg: 1 }),
+    );
+    let sky: "clear" | "no-rf" = "clear";
+    const policy = new BootDeferPolicy({
+      telemetryFile,
+      budgetPath: writeBudget(home, 3000),
+      gnss: () => ({ fix: false, sky }),
+    });
+    saveSettings({ recording: { video: { enabled: true, gpsGate: "always" } } });
+    manager = makeManager(spawner, policy, []);
+    await manager.start();
+    await delay(20);
+    expect(manager.status().bootDefer).toBe("gating");
+
+    sky = "no-rf";
+    manager.reapply();
+    await delay(200);
+    expect(manager.status().bootDefer).toBe("released:no-rf");
+  });
+
+  it("telemetry recording is never deferred or gated", async () => {
     const spawner = fakeSpawner();
     const policy = new BootDeferPolicy({
       telemetryFile: join(home, "absent-telemetry.json"),
@@ -855,7 +939,11 @@ describe("RecordingManager boot power staging (Phase 2)", () => {
     await manager.start();
     await delay(150);
     expect(manager.status().enabled).toBe(true); // telemetry recorder running
-    expect(manager.status().bootDefer).toBeUndefined(); // policy never consulted
+    // Since Phase 7 the policy IS consulted with video recording off (the gate
+    // also holds live streaming), but it can only ever hold VIDEO: no capture
+    // child runs in record mode, and the telemetry recorder is untouched.
+    expect(manager.status().bootDefer).toBe("deferring");
+    expect(spawner.spawns.every((s) => !s.args.join(" ").includes("splitmuxsink"))).toBe(true);
   });
 });
 

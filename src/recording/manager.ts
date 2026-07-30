@@ -37,6 +37,7 @@ import {
   type ShedLevel,
   type ShedVerdict,
 } from "./boot-policy.js";
+import type { GnssView } from "../lib/sky-state.js";
 import {
   createTimeSourceTracker,
   mintSessionId,
@@ -148,6 +149,12 @@ export interface RecordingManagerOptions {
   segmentMaxAgeMs?: number;
   timeSource?: TimeSourceTracker;
   timeProbeTimeoutMs?: number;
+  /**
+   * GNSS view for the Phase 7 video gate — the worker wires the gps collector.
+   * Absent (or returning null) leaves the gate disarmed, so a host without a
+   * receiver behaves exactly as it did before Phase 7.
+   */
+  gnss?: () => GnssView | null;
   /** Boot power staging policy override (tests inject fake telemetry/budget). */
   bootPolicy?: BootDeferPolicy;
   /**
@@ -188,7 +195,7 @@ export class RecordingManager {
   /** Current rung as published in status(); null = full operation / inert. */
   private shedStatus: string | null = null;
   private shedLevel: ShedLevel = 0;
-  /** Whether the live KVS masters are currently parked by rung 1. */
+  /** Whether the live KVS masters are currently parked (shed rung 1 or the Phase 7 gate). */
   private liveShed = false;
   /** powerShedding namespace fingerprint — a change resets the policy (clears park). */
   private shedCfgKey: string;
@@ -201,7 +208,7 @@ export class RecordingManager {
   constructor(opts: RecordingManagerOptions) {
     this.opts = opts;
     this.timeSource = opts.timeSource ?? createTimeSourceTracker();
-    this.bootPolicy = opts.bootPolicy ?? new BootDeferPolicy();
+    this.bootPolicy = opts.bootPolicy ?? new BootDeferPolicy({ gnss: opts.gnss });
     this.shedPolicy = opts.shedPolicy ?? new LoadShedPolicy();
     this.root = opts.root ?? recordingsRoot();
     this.cfg = resolveRecordingConfig(loadSettings().recording);
@@ -423,25 +430,33 @@ export class RecordingManager {
     // camera exists (the heavy-load case this protects); null = feature inert,
     // behave exactly as today.
     const shed = this.updateShedMonitor(cameras.length > 0);
-    const shedLive = shed !== null && shed.level >= 1;
-    if (shedLive !== this.liveShed) {
-      this.liveShed = shedLive;
-      vo.setLiveShed?.(shedLive);
-    }
-    // Boot power staging (Phase 2): while the modem is still bringing up LTE
-    // on a constrained supply budget, run bridge-only (record=false) so live
-    // streaming can attach but no x264 encoder competes with the attach/TX
-    // power draw. The policy latches its first allow — after that this is a
-    // plain pass-through of recording.video.enabled.
+    // Boot power staging (Phase 2 stage 1 + Phase 7 stage 2): while the modem
+    // is still converting power into value on a constrained supply budget, run
+    // bridge-only (record=false) so live streaming can attach but no x264
+    // encoder competes with the attach/acquisition draw. The policy latches its
+    // first allow — after that this is a plain pass-through of
+    // recording.video.enabled. Consulted whenever a camera exists (not only
+    // when recording is enabled), because the Phase 7 gate also holds LIVE.
     let record = this.cfg.video.enabled;
-    if (record && cameras.length > 0) {
+    let gateHoldsLive = false;
+    if (cameras.length > 0) {
       const verdict = this.bootPolicy.evaluate({
         mode: this.cfg.video.bootDefer,
         maxSecs: this.cfg.video.bootDeferMaxSecs,
         minBudgetMa: this.cfg.video.bootDeferMinBudgetMa,
+        gateMode: this.cfg.video.gpsGate,
+        gateMaxSecs: this.cfg.video.gpsGateMaxSecs,
       });
-      record = verdict.allow;
+      if (!verdict.allow) record = false;
+      gateHoldsLive = verdict.holdLive;
       this.noteBootDefer(verdict);
+    }
+    // Live streaming is held down by EITHER shed rung 1 or the Phase 7 gate —
+    // one boolean into the media supervisor, so the two can't fight over it.
+    const liveParked = (shed !== null && shed.level >= 1) || gateHoldsLive;
+    if (liveParked !== this.liveShed) {
+      this.liveShed = liveParked;
+      vo.setLiveShed?.(liveParked);
     }
     // Shed rung 2: recording off, bridge-only (telemetry recording — the
     // crash evidence — keeps running; it is not touched by the ladder).
@@ -565,15 +580,19 @@ export class RecordingManager {
     const status = verdict.state === "released" ? `released:${verdict.why}` : verdict.state;
     if (status === this.bootDeferStatus) return;
     this.bootDeferStatus = status;
+    const gateCap = this.cfg.video.gpsGateMaxSecs;
     const msg =
       verdict.state === "deferring"
         ? `video boot-defer armed (${verdict.why}) — bridge-only until the modem settles ` +
           `(cap ${this.cfg.video.bootDeferMaxSecs}s)`
-        : verdict.state === "skipped"
-          ? `video boot-defer skipped: ${verdict.why}`
-          : verdict.state === "released"
-            ? `video boot-defer released (${verdict.why}) — starting full capture`
-            : `video boot-defer off (${verdict.why})`;
+        : verdict.state === "gating"
+          ? `video gps gate armed (${verdict.why}) — bridge-only + live parked until LTE is up ` +
+            `with a GPS fix (${gateCap > 0 ? `cap ${gateCap}s` : "no time cap"})`
+          : verdict.state === "skipped"
+            ? `video boot-defer skipped: ${verdict.why}`
+            : verdict.state === "released"
+              ? `video boot-defer released (${verdict.why}) — starting full capture`
+              : `video boot-defer off (${verdict.why})`;
     this.opts.onEvent?.("info", msg);
     this.notifyStatus();
   }

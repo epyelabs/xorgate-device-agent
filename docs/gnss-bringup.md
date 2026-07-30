@@ -79,6 +79,20 @@ Runtime upkeep while the link is healthy:
   command responses and can confuse naive parsers. Clear with `AT+CMGD=1,4`.
 - **Mode 3 (UE-assisted, `AT+CGPS=1,3`) is broken with public SUPL servers**
   — it immediately self-stops (`+CGPS: 0`). Known community-wide; don't use.
+- **`AT+CGPS=<mode>` is rejected while the engine is RUNNING — including the
+  mode it is already in** (bench-isolated 2026-07-30). With `+CGPS: 1,2` live,
+  both `AT+CGPS=1,2` and `AT+CGPS=1` answer `ERROR`; the engine is unaffected.
+  `AT+CGPS=0` answers `OK` immediately but the engine keeps running for several
+  more seconds (an async `+CGPS: 0` marks the real stop, ~6 s measured), and a
+  start inside that window is rejected too — that, not elapsed time, is what the
+  historical "explicit-mode start failed twice" fallback was hitting.
+  Consequences the daemon now handles: (a) after a modem reboot the module
+  restores GNSS **by itself as plain `1,1`**, so a device that power-cycles
+  spends the session in standalone unless something stops the engine and
+  restarts it in `1,2` (`gps_start` now does this once per session);
+  (b) a single lost `AT+CGPS?` read in the flaky early-boot window used to make
+  the daemon report a standalone fallback that never happened, on an engine
+  already running in `1,2` — it now confirms the state before claiming it.
 - **One AT-port owner.** The daemon owns `/dev/ttyUSB2`. A second reader
   steals response bytes from the first. Stop `sim7600-lte.service` before any
   manual AT session.
@@ -111,7 +125,9 @@ send 'AT+CGPSINFO'        # position when fixed
 Run with the daemon stopped, from a spot representative of the deployment:
 
 ```sh
-send 'AT+CGPS=0' 3; sleep 3
+send 'AT+CGPS=0' 3
+# Wait for the engine to REALLY stop before any start/DEL — poll AT+CGPS?
+# until it reads 0 (~6 s). Commands issued while it still reads 1,x ERROR out.
 send 'AT+CGPSDEL' 3          # wipe aiding (XTRA file survives)
 send 'AT+CGPS=1,1' 2
 # poll AT+CGPSINFO every 1-2 s; TTFF = time until lat/lon appear

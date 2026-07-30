@@ -44,6 +44,19 @@ export interface RecordingSettings {
     bootDeferMaxSecs?: number;
     /** `auto` skips the defer at/above this negotiated budget in mA (default 5000). */
     bootDeferMinBudgetMa?: number;
+    /**
+     * GPS/LTE video gate (optimize-system-process-cycle plan, Phase 7 / Q8):
+     * stage 2 of the boot policy. On a constrained budget, video — recording
+     * AND live — waits until the modem has finished converting power into
+     * value: LTE connected with a GPS fix, a declared dead zone, a sustained
+     * no-RF sky, or the give-up cap. "auto" (default) is budget-gated on
+     * bootDeferMinBudgetMa exactly like bootDefer; "always" gates every boot
+     * (the way to exercise it on a 5 A bench); "off" is pre-Phase-7 behavior.
+     * Telemetry recording is never gated.
+     */
+    gpsGate?: "auto" | "always" | "off";
+    /** Gate give-up cap, seconds (default 600; 0 = wait indefinitely, clamp ≤3600). */
+    gpsGateMaxSecs?: number;
     /** Inter-camera spawn delay, seconds (default 4; 0 = simultaneous as before). */
     spawnStaggerSecs?: number;
     /**
@@ -262,6 +275,16 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
     const bootDeferMinBudgetMa = (vid as { bootDeferMinBudgetMa?: unknown }).bootDeferMinBudgetMa;
     if (typeof bootDeferMinBudgetMa === "number" && Number.isFinite(bootDeferMinBudgetMa)) {
       o.bootDeferMinBudgetMa = Math.min(10_000, Math.max(0, Math.round(bootDeferMinBudgetMa)));
+    }
+    const gpsGate = (vid as { gpsGate?: unknown }).gpsGate;
+    if (gpsGate === "auto" || gpsGate === "always" || gpsGate === "off") {
+      o.gpsGate = gpsGate;
+    }
+    const gpsGateMaxSecs = (vid as { gpsGateMaxSecs?: unknown }).gpsGateMaxSecs;
+    if (typeof gpsGateMaxSecs === "number" && Number.isFinite(gpsGateMaxSecs)) {
+      // 0 stays meaningful (Q8: no time cap at all — the other release paths
+      // still bound it); 3600 is the sanity ceiling.
+      o.gpsGateMaxSecs = Math.min(3600, Math.max(0, Math.round(gpsGateMaxSecs)));
     }
     const spawnStaggerSecs = (vid as { spawnStaggerSecs?: unknown }).spawnStaggerSecs;
     if (typeof spawnStaggerSecs === "number" && Number.isFinite(spawnStaggerSecs)) {

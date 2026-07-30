@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -203,6 +203,43 @@ describe("createGpsCollector", () => {
       warn.mockRestore();
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("publishes sky visibility in telemetry and in the daemon-facing file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xorgate-gps-"));
+    const file = join(dir, "nmea.txt");
+    // Four GPS satellites with real C/N0 + four listed but silent: heard 4,
+    // usable 4 (>= 20 dBHz), in view 8.
+    await writeFile(
+      file,
+      [
+        "$GPGGA,083745.000,1430.1234,N,12101.5678,E,1,08,0.9,545.4,M,46.9,M,,*56",
+        "$GPGSV,2,1,08,05,31,077,29,15,79,067,20,20,46,052,30,21,,,21,1",
+        "$GPGSV,2,2,08,10,11,274,,18,75,292,,23,41,286,,27,09,322,,1",
+      ].join("\n") + "\n",
+    );
+    const skyPath = join(dir, "gnss-sky.json");
+
+    vi.stubEnv("GPS_NMEA_PORT", file);
+    vi.resetModules();
+    const { createGpsCollector } = await import("../src/agent/collectors/gps.js");
+    const collector = createGpsCollector({ skyStatePath: skyPath });
+
+    const fields = await readUntilFix(collector);
+    expect(fields.sats_heard).toEqual({ value: 4 });
+    expect(fields.snr_max).toEqual({ value: 30, unit: "dBHz" });
+    expect(fields.satellites_in_view).toEqual({ value: 8 });
+    // Freshly seen: `clear` has to hold first, so this reads obstructed (1).
+    expect(fields.sky_state).toEqual({ value: 1 });
+
+    const published = JSON.parse(await readFile(skyPath, "utf8")) as Record<string, unknown>;
+    expect(published).toMatchObject({ v: 1, state: "obstructed", heard: 4, in_view: 8 });
+    expect(typeof published.timestamp).toBe("string");
+    // The gate/daemon view agrees with the telemetry view.
+    expect(collector.sky().heard).toBe(4);
+    expect(collector.hasFix()).toBe(true);
+
+    await rm(dir, { recursive: true, force: true });
   });
 
   it("returns {} when the NMEA port is absent", async () => {

@@ -15,6 +15,7 @@ import { loadConfig } from "./agent/config.js";
 import { applyCloudConfig, parseCloudConfig } from "./agent/cloud-config.js";
 import { createClockStepper, resolveTimeSyncConfig } from "./agent/clock-step.js";
 import type { GpsClockReading } from "./agent/collectors/gps.js";
+import type { GnssView } from "./lib/sky-state.js";
 import { createTimeSourceTracker } from "./recording/session.js";
 import { loadSettings } from "./daemon/settings.js";
 import {
@@ -60,6 +61,7 @@ const source: {
   setDisabledStreams?: (streamKeys: readonly string[]) => void;
   samplePower?: () => Promise<PowerSampleReading | null>;
   gpsClock?: () => GpsClockReading | null;
+  gnssView?: () => GnssView | null;
 } =
   config.mode === "real"
     ? createCollector(
@@ -200,6 +202,9 @@ const recording = new RecordingManager({
   // sampler, so the recorder and the shedder share one vcgencmd stream.
   // Absent in sim mode (no real power to measure → shedding inert).
   powerSample: source.samplePower ? () => source.samplePower!() : undefined,
+  // GNSS view for the Phase 7 video gate (fix + sky visibility). Absent in sim
+  // mode and on GPS-less hosts, which leaves the gate disarmed.
+  gnss: source.gnssView ? () => source.gnssView!() : undefined,
   onStatus: (status) => {
     store.setRecording(status);
     store.flush(Date.now());

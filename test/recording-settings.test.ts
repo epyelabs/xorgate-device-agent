@@ -80,13 +80,31 @@ describe("parseRecordingSettings", () => {
     });
   });
 
-  it("resolves boot staging defaults (auto / 90 s / 5000 mA / 4 s stagger)", () => {
+  it("accepts and clamps the Phase 7 GPS gate knobs", () => {
+    expect(parseRecordingSettings({ video: { gpsGate: "always", gpsGateMaxSecs: 900 } })).toEqual({
+      video: { gpsGate: "always", gpsGateMaxSecs: 900 },
+    });
+    // 0 = "no time cap" (Q8) — it must survive parsing, not be dropped.
+    expect(parseRecordingSettings({ video: { gpsGateMaxSecs: 0 } })).toEqual({
+      video: { gpsGateMaxSecs: 0 },
+    });
+    expect(
+      parseRecordingSettings({ video: { gpsGate: "maybe", gpsGateMaxSecs: 99_999 } }),
+    ).toEqual({ video: { gpsGateMaxSecs: 3600 } });
+    expect(parseRecordingSettings({ video: { gpsGateMaxSecs: -5 } })).toEqual({
+      video: { gpsGateMaxSecs: 0 },
+    });
+  });
+
+  it("resolves boot staging defaults (auto / 90 s / 5000 mA / 4 s stagger / gate auto 600 s)", () => {
     const cfg = resolveRecordingConfig(undefined);
     expect(cfg.video).toMatchObject({
       bootDefer: "auto",
       bootDeferMaxSecs: 90,
       bootDeferMinBudgetMa: 5000,
       spawnStaggerSecs: 4,
+      gpsGate: "auto",
+      gpsGateMaxSecs: 600,
     });
     expect(RECORDING_DEFAULTS.video.bootDefer).toBe("auto");
   });

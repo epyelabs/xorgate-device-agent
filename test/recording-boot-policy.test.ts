@@ -14,7 +14,14 @@ import {
 } from "../src/recording/boot-policy.js";
 import { cleanup, tempHome } from "./helpers.js";
 
-const CFG: BootDeferConfig = { mode: "auto", maxSecs: 90, minBudgetMa: 5000 };
+// Stage 1 only: the Phase 7 gate has its own describe block below.
+const CFG: BootDeferConfig = {
+  mode: "auto",
+  maxSecs: 90,
+  minBudgetMa: 5000,
+  gateMode: "off",
+  gateMaxSecs: 600,
+};
 
 /** Inputs for a freshly-armed defer: constrained budget, fresh connecting telemetry. */
 function inputs(over: Partial<BootDeferInputs> = {}): BootDeferInputs {
@@ -28,6 +35,8 @@ function inputs(over: Partial<BootDeferInputs> = {}): BootDeferInputs {
     // explicitly in its own cases below.
     telemetryUnchangedMs: 0,
     staleMs: TELEMETRY_STALE_MS,
+    // No GNSS view by default — the gate cases below supply one.
+    gnss: null,
     ...over,
   };
 }
@@ -170,6 +179,136 @@ describe("decideBootDefer", () => {
       allow: true,
       why: "timeout",
     });
+  });
+});
+
+/**
+ * Stage 2 — the GPS/LTE video gate (Phase 7 / Q8). Arms like stage 1 and, while
+ * armed, SUPERSEDES it: a gated boot never releases on `reg` or the stage-1 cap.
+ */
+describe("decideBootDefer — GPS/LTE gate (Phase 7)", () => {
+  const GATE: BootDeferConfig = {
+    mode: "auto",
+    maxSecs: 90,
+    minBudgetMa: 5000,
+    gateMode: "auto",
+    gateMaxSecs: 600,
+  };
+  /** Constrained budget, LTE connected, no fix yet, sky says be patient. */
+  function gateInputs(over: Partial<BootDeferInputs> = {}): BootDeferInputs {
+    const now = 1_000_000_000_000;
+    return {
+      budgetMa: 3000,
+      telemetry: { timestamp: new Date(now - 1000).toISOString(), status: "connected", reg: 1 },
+      nowMs: now,
+      elapsedMs: 30_000,
+      telemetryUnchangedMs: 0,
+      staleMs: TELEMETRY_STALE_MS,
+      gnss: { fix: false, sky: "clear" },
+      ...over,
+    };
+  }
+
+  it("holds video AND live while LTE is up but the fix has not landed", () => {
+    expect(decideBootDefer(GATE, gateInputs())).toMatchObject({
+      allow: false,
+      state: "gating",
+      holdLive: true,
+      why: "psu budget 3000mA < 5000",
+    });
+  });
+
+  it("releases on LTE connected + GPS fix (the happy path)", () => {
+    expect(
+      decideBootDefer(GATE, gateInputs({ gnss: { fix: true, sky: "clear" } })),
+    ).toMatchObject({ allow: true, state: "released", why: "gps-fix", holdLive: false });
+  });
+
+  it("a fix alone does not release while LTE is still connecting", () => {
+    const stillAttaching = gateInputs({
+      telemetry: { timestamp: new Date(1_000_000_000_000 - 1000).toISOString(), status: "connecting", reg: 1 },
+      gnss: { fix: true, sky: "clear" },
+    });
+    // This is exactly the input stage 1 alone WOULD have released on (`reg`) —
+    // which is the point: the gate supersedes it.
+    expect(decideBootDefer({ ...GATE, gateMode: "off" }, stillAttaching)).toMatchObject({
+      allow: true,
+      why: "reg",
+    });
+    expect(decideBootDefer(GATE, stillAttaching)).toMatchObject({ allow: false, state: "gating" });
+  });
+
+  it("releases on a declared dead zone (the modem gave up on LTE)", () => {
+    const dead = gateInputs({
+      telemetry: { timestamp: new Date(1_000_000_000_000 - 1000).toISOString(), status: "dead_zone" },
+    });
+    expect(decideBootDefer(GATE, dead)).toMatchObject({ allow: true, why: "dead_zone" });
+  });
+
+  it("releases on a sustained no-RF sky (a fix is not coming)", () => {
+    expect(
+      decideBootDefer(GATE, gateInputs({ gnss: { fix: false, sky: "no-rf" } })),
+    ).toMatchObject({ allow: true, why: "no-rf" });
+    // An obstructed or unknown sky is NOT a release — only the confirmed verdict.
+    for (const sky of ["obstructed", "unknown"] as const) {
+      expect(decideBootDefer(GATE, gateInputs({ gnss: { fix: false, sky } })).allow).toBe(false);
+    }
+  });
+
+  it("releases at the give-up cap, and never on the stage-1 cap", () => {
+    // Well past bootDeferMaxSecs (90 s) — the gate keeps holding.
+    expect(decideBootDefer(GATE, gateInputs({ elapsedMs: 120_000 })).allow).toBe(false);
+    expect(decideBootDefer(GATE, gateInputs({ elapsedMs: 600_000 }))).toMatchObject({
+      allow: true,
+      why: "gate-timeout",
+    });
+  });
+
+  it("gateMaxSecs 0 means no time cap at all (Q8)", () => {
+    const noCap = { ...GATE, gateMaxSecs: 0 };
+    expect(decideBootDefer(noCap, gateInputs({ elapsedMs: 86_400_000 })).allow).toBe(false);
+    // ... but the other release paths still bound it.
+    expect(
+      decideBootDefer(noCap, gateInputs({ elapsedMs: 86_400_000, gnss: { fix: false, sky: "no-rf" } })),
+    ).toMatchObject({ allow: true, why: "no-rf" });
+  });
+
+  it("fails open when the modem daemon is gone", () => {
+    expect(decideBootDefer(GATE, gateInputs({ telemetry: null, elapsedMs: 61_000 }))).toMatchObject({
+      allow: true,
+      why: "stale",
+    });
+  });
+
+  it("auto is budget-gated; always gates a 5 A device; off is pre-Phase-7 behavior", () => {
+    expect(decideBootDefer(GATE, gateInputs({ budgetMa: 5000 }))).toMatchObject({
+      allow: true,
+      state: "skipped",
+    });
+    expect(
+      decideBootDefer({ ...GATE, gateMode: "always" }, gateInputs({ budgetMa: 5000 })),
+    ).toMatchObject({ allow: false, state: "gating", why: "mode=always" });
+    // Gate off + stage 1 armed → the plain Phase 2 release on `connected`.
+    expect(decideBootDefer({ ...GATE, gateMode: "off" }, gateInputs())).toMatchObject({
+      allow: true,
+      why: "connected",
+      holdLive: false,
+    });
+  });
+
+  it("arms on its own when the stage-1 defer is switched off", () => {
+    expect(
+      decideBootDefer({ ...GATE, mode: "off" }, gateInputs()),
+    ).toMatchObject({ allow: false, state: "gating" });
+  });
+
+  it("cannot arm without a GNSS view — a receiver-less host is never held", () => {
+    expect(
+      decideBootDefer({ ...GATE, gateMode: "always" }, gateInputs({ gnss: null })),
+    ).toMatchObject({ allow: true, why: "connected" });
+    expect(
+      decideBootDefer({ ...GATE, mode: "off", gateMode: "always" }, gateInputs({ gnss: null })),
+    ).toMatchObject({ allow: true, state: "off" });
   });
 });
 

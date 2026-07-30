@@ -9,7 +9,7 @@
  * writes happen here, so there's no contention with the daemon's AT polling.
  */
 import { createReadStream, type ReadStream } from "node:fs";
-import { createFixAggregator, type GpsFix } from "../lib/nmea.js";
+import { createFixAggregator, parseGsv, type GpsFix, type GsvMessage } from "../lib/nmea.js";
 
 /** NMEA GPS port. Override with GPS_NMEA_PORT (handy for local testing). */
 export const GPS_NMEA_PORT = process.env.GPS_NMEA_PORT ?? "/dev/ttyUSB1";
@@ -17,6 +17,13 @@ export const GPS_NMEA_PORT = process.env.GPS_NMEA_PORT ?? "/dev/ttyUSB1";
 export interface GpsStreamHandlers {
   /** Called with a fresh copy of the rolling fix whenever a sentence updates it. */
   onFix?: (fix: GpsFix) => void;
+  /**
+   * Called for every GSV sentence, whether or not it changed the rolling fix
+   * (optimize-system-process-cycle plan, Phase 7): the sky-visibility tracker
+   * needs per-satellite C/N0, and it must keep ticking precisely when nothing
+   * changes — a garage repeats the same "listed, silent" sky every second.
+   */
+  onGsv?: (msg: GsvMessage) => void;
   onError?: (message: string) => void;
   /** Stream ended/closed (EOF on a file, or the tty vanished). */
   onEnd?: () => void;
@@ -58,6 +65,10 @@ export function streamGps(port: string = GPS_NMEA_PORT, handlers: GpsStreamHandl
     let updated = false;
     for (const line of parts) {
       if (agg.update(line)) updated = true;
+      if (handlers.onGsv && line.includes("GSV")) {
+        const gsv = parseGsv(line);
+        if (gsv) handlers.onGsv(gsv);
+      }
     }
     if (updated) handlers.onFix?.({ ...agg.fix });
   });

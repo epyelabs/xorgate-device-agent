@@ -3,6 +3,7 @@ import type { MediaConfig } from "../config.js";
 import type { PowerSampleReading } from "../../recording/boot-policy.js";
 import { createImuCollector } from "./imu.js";
 import { createGpsCollector, type GpsClockReading } from "./gps.js";
+import type { GnssView } from "../../lib/sky-state.js";
 import { createLteCollector } from "./lte.js";
 import { createSystemCollector } from "./system.js";
 import { createMediaCollector, type MediaSupervisor } from "./media.js";
@@ -73,6 +74,13 @@ export function createCollector(
    * capability is off or no fresh RMC time exists.
    */
   gpsClock(): GpsClockReading | null;
+  /**
+   * GNSS view for the Phase 7 video gate: does the receiver have a fix, and
+   * what does the sky look like (see lib/sky-state.ts)? null when the gps
+   * capability is off — the gate then stays disarmed rather than holding video
+   * on a device that can never satisfy it.
+   */
+  gnssView(): GnssView | null;
 } {
   const collectors: Collector[] = [];
   const system = ioCapabilities.system ? createSystemCollector() : null;
@@ -141,6 +149,10 @@ export function createCollector(
     },
     gpsClock(): GpsClockReading | null {
       return gps?.clock() ?? null;
+    },
+    gnssView(): GnssView | null {
+      if (!gps) return null;
+      return { fix: gps.hasFix(), sky: gps.sky().state };
     },
   };
 }

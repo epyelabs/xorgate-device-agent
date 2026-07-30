@@ -153,22 +153,87 @@ export function parseSentence(line: string): Partial<GpsFix> | null {
   return null;
 }
 
+/** One satellite block of a GSV sentence. */
+export interface GsvSatellite {
+  /** Satellite id (PRN / slot), as reported by the constellation's talker. */
+  prn: number;
+  /** Elevation in degrees, or null when the field is blank. */
+  elevation: number | null;
+  /** Azimuth in degrees true, or null when the field is blank. */
+  azimuth: number | null;
+  /**
+   * Carrier-to-noise density in dBHz, or null when the field is BLANK — which
+   * is the whole point of this parser: a receiver lists satellites it merely
+   * expects from almanac/ephemeris with an empty C/N0 field, and only fills it
+   * in for satellites it is actually HEARING. "Listed but silent" is a garage
+   * or a dead antenna; "listed and heard" is RF (see lib/sky-state.ts).
+   */
+  snr: number | null;
+}
+
+/** One parsed GSV sentence (satellites arrive split across numMsgs of them). */
+export interface GsvMessage {
+  /** Talker id without the `$` — GP, GL, BD/GB, GA, GQ … (one per constellation). */
+  talker: string;
+  msgNum: number;
+  numMsgs: number;
+  /** Satellites in view for THIS talker (repeated on every message of the cycle). */
+  inView: number;
+  satellites: GsvSatellite[];
+}
+
+function numOrNull(v: string | undefined): number | null {
+  if (v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 /**
- * Parse a GSV header into its talker + total satellites in view, or null for
- * anything else. Kept separate from parseSentence because in-view counts come
- * per constellation ($GPGSV, $GLGSV, $GAGSV, …) and only make sense summed —
- * the aggregator owns that state.
+ * Parse a GSV sentence — the sky-visibility source (optimize-system-process-cycle
+ * plan, Phase 7). Kept separate from parseSentence because GSV is per
+ * constellation ($GPGSV, $GLGSV, $BDGSV, …) and multi-sentence: only the
+ * consumer that reassembles a full cycle across talkers can say anything, so
+ * this returns the raw message and owns no state.
+ *
+ * Field layout: `$xxGSV,numMsgs,msgNum,inView,{prn,elev,azim,snr}×≤4[,…]`.
+ * Trailing extras are tolerated by construction — satellite blocks are read as
+ * complete quadruples only, so the NMEA 4.10 `signalId` suffix (and the extra
+ * pair the SIM7600 appends to $BDGSV) is simply left unread.
  */
-export function parseGsvInView(line: string): { talker: string; inView: number } | null {
+export function parseGsv(line: string): GsvMessage | null {
   const trimmed = line.trim();
   if (!trimmed.startsWith("$") || !checksumValid(trimmed)) return null;
   const star = trimmed.indexOf("*");
   const body = star === -1 ? trimmed : trimmed.slice(0, star);
   const fields = body.split(",");
   if (fields[0].slice(3) !== "GSV") return null;
+  const numMsgs = parseInt(fields[1], 10);
+  const msgNum = parseInt(fields[2], 10);
   const inView = parseInt(fields[3], 10);
-  if (Number.isNaN(inView)) return null;
-  return { talker: fields[0].slice(1, 3), inView };
+  if (Number.isNaN(numMsgs) || Number.isNaN(msgNum) || Number.isNaN(inView)) return null;
+  const satellites: GsvSatellite[] = [];
+  for (let i = 4; i + 3 < fields.length; i += 4) {
+    const prn = parseInt(fields[i], 10);
+    // A non-numeric id means we're reading trailing fields, not a satellite.
+    if (Number.isNaN(prn) || prn <= 0) continue;
+    satellites.push({
+      prn,
+      elevation: numOrNull(fields[i + 1]),
+      azimuth: numOrNull(fields[i + 2]),
+      snr: numOrNull(fields[i + 3]),
+    });
+  }
+  return { talker: fields[0].slice(1, 3), msgNum, numMsgs, inView, satellites };
+}
+
+/**
+ * Parse a GSV header into its talker + total satellites in view, or null for
+ * anything else. In-view counts come per constellation and only make sense
+ * summed — the aggregator owns that state.
+ */
+export function parseGsvInView(line: string): { talker: string; inView: number } | null {
+  const msg = parseGsv(line);
+  return msg === null ? null : { talker: msg.talker, inView: msg.inView };
 }
 
 export interface FixAggregator {

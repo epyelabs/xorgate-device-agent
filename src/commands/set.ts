@@ -28,6 +28,8 @@
  *   recording.video.bootDefer <auto|always|off>
  *   recording.video.bootDeferMaxSecs <0-600> recording.video.bootDeferMinBudgetMa <0-10000>
  *   recording.video.spawnStaggerSecs <0-30>
+ *   recording.video.gpsGate <auto|always|off>
+ *   recording.video.gpsGateMaxSecs <0-3600>   (0 = no time cap)
  * (bootDefer* / spawnStaggerSecs are the Phase 2 boot power staging knobs —
  * optimize-system-process-cycle plan.)
  *   recording.video.cameras.<streamKey> <on|off>
@@ -130,6 +132,7 @@ function setRecordingCommand(key: string, value: string | undefined): void {
     field === "minFreeBytes" ||
     field === "bootDeferMaxSecs" ||
     field === "bootDeferMinBudgetMa" ||
+    field === "gpsGateMaxSecs" ||
     field === "spawnStaggerSecs" ||
     field === "uvSamples" ||
     field === "uvWindowSecs" ||
@@ -147,7 +150,7 @@ function setRecordingCommand(key: string, value: string | undefined): void {
       return;
     }
     raw = num;
-  } else if (field === "bootDefer") {
+  } else if (field === "bootDefer" || field === "gpsGate") {
     if (value !== "auto" && value !== "always" && value !== "off") {
       console.error(`${key} must be auto|always|off, got '${value ?? ""}'`);
       process.exitCode = 1;

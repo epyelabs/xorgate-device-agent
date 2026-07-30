@@ -19,6 +19,13 @@ export interface ResolvedRecordingConfig {
     bootDefer: "auto" | "always" | "off";
     bootDeferMaxSecs: number;
     bootDeferMinBudgetMa: number;
+    /**
+     * GPS/LTE video gate (Phase 7) — stage 2 of the boot policy. Armed like
+     * bootDefer (`auto` is budget-gated on bootDeferMinBudgetMa).
+     */
+    gpsGate: "auto" | "always" | "off";
+    /** Gate give-up cap, seconds; 0 = no time cap (Q8). */
+    gpsGateMaxSecs: number;
     spawnStaggerSecs: number;
     /**
      * Per-camera enable (Phase 6), keyed by streamKey. ABSENT KEY = ENABLED,
@@ -43,6 +50,8 @@ export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
     bootDefer: "auto",
     bootDeferMaxSecs: 90,
     bootDeferMinBudgetMa: 5000,
+    gpsGate: "auto",
+    gpsGateMaxSecs: 600,
     spawnStaggerSecs: 4,
     cameras: {},
   },
@@ -77,6 +86,8 @@ export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecording
       bootDefer: s?.video?.bootDefer ?? d.video.bootDefer,
       bootDeferMaxSecs: s?.video?.bootDeferMaxSecs ?? d.video.bootDeferMaxSecs,
       bootDeferMinBudgetMa: s?.video?.bootDeferMinBudgetMa ?? d.video.bootDeferMinBudgetMa,
+      gpsGate: s?.video?.gpsGate ?? d.video.gpsGate,
+      gpsGateMaxSecs: s?.video?.gpsGateMaxSecs ?? d.video.gpsGateMaxSecs,
       spawnStaggerSecs: s?.video?.spawnStaggerSecs ?? d.video.spawnStaggerSecs,
       cameras: s?.video?.cameras ?? d.video.cameras,
     },

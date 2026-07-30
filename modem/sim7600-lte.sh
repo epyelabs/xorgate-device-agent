@@ -14,7 +14,8 @@
 #         standalone when the server is unreachable
 #   - Re-asserts the GNSS engine while connected (survives modem resets) and
 #     self-heals a wedged engine: on + fixless too long -> clean engine
-#     restart, capped per hour (never a modem reset)
+#     restart, capped per hour (never a modem reset), and suppressed while the
+#     agent reports a no-RF sky (a garage is not a wedge — see SKY_STATE_FILE)
 #   - Adaptive CSQ polling: faster when signal is changing rapidly
 #   - Signal-aware reconnect: distinguishes dead zone vs network failure
 #   - Registration-aware: good RSSI alone never triggers a connect attempt;
@@ -82,7 +83,21 @@ DRIFT_CONFIRM_DELAY=15       # secs between the two reads that confirm drift
 # SUPL-assisted start AT+CGPS=1,2 is rejected ("explicit mode not accepted")
 # when issued too soon after AT+CGPS=0 or a modem reboot; the same command is
 # accepted after a ~4-5 s settle. Sequencing bug, not a firmware limitation.
+# ROOT CAUSE, isolated on the bench 2026-07-30 (Phase 7C): the rejection is not
+# about elapsed time at all — the module rejects AT+CGPS=<mode> whenever the
+# engine is still RUNNING, including the very mode requested (AT+CGPS=1,2 ->
+# ERROR while +CGPS? reads 1,2; AT+CGPS=1 -> ERROR too). The settle "worked"
+# only because AT+CGPS=0 needs those seconds to take effect. At cold boot the
+# module restores GNSS from NV by itself, so the engine is already up when the
+# daemon starts, and a single lost AT+CGPS? read is enough to mistake that for
+# "engine off" and issue a doomed start. See gps_stop (bounded wait for the
+# engine to be really off) and gps_start (confirm the state before claiming a
+# standalone fallback).
 GNSS_START_SETTLE_SECS=5     # min settle before an explicit-mode engine start
+# Bounded wait for the engine to actually stop after AT+CGPS=0 (Phase 7C). The
+# module answers OK immediately and keeps running for several more seconds; any
+# AT+CGPS=<mode> inside that window is rejected.
+GNSS_STOP_SETTLE_MAX_SECS=20
 # Post-reset quiet period (F10/F11): for ~10 s after re-enumeration the modem
 # answers config queries with well-formed boot DEFAULTS (NV not yet loaded)
 # and auto-restarts the GNSS engine itself as plain "1,1". Post-reset recovery
@@ -188,6 +203,20 @@ GNSS_REASSERT_INTERVAL=600           # re-check the engine every 10 min while co
 # is barely affected.
 GNSS_WEDGE_RESTART_SECS="${SIM7600_GNSS_WEDGE_RESTART_SECS:-1200}"
 GNSS_WEDGE_RESTART_MAX_PER_HOUR="${SIM7600_GNSS_WEDGE_RESTART_MAX_PER_HOUR:-1}"  # 0 = detect + log only, never restart
+# Sky-visibility veto for that detector (optimize-system-process-cycle plan,
+# Phase 7). The detector above is blind by construction — the daemon's only fix
+# view is AT+CGNSSINFO, so it cannot tell a garage from a wedged engine and
+# restarts the engine either way. The agent CAN tell: it parses per-satellite
+# C/N0 out of GSV and publishes a hysteretic verdict to this small file
+# (device src/lib/sky-state.ts). A sustained "no-rf" means nothing is being
+# heard on any constellation — nothing is wedged, the sky is simply missing —
+# so the restart is suppressed. Fail-open by design: a missing, unparseable or
+# STALE file (dead agent, pre-Phase-7 build) means no opinion, and the detector
+# behaves exactly as it did before. Crucially "no NMEA at all" is published as
+# `unknown`, never `no-rf`: a silenced NMEA stream is the brownout/wedge
+# signature (2026-07-28), the one case the restart must still fire for.
+SKY_STATE_FILE="${SIM7600_SKY_STATE_FILE:-/var/lib/xorgate/gnss-sky.json}"
+SKY_STATE_FRESH_SECS=60              # older than this = no opinion
 
 # Telemetry
 TELEMETRY_FILE="${SIM7600_TELEMETRY_FILE:-/run/sim7600-lte/telemetry.json}"
@@ -678,6 +707,29 @@ gnss_bias_apply() {
     GNSS_BIAS_APPLIED="$desired"
 }
 
+# Sky visibility as published by the agent: prints "clear", "obstructed",
+# "no-rf", or "" for no opinion (missing/unreadable/bad JSON/stale/no python3).
+# Same failure posture as gnss_bias_desired — every error path resolves to the
+# answer that changes nothing.
+gnss_sky_state() {
+    python3 - "$SKY_STATE_FILE" "$SKY_STATE_FRESH_SECS" 2>/dev/null <<'PYEOF'
+import json, sys, time, calendar
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    # The file's own ISO stamp is the freshness contract; an agent that died
+    # (or never got past boot) must not keep vetoing forever.
+    ts = calendar.timegm(time.strptime(d["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
+    if abs(time.time() - ts) > float(sys.argv[2]):
+        print("")
+    else:
+        s = d.get("state")
+        print(s if s in ("clear", "obstructed", "no-rf") else "")
+except Exception:
+    print("")
+PYEOF
+}
+
 # --- Recovery policy from settings.json (R8) ---------------------------------
 # Two cloud-delivered *policy* knobs ride the same conduit as gnssAntBias
 # (web device settings -> retained MQTT -> settings.json -> live re-read here).
@@ -788,11 +840,39 @@ gnss_fix_present() {
     return 1
 }
 
+# Issue AT+CGPS=0 and wait (bounded) for the engine to REALLY be off.
+#
+# AT+CGPS=0 answers OK immediately but the engine keeps running for a few more
+# seconds (the module emits an async "+CGPS: 0" when it is really down;
+# bench-measured ~6 s on 2026-07-30). Any AT+CGPS=<mode> issued inside that
+# window is REJECTED — which is what the historical "explicit-mode start failed"
+# fallback was really hitting.
+#
+# Verification uses the RETRYING confirmed read, never the single-shot
+# gps_engine_on: this whole code path exists because that read is unreliable at
+# cold boot, so depending on it here would reintroduce the very bug (a lost read
+# made the stop a no-op, and the re-issued start was rejected again — caught on
+# the bench 2026-07-30). Returns 0 only when the engine is confirmed off.
+gps_stop_confirmed() {
+    log "Stopping GNSS engine for reconfiguration (AT+CGPS=0)..."
+    at_cmd "AT+CGPS=0" 3
+    GNSS_ENGINE_ON=0
+    local deadline=$(( SECONDS + GNSS_STOP_SETTLE_MAX_SECS )) state rc
+    while (( SECONDS < deadline )); do
+        sleep 1
+        state=$(at_setting_confirmed "AT+CGPS?" "CGPS"); rc=$?
+        if (( rc == 0 )) && [[ "$state" == 0* ]]; then
+            log "GNSS engine confirmed off after $(( GNSS_STOP_SETTLE_MAX_SECS - (deadline - SECONDS) ))s."
+            return 0
+        fi
+    done
+    warn "GNSS engine still reads on ${GNSS_STOP_SETTLE_MAX_SECS}s after AT+CGPS=0."
+    return 1
+}
+
 gps_stop() {
     if gps_engine_on; then
-        log "Stopping GNSS engine for reconfiguration (AT+CGPS=0)..."
-        at_cmd "AT+CGPS=0" 3
-        GNSS_ENGINE_ON=0
+        gps_stop_confirmed || true
     fi
 }
 
@@ -804,17 +884,56 @@ gps_stop() {
 # auto-reverts and AT+CGPS? later reads 1,1. That is the documented fallback,
 # NOT a failed start; nothing may flap the engine to force mode 2 back
 # (gnss_health's "any 1,x = on" check depends on this).
-gps_start() {
-    if gps_engine_on; then
-        return
+#
+# ONE exception to that non-goal, added 2026-07-30 (Phase 7C) on bench evidence:
+# after a modem reboot the MODULE restores GNSS by itself as plain 1,1, and a
+# mode change is refused while the engine runs — so a device that power-cycles
+# (every car start) spent its whole session in standalone mode with the daemon
+# reporting a "fallback" that never executed. Correcting THAT — once per daemon
+# session, and only when the engine has just come up under the module's own
+# restore — is worth the restart: there is no acquisition progress to lose yet,
+# and assisted mode is the entire point of configuring a SUPL server.
+GNSS_MODE_FIX_DONE=0         # one mode-correcting engine restart per modem boot
+
+# Stop an engine that is running in the WRONG mode so a start can be re-issued.
+# Returns 0 when the engine is confirmed off (caller should start it), 1 when it
+# must be left alone (already corrected this modem boot, or it refused to stop).
+#
+# Reached from BOTH detection points, because the cold boot hits them
+# unpredictably: when the early-boot AT+CGPS? read succeeds we notice the wrong
+# mode up front, and when that read is LOST (the flaky window that also loses
+# the CGNSSMODE/CGPSXE/CGPSURL/CGPSNMEA reads — 2026-07-30 15:00 boot) we only
+# find out because the start itself is rejected. Correcting in one place and
+# giving up in the other is how that boot silently ran standalone all session.
+gps_mode_correct() {
+    local running="$1" mode="$2" desc="$3"
+    (( GNSS_MODE_FIX_DONE )) && return 1
+    GNSS_MODE_FIX_DONE=1
+    log "GNSS engine is running as +CGPS: $running, but $desc ($mode) is configured — the module restores GNSS from NV on its own after a reboot and refuses a mode change while running. Stopping it once so the assisted start is accepted."
+    if gps_stop_confirmed; then
+        return 0
     fi
+    warn "GNSS engine did not stop — leaving it in +CGPS: $running for this session."
+    return 1
+}
+
+gps_start() {
     local mode="1,2" desc="UE-based AGPS (SUPL; auto-falls back to standalone)"
     if [[ -z "$SUPL_URL" ]]; then
         mode="1,1" desc="standalone"
     fi
+    if gps_engine_on; then
+        # Engine already up. Is it up in the mode we want?
+        local running rc
+        running=$(at_setting_confirmed "AT+CGPS?" "CGPS"); rc=$?
+        if (( rc != 0 )) || [[ "$running" == "$mode"* ]]; then
+            return 0
+        fi
+        gps_mode_correct "$running" "$mode" "$desc" || return 0
+    fi
     # F4: the explicit-mode start is rejected when it lands too close to the
-    # last AT+CGPS=0 / modem reboot; this settle is what turns the historical
-    # "not accepted" fallback into a first-try acceptance.
+    # last AT+CGPS=0 / modem reboot (root cause: the engine is still running —
+    # see the GNSS_STOP_SETTLE_MAX_SECS note at the top).
     sleep "$GNSS_START_SETTLE_SECS"
     log "Starting GNSS engine in $desc mode (AT+CGPS=$mode)..."
     # Telemetry: every start attempt re-arms the coarse TTFF clock.
@@ -832,10 +951,65 @@ gps_start() {
         GNSS_STANDALONE_FALLBACK=0
         return 0
     fi
+    # Before believing the start failed, ask what the engine is actually doing.
+    # BENCH-VERIFIED 2026-07-30 (optimize-system-process-cycle plan, Phase 7C):
+    # the module rejects AT+CGPS=<anything> while the engine is still running —
+    # INCLUDING the exact mode requested — so a single lost AT+CGPS? read in the
+    # flaky early-boot window (the same one that loses the CGNSSMODE/CGPSXE/
+    # CGPSURL/CGPSNMEA reads) is enough to send an already-assisted engine down
+    # this path. Every "SUPL assist unavailable" line in the field logs so far
+    # was this: +CGPS read back 1,2 the whole time. Claiming a standalone
+    # fallback that never happened is worse than the non-event it describes —
+    # it sends the next investigation after a phantom.
+    local actual rc
+    actual=$(at_setting_confirmed "AT+CGPS?" "CGPS"); rc=$?
+    if (( rc == 0 )) && [[ "$actual" == "$mode"* ]]; then
+        log "AT+CGPS=$mode was rejected because the engine is ALREADY running in that mode (+CGPS: $actual) — the module restores GNSS from NV on its own after a reboot. Nothing to do; $desc mode is active."
+        GNSS_ENGINE_ON=1
+        GNSS_STANDALONE_FALLBACK=0
+        return 0
+    fi
+    if (( rc == 0 )) && [[ "$actual" == 1,* ]]; then
+        # Running, but in the wrong mode — the rejection IS the symptom. This is
+        # the cold-boot case where the up-front AT+CGPS? read was lost, so the
+        # correction has to happen here or the session stays standalone.
+        if gps_mode_correct "$actual" "$mode" "$desc"; then
+            sleep "$GNSS_START_SETTLE_SECS"
+            log "Re-issuing the $desc start after the corrective stop (AT+CGPS=$mode)..."
+            GNSS_LAST_ENGINE_START=$(date +%s)
+            resp=$(at_query "AT+CGPS=$mode" 6)
+            if grep -q "OK" <<< "$resp"; then
+                GNSS_ENGINE_ON=1
+                GNSS_STANDALONE_FALLBACK=0
+                return 0
+            fi
+            warn "The re-issued AT+CGPS=$mode was rejected too — restarting the engine plain so GNSS runs at all."
+            resp=$(at_query "AT+CGPS=1" 6)
+            if grep -q "OK" <<< "$resp"; then
+                GNSS_ENGINE_ON=1
+                GNSS_STANDALONE_FALLBACK=1
+                return 0
+            fi
+            warn "Plain AT+CGPS=1 was rejected as well — GNSS engine state unknown; the health loop will re-check."
+            return 1
+        fi
+        warn "AT+CGPS=$mode was rejected and the engine is already running as +CGPS: $actual — leaving it alone (mode already corrected once this modem boot, or the engine refused to stop; the wedge detector still governs this session)."
+        GNSS_ENGINE_ON=1
+        GNSS_STANDALONE_FALLBACK=1
+        return 0
+    fi
     warn "GNSS explicit-mode start failed twice — falling back to plain AT+CGPS=1 (running standalone: SUPL assist unavailable this session)."
-    at_cmd "AT+CGPS=1" 2
-    GNSS_ENGINE_ON=1
-    GNSS_STANDALONE_FALLBACK=1
+    resp=$(at_query "AT+CGPS=1" 6)
+    if grep -q "OK" <<< "$resp"; then
+        GNSS_ENGINE_ON=1
+        GNSS_STANDALONE_FALLBACK=1
+        return 0
+    fi
+    # Both starts rejected AND the state read is unusable: record NOTHING as
+    # definite (GNSS_ENGINE_ON keeps last-knowledge semantics) and let the
+    # health loop re-check on its own cadence.
+    warn "Plain AT+CGPS=1 was rejected too and the engine state could not be read — leaving GNSS state unknown; the health loop will re-check."
+    return 1
 }
 
 # Read a "+PREFIX: value" style current setting; prints the raw value part.
@@ -1101,6 +1275,18 @@ gnss_health() {
         log "GNSS health: engine on, no fix for ${fixless}s/${GNSS_WEDGE_RESTART_SECS}s — watching."
         return 0
     fi
+    # Sky-visibility veto (Phase 7): the time-only detector is about to call
+    # this a wedge. Ask the agent whether there is any sky first — a garage or a
+    # bagged antenna is not a wedge, and restarting the engine there throws away
+    # acquisition state for nothing. Re-arm the clock so a returning sky earns a
+    # full window before the detector may judge the session again.
+    local sky
+    sky=$(gnss_sky_state)
+    if [[ "$sky" == "no-rf" ]]; then
+        NO_FIX_SINCE=$now
+        log "GNSS health: no fix for ${fixless}s but the agent reports a no-RF sky (no satellite heard on any constellation) — engine restart suppressed; no-fix clock re-armed, so a returning sky gets a full ${GNSS_WEDGE_RESTART_SECS}s window."
+        return 0
+    fi
     # Rolling per-hour cap (same prune idiom as creset_budget_recount).
     local t kept=()
     for t in "${GNSS_WEDGE_RESTARTS[@]}"; do
@@ -1327,6 +1513,10 @@ creset_note_fired() {
     LAST_MODEM_RESET=$(date +%s)
     CRESET_TIMES+=("$LAST_MODEM_RESET")
     CRESET_LAST_PATH="${1:-unknown}"
+    # A modem reboot re-arms the one-shot GNSS mode correction: the module will
+    # restore the engine as plain 1,1 again on the way back up (F11), and this
+    # session's earlier correction says nothing about the new one.
+    GNSS_MODE_FIX_DONE=0
 }
 
 # Record a CRESET gate refusal for telemetry (the R7 log line is the primary

@@ -288,7 +288,10 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
           c.state = "stopped";
           c.handle?.stop("SIGINT");
         }
-        if (channels.size > 0) console.warn("[media] live masters parked (power load shedding)");
+        // Two callers share this control (load shedding rung 1 and the Phase 7
+        // GPS/LTE gate), so the message names the effect, not the cause — the
+        // cause is logged by whichever policy asked, at the same instant.
+        if (channels.size > 0) console.warn("[media] live masters parked (power policy)");
         return;
       }
       // Release: respawn everything from a clean slate (fresh backoff — the
@@ -299,7 +302,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
         c.backoffMs = BASE_BACKOFF_MS;
         if (!c.handle && !c.restartTimer) spawn(c.channelName);
       }
-      if (channels.size > 0) console.log("[media] live masters released (power load shedding over)");
+      if (channels.size > 0) console.log("[media] live masters released (power policy cleared)");
     },
     setDisabledStreams(streamKeys: readonly string[]): void {
       if (stopped) return;

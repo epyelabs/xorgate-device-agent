@@ -40,6 +40,12 @@ export interface KvsRuntimeEnv {
   pipelinePath?: string;
   /** AWS_KVS_LOG_LEVEL (1 verbose … 7 silent); default 3 = INFO, like run-master.sh. */
   logLevel?: string;
+  /**
+   * KVS_IDLE_TEARDOWN_SECS — seconds with zero viewers after which the runtime stops its x264
+   * encoder pipeline (it restarts transparently on the next viewer offer). `"0"` keeps the
+   * pre-Phase-9 behavior, where the encoder runs from the first viewer until the process exits.
+   */
+  idleTeardownSecs?: string;
 }
 
 /**
@@ -92,6 +98,7 @@ export function streamChannel(
     LD_LIBRARY_PATH: ldPath,
   };
   if (env.pipelinePath) childEnv.KVS_GST_PIPELINE = env.pipelinePath;
+  if (env.idleTeardownSecs !== undefined) childEnv.KVS_IDLE_TEARDOWN_SECS = env.idleTeardownSecs;
 
   return runStream(binaryPath, [channelName, mediaType, source], handlers, { env: childEnv });
 }

@@ -176,6 +176,7 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
         libDir: cfg.libDir,
         pipelinePath,
         logLevel: cfg.logLevel,
+        idleTeardownSecs: cfg.idleTeardownSecs,
       },
       {
         // Forward the runtime's diagnostics (the KVS SDK's "error while loading

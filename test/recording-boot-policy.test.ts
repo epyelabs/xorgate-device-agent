@@ -21,6 +21,7 @@ const CFG: BootDeferConfig = {
   minBudgetMa: 5000,
   gateMode: "off",
   gateMaxSecs: 600,
+  gateNoProgressSecs: 0,
 };
 
 /** Inputs for a freshly-armed defer: constrained budget, fresh connecting telemetry. */
@@ -193,6 +194,9 @@ describe("decideBootDefer — GPS/LTE gate (Phase 7)", () => {
     minBudgetMa: 5000,
     gateMode: "auto",
     gateMaxSecs: 600,
+    // Off by default in this block so the pre-existing cases keep testing the
+    // arms they were written for; the escape hatch has its own cases below.
+    gateNoProgressSecs: 0,
   };
   /** Constrained budget, LTE connected, no fix yet, sky says be patient. */
   function gateInputs(over: Partial<BootDeferInputs> = {}): BootDeferInputs {
@@ -630,5 +634,93 @@ describe("LoadShedPolicy (Phase 3 runtime undervoltage shedding)", () => {
     policy.reset();
     expect(policy.evaluate(cfg)).toMatchObject({ level: 0, parked: false });
     expect(policy.statusString()).toBeNull();
+  });
+});
+
+/**
+ * No-progress escape hatch (Phase 10 iteration 2). The 2026-07-30 garage drive
+ * found every other gate release blind at once — no LTE, CSQ 99 (so
+ * `disconnected`, not `dead_zone`), and a module reporting a constant 4
+ * satellites with no fix (so `clear`, never `no-rf`) — leaving only the 600 s
+ * cap and costing 5 min 37 s of footage.
+ */
+describe("decideBootDefer — gate no-progress escape hatch", () => {
+  const CFG_NP: BootDeferConfig = {
+    mode: "auto",
+    maxSecs: 90,
+    minBudgetMa: 5000,
+    gateMode: "auto",
+    gateMaxSecs: 600,
+    gateNoProgressSecs: 120,
+  };
+  /** The exact garage state: no LTE, no fix, and a sky that reads `clear`. */
+  function garage(over: Partial<BootDeferInputs> = {}): BootDeferInputs {
+    const now = 1_000_000_000_000;
+    return {
+      budgetMa: 3000,
+      telemetry: {
+        timestamp: new Date(now - 1000).toISOString(),
+        status: "disconnected",
+        reg: 99,
+      },
+      nowMs: now,
+      elapsedMs: 130_000,
+      telemetryUnchangedMs: 0,
+      staleMs: TELEMETRY_STALE_MS,
+      gnss: { fix: false, sky: "clear" },
+      ...over,
+    };
+  }
+
+  it("releases once neither a fix nor LTE has arrived for the window", () => {
+    const v = decideBootDefer(CFG_NP, garage());
+    expect(v).toMatchObject({ allow: true, state: "released", why: "no-progress" });
+  });
+
+  it("keeps gating before the window elapses", () => {
+    const v = decideBootDefer(CFG_NP, garage({ elapsedMs: 119_000 }));
+    expect(v).toMatchObject({ allow: false, state: "gating", holdLive: true });
+  });
+
+  it("never fires while LTE IS connected — that is the acquiring case", () => {
+    // Connected + no fix + open sky: genuinely acquiring, so stay patient and
+    // let gateMaxSecs bound it.
+    const v = decideBootDefer(CFG_NP, garage({
+      telemetry: { timestamp: new Date(1_000_000_000_000 - 1000).toISOString(), status: "connected", reg: 1 },
+      elapsedMs: 500_000,
+    }));
+    expect(v).toMatchObject({ allow: false, state: "gating" });
+    // ...and the cap still applies.
+    const capped = decideBootDefer(CFG_NP, garage({
+      telemetry: { timestamp: new Date(1_000_000_000_000 - 1000).toISOString(), status: "connected", reg: 1 },
+      elapsedMs: 600_000,
+    }));
+    expect(capped).toMatchObject({ allow: true, why: "gate-timeout" });
+  });
+
+  it("does not pre-empt a fix that did arrive", () => {
+    const v = decideBootDefer(CFG_NP, garage({
+      telemetry: { timestamp: new Date(1_000_000_000_000 - 1000).toISOString(), status: "connected", reg: 1 },
+      gnss: { fix: true, sky: "clear" },
+    }));
+    expect(v).toMatchObject({ allow: true, why: "gps-fix" });
+  });
+
+  it("0 disables it, restoring cap-only behavior", () => {
+    const off = { ...CFG_NP, gateNoProgressSecs: 0 };
+    expect(decideBootDefer(off, garage())).toMatchObject({ allow: false, state: "gating" });
+    expect(decideBootDefer(off, garage({ elapsedMs: 600_000 }))).toMatchObject({
+      allow: true,
+      why: "gate-timeout",
+    });
+  });
+
+  it("more specific arms still win — dead_zone and no-rf name the cause", () => {
+    const dz = decideBootDefer(CFG_NP, garage({
+      telemetry: { timestamp: new Date(1_000_000_000_000 - 1000).toISOString(), status: "dead_zone", reg: 0 },
+    }));
+    expect(dz.why).toBe("dead_zone");
+    const norf = decideBootDefer(CFG_NP, garage({ gnss: { fix: false, sky: "no-rf" } }));
+    expect(norf.why).toBe("no-rf");
   });
 });

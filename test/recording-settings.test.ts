@@ -94,6 +94,17 @@ describe("parseRecordingSettings", () => {
     expect(parseRecordingSettings({ video: { gpsGateMaxSecs: -5 } })).toEqual({
       video: { gpsGateMaxSecs: 0 },
     });
+    // Phase 10 iter 2: the no-progress escape hatch clamps the same way, and 0
+    // (= off, cap-only behavior) must survive parsing rather than be dropped.
+    expect(parseRecordingSettings({ video: { gpsGateNoProgressSecs: 180 } })).toEqual({
+      video: { gpsGateNoProgressSecs: 180 },
+    });
+    expect(parseRecordingSettings({ video: { gpsGateNoProgressSecs: 0 } })).toEqual({
+      video: { gpsGateNoProgressSecs: 0 },
+    });
+    expect(parseRecordingSettings({ video: { gpsGateNoProgressSecs: 99_999 } })).toEqual({
+      video: { gpsGateNoProgressSecs: 3600 },
+    });
   });
 
   it("resolves boot staging defaults (auto / 90 s / 5000 mA / 4 s stagger / gate auto 600 s)", () => {

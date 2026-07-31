@@ -446,6 +446,7 @@ export class RecordingManager {
         minBudgetMa: this.cfg.video.bootDeferMinBudgetMa,
         gateMode: this.cfg.video.gpsGate,
         gateMaxSecs: this.cfg.video.gpsGateMaxSecs,
+        gateNoProgressSecs: this.cfg.video.gpsGateNoProgressSecs,
       });
       if (!verdict.allow) record = false;
       gateHoldsLive = verdict.holdLive;
@@ -587,7 +588,7 @@ export class RecordingManager {
           `(cap ${this.cfg.video.bootDeferMaxSecs}s)`
         : verdict.state === "gating"
           ? `video gps gate armed (${verdict.why}) — bridge-only + live parked until LTE is up ` +
-            `with a GPS fix (${gateCap > 0 ? `cap ${gateCap}s` : "no time cap"})`
+            `with a GPS fix (${gateCap > 0 ? `cap ${gateCap}s` : "no time cap"}${this.cfg.video.gpsGateNoProgressSecs > 0 ? `, no-progress escape ${this.cfg.video.gpsGateNoProgressSecs}s` : ""})`
           : verdict.state === "skipped"
             ? `video boot-defer skipped: ${verdict.why}`
             : verdict.state === "released"

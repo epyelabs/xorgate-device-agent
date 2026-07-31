@@ -26,6 +26,8 @@ export interface ResolvedRecordingConfig {
     gpsGate: "auto" | "always" | "off";
     /** Gate give-up cap, seconds; 0 = no time cap (Q8). */
     gpsGateMaxSecs: number;
+    /** Gate no-progress escape hatch, seconds; 0 = off (Phase 10 iter 2). */
+    gpsGateNoProgressSecs: number;
     spawnStaggerSecs: number;
     /**
      * Per-camera enable (Phase 6), keyed by streamKey. ABSENT KEY = ENABLED,
@@ -52,6 +54,7 @@ export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
     bootDeferMinBudgetMa: 5000,
     gpsGate: "auto",
     gpsGateMaxSecs: 600,
+    gpsGateNoProgressSecs: 120,
     spawnStaggerSecs: 4,
     cameras: {},
   },
@@ -88,6 +91,8 @@ export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecording
       bootDeferMinBudgetMa: s?.video?.bootDeferMinBudgetMa ?? d.video.bootDeferMinBudgetMa,
       gpsGate: s?.video?.gpsGate ?? d.video.gpsGate,
       gpsGateMaxSecs: s?.video?.gpsGateMaxSecs ?? d.video.gpsGateMaxSecs,
+      gpsGateNoProgressSecs:
+        s?.video?.gpsGateNoProgressSecs ?? d.video.gpsGateNoProgressSecs,
       spawnStaggerSecs: s?.video?.spawnStaggerSecs ?? d.video.spawnStaggerSecs,
       cameras: s?.video?.cameras ?? d.video.cameras,
     },

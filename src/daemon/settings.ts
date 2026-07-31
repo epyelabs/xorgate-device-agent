@@ -57,6 +57,7 @@ export interface RecordingSettings {
     gpsGate?: "auto" | "always" | "off";
     /** Gate give-up cap, seconds (default 600; 0 = wait indefinitely, clamp ≤3600). */
     gpsGateMaxSecs?: number;
+    gpsGateNoProgressSecs?: number;
     /** Inter-camera spawn delay, seconds (default 4; 0 = simultaneous as before). */
     spawnStaggerSecs?: number;
     /**
@@ -285,6 +286,12 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
       // 0 stays meaningful (Q8: no time cap at all — the other release paths
       // still bound it); 3600 is the sanity ceiling.
       o.gpsGateMaxSecs = Math.min(3600, Math.max(0, Math.round(gpsGateMaxSecs)));
+    }
+    const gpsGateNoProgressSecs = (vid as { gpsGateNoProgressSecs?: unknown })
+      .gpsGateNoProgressSecs;
+    if (typeof gpsGateNoProgressSecs === "number" && Number.isFinite(gpsGateNoProgressSecs)) {
+      // 0 = disable the escape hatch (back to cap-only behavior).
+      o.gpsGateNoProgressSecs = Math.min(3600, Math.max(0, Math.round(gpsGateNoProgressSecs)));
     }
     const spawnStaggerSecs = (vid as { spawnStaggerSecs?: unknown }).spawnStaggerSecs;
     if (typeof spawnStaggerSecs === "number" && Number.isFinite(spawnStaggerSecs)) {

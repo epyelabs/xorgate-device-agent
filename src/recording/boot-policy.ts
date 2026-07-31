@@ -78,6 +78,26 @@ export interface BootDeferConfig {
   gateMode: BootDeferMode;
   /** Stage-2 give-up cap, seconds; 0 = no time cap (Q8: both behaviors required). */
   gateMaxSecs: number;
+  /**
+   * Stage-2 NO-PROGRESS escape hatch, seconds; 0 = off (Phase 10 iteration 2).
+   *
+   * Every other gate release asks a subsystem to report on itself, and the
+   * 2026-07-30 garage drive found all of them blind at once: no LTE (so the
+   * `gps-fix` arm cannot fire), CSQ 99 rather than 1–9 (so the daemon wrote
+   * `disconnected`, not `dead_zone`), and a module reporting a constant 4
+   * satellites at ~36 dBHz with no fix (so the sky read `clear`, never
+   * `no-rf`). Only the 600 s cap was left, and 5 min 37 s of garage video was
+   * lost to it — recovered only because the exit ramp happened to produce
+   * CSQ=2.
+   *
+   * This arm keys on the ABSENCE OF PROGRESS instead: GNSS has not produced a
+   * fix AND LTE has not connected, for this long. If neither has moved, the
+   * modem is by definition not converting power into value, whatever any
+   * individual signal claims. Deliberately cannot fire while LTE IS connected
+   * — that is the genuinely-acquiring case where patience is right, and the
+   * `gateMaxSecs` cap still bounds it.
+   */
+  gateNoProgressSecs: number;
 }
 
 export type BootDeferState = "off" | "skipped" | "deferring" | "gating" | "released";
@@ -88,9 +108,9 @@ export interface BootDeferVerdict {
   state: BootDeferState;
   /**
    * Stable detail: the release reason ("connected" | "dead_zone" | "reg" |
-   * "stale" | "timeout" | "gps-fix" | "no-rf" | "gate-timeout"), the skip/arm
-   * rationale (budget comparison), or "disabled". Kept tick-stable so callers
-   * can log on change.
+   * "stale" | "timeout" | "gps-fix" | "no-rf" | "no-progress" |
+   * "gate-timeout"), the skip/arm rationale (budget comparison), or
+   * "disabled". Kept tick-stable so callers can log on change.
    */
   why: string;
   /**
@@ -217,6 +237,17 @@ export function decideBootDefer(cfg: BootDeferConfig, input: BootDeferInputs): B
     }
     if (input.gnss?.sky === "no-rf") {
       return { allow: true, state: "released", why: "no-rf", holdLive: false };
+    }
+    // No-progress escape hatch: nothing on EITHER side has moved. Checked after
+    // the specific arms (they are cheaper and name the cause better) and before
+    // the blind cap.
+    if (
+      cfg.gateNoProgressSecs > 0 &&
+      input.elapsedMs >= cfg.gateNoProgressSecs * 1000 &&
+      input.gnss?.fix !== true &&
+      (t === null || t.status !== "connected")
+    ) {
+      return { allow: true, state: "released", why: "no-progress", holdLive: false };
     }
     if (cfg.gateMaxSecs > 0 && input.elapsedMs >= cfg.gateMaxSecs * 1000) {
       return { allow: true, state: "released", why: "gate-timeout", holdLive: false };

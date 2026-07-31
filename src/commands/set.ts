@@ -30,6 +30,7 @@
  *   recording.video.spawnStaggerSecs <0-30>
  *   recording.video.gpsGate <auto|always|off>
  *   recording.video.gpsGateMaxSecs <0-3600>   (0 = no time cap)
+ *   recording.video.gpsGateNoProgressSecs <0-3600>  (0 = off)
  * (bootDefer* / spawnStaggerSecs are the Phase 2 boot power staging knobs —
  * optimize-system-process-cycle plan.)
  *   recording.video.cameras.<streamKey> <on|off>
@@ -133,6 +134,7 @@ function setRecordingCommand(key: string, value: string | undefined): void {
     field === "bootDeferMaxSecs" ||
     field === "bootDeferMinBudgetMa" ||
     field === "gpsGateMaxSecs" ||
+    field === "gpsGateNoProgressSecs" ||
     field === "spawnStaggerSecs" ||
     field === "uvSamples" ||
     field === "uvWindowSecs" ||

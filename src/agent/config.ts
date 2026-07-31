@@ -44,6 +44,14 @@ export interface MediaConfig {
   pipelinePath?: string;
   /** AWS_KVS_LOG_LEVEL for the runtime (default "3" = INFO). */
   logLevel: string;
+  /**
+   * KVS_IDLE_TEARDOWN_SECS for the runtime (default "30"): seconds with no viewer after which
+   * the master stops its x264 encoder pipeline and returns to bridge-idle CPU, restarting on the
+   * next viewer. "0" disables it (pre-Phase-9 behavior: encode forever after the first viewer).
+   * Env-only for now — a live stream nobody is watching has no legitimate reason to keep
+   * encoding, so this is a safety valve rather than a product setting.
+   */
+  idleTeardownSecs: string;
   /** The device IoT cert + key the runtime authenticates with (AWS_IOT_CORE_CERT/PRIVATE_KEY). */
   certPath: string;
   keyPath: string;
@@ -211,6 +219,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
       ? resolve(process.env.KVS_GST_PIPELINE)
       : undefined,
     logLevel: get("media-log", "AWS_KVS_LOG_LEVEL", "3")!,
+    idleTeardownSecs: get("media-idle-teardown", "KVS_IDLE_TEARDOWN_SECS", "30")!,
     certPath,
     keyPath,
     // KVS CA bundle ships next to the binary (media/cert.pem); override with KVS_CACERT_PATH.

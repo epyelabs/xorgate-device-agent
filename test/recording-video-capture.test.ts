@@ -1099,3 +1099,208 @@ describe("RecordingManager power load shedding (Phase 3)", () => {
     expect(manager!.status().powerShed).toBeUndefined();
   });
 });
+
+/**
+ * The published live-block verdict (power_management_improvements Phase 2).
+ *
+ * One field answering "may I watch this device right now, and if not, why",
+ * derived at the SINGLE existing liveParked site from the same two inputs, so
+ * the reason and the reality cannot come apart (README principle 5). Absence is
+ * load-bearing: no field means allowed, and every consumer fails open on it.
+ */
+describe("RecordingManager liveBlock contract (Phase 2)", () => {
+  let manager: RecordingManager | null = null;
+  afterEach(() => {
+    manager?.stop();
+    manager = null;
+  });
+
+  async function until(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+    const t0 = Date.now();
+    while (!cond()) {
+      if (Date.now() - t0 > timeoutMs) throw new Error("until(): condition not met in time");
+      await delay(10);
+    }
+  }
+
+  function writeBudget(dir: string, ma: number): string {
+    const path = join(dir, "max_current");
+    const buf = Buffer.alloc(4);
+    buf.writeUInt32BE(ma, 0);
+    writeFileSync(path, buf);
+    return path;
+  }
+
+  /**
+   * A manager wired for BOTH block sources at once: a gate that can be armed and
+   * released via its GNSS view, and a fake-clocked shed monitor fed by `reading`.
+   */
+  function makeRig(opts: { gate?: boolean } = {}) {
+    const spawner = fakeSpawner();
+    const clock = { now: 0 };
+    const telemetryFile = join(home, "telemetry.json");
+    writeFileSync(
+      telemetryFile,
+      JSON.stringify({ timestamp: new Date().toISOString(), status: "connected", reg: 1 }),
+    );
+    const rig = {
+      spawner,
+      clock,
+      reading: { uv: false, railV: 5.05, tempC: 55 } as PowerSampleReading,
+      fix: false,
+      liveShed: [] as boolean[],
+      statuses: [] as (ReturnType<RecordingManager["status"]>)[],
+    };
+    manager = new RecordingManager({
+      deviceId: "dev-1",
+      sampleGroups: async () => ({}),
+      root: join(home, "recordings"),
+      pollMs: 60_000,
+      bootPolicy: new BootDeferPolicy({
+        telemetryFile,
+        budgetPath: writeBudget(home, 3000),
+        gnss: opts.gate === false ? undefined : () => ({ fix: rig.fix, sky: "clear" }),
+      }),
+      shedPolicy: new LoadShedPolicy({ monoMs: () => clock.now }),
+      shedSampleMs: 10,
+      powerSample: async () => {
+        clock.now += 1000;
+        return rig.reading;
+      },
+      onStatus: (s) => rig.statuses.push(s),
+      video: {
+        mediaEnabled: true,
+        cameras: () => [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+        shmDir: join(home, "shm"),
+        spawn: spawner.spawn,
+        stableMs: 50,
+        sweepPollMs: 3600_000,
+        setLiveShed: (s) => rig.liveShed.push(s),
+      },
+    });
+    return rig;
+  }
+
+  it("no block: the field is ABSENT entirely — not null, not {}", async () => {
+    saveSettings({ recording: { video: { enabled: true, bootDefer: "off", gpsGate: "off" } } });
+    const rig = makeRig();
+    await manager!.start();
+    await delay(150);
+    const status = manager!.status();
+    expect(status.liveBlock).toBeUndefined();
+    expect("liveBlock" in status).toBe(false);
+    expect(JSON.stringify(status)).not.toContain("liveBlock");
+    expect(rig.liveShed).toEqual([]);
+  });
+
+  it("the armed gate publishes gps-gate, and releasing drops the field", async () => {
+    saveSettings({ recording: { video: { enabled: true, gpsGate: "always" } } });
+    const rig = makeRig();
+    await manager!.start();
+    await delay(20);
+    expect(manager!.status().bootDefer).toBe("gating");
+    expect(manager!.status().liveBlock).toMatchObject({
+      reason: "gps-gate",
+      detail: "waiting for LTE attach + GPS fix (mode=always)",
+    });
+    expect(manager!.status().liveBlock!.since).toBeGreaterThan(0);
+
+    rig.fix = true;
+    manager!.reapply();
+    await delay(200);
+    expect(manager!.status().bootDefer).toBe("released:gps-fix");
+    expect(manager!.status().liveBlock).toBeUndefined();
+  });
+
+  it("`since` is stamped once and holds steady while the block does", async () => {
+    saveSettings({ recording: { video: { enabled: true, gpsGate: "always" } } });
+    makeRig();
+    await manager!.start();
+    await delay(20);
+    const since = manager!.status().liveBlock!.since;
+    for (let i = 0; i < 5; i++) {
+      manager!.reapply();
+      await delay(15);
+      expect(manager!.status().liveBlock).toMatchObject({ reason: "gps-gate", since });
+    }
+  });
+
+  it("a rail shed publishes undervoltage with the rail in the detail", async () => {
+    saveSettings({
+      recording: {
+        video: { enabled: true, bootDefer: "off", gpsGate: "off" },
+        powerShedding: { railLowSecs: 3, restoreSecs: 5 },
+      },
+    });
+    const rig = makeRig();
+    rig.reading = { uv: false, railV: 4.7, tempC: 55 };
+    await manager!.start();
+    await until(() => manager!.status().powerShed === "no-live");
+    expect(manager!.status().liveBlock).toMatchObject({
+      reason: "undervoltage",
+      detail: "rail 4.70V < 4.85V for 3s",
+    });
+
+    rig.reading = { uv: false, railV: 5.05, tempC: 55 };
+    await until(() => manager!.status().powerShed === undefined);
+    expect(manager!.status().liveBlock).toBeUndefined();
+  });
+
+  it("a thermal shed publishes thermal, and HOLDS it after the trigger clears", async () => {
+    // The regression the natural implementation gets wrong: a shed whose
+    // trigger has stopped firing but whose restore interval has not elapsed
+    // must keep naming its reason for the whole hold (PROGRESS hand-off note;
+    // bench run D held for ~7 min with `cause === null`).
+    saveSettings({
+      recording: {
+        video: { enabled: true, bootDefer: "off", gpsGate: "off" },
+        powerShedding: { cpuTempSecs: 5, restoreSecs: 600 }, // 5 = the settings floor
+      },
+    });
+    const rig = makeRig();
+    rig.reading = { uv: false, railV: 5.05, tempC: 85 };
+    await manager!.start();
+    await until(() => manager!.status().powerShed === "no-live");
+    const block = manager!.status().liveBlock!;
+    expect(block).toMatchObject({ reason: "thermal", detail: "cpu 85.0°C >= 80°C for 5s" });
+
+    // Below cpuTempC (so no trigger) but above cpuTempRestoreC (so no restore):
+    // the rung holds, and the reason must hold with it.
+    rig.reading = { uv: false, railV: 5.05, tempC: 75 };
+    const from = rig.clock.now;
+    // 2 fake minutes — well past the point a per-tick reason would have blanked
+    // out, and well short of the 600 s restore interval.
+    await until(() => rig.clock.now - from > 120_000);
+    expect(manager!.status().powerShed).toBe("no-live");
+    expect(manager!.status().liveBlock).toEqual(block); // reason, detail AND since
+  });
+
+  it("the gate wins when both the gate and a shed are blocking live", async () => {
+    saveSettings({
+      recording: {
+        video: { enabled: true, gpsGate: "always" },
+        powerShedding: { railLowSecs: 3, restoreSecs: 5 },
+      },
+    });
+    const rig = makeRig();
+    rig.reading = { uv: false, railV: 4.7, tempC: 55 };
+    await manager!.start();
+    await until(() => manager!.status().powerShed === "no-live");
+    // Both are holding live down...
+    expect(manager!.status().bootDefer).toBe("gating");
+    // ...and the gate is the one with a knowable end, so it names the block.
+    expect(manager!.status().liveBlock).toMatchObject({ reason: "gps-gate" });
+
+    // Release the gate while the shed still holds: the shed's reason takes over
+    // and `since` is re-stamped, because the reason changed.
+    const gateSince = manager!.status().liveBlock!.since;
+    rig.fix = true;
+    await delay(5);
+    manager!.reapply();
+    await until(() => manager!.status().liveBlock?.reason === "undervoltage");
+    expect(manager!.status().liveBlock!.since).toBeGreaterThanOrEqual(gateSince);
+    // Live stayed parked throughout — the block never lapsed as the reason
+    // changed hands, which is the failure the gate-wins rule exists to avoid.
+    expect(rig.liveShed).toEqual([true]);
+  });
+});

@@ -17,7 +17,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { GroupSample } from "../agent/collectors/index.js";
 import { loadSettings } from "../daemon/settings.js";
-import type { RecordingStatus } from "../agent/telemetry.js";
+import type { LiveBlock, RecordingStatus } from "../agent/telemetry.js";
 import {
   recordingsRoot,
   resolveRecordingConfig,
@@ -197,6 +197,12 @@ export class RecordingManager {
   private shedLevel: ShedLevel = 0;
   /** Whether the live KVS masters are currently parked (shed rung 1 or the Phase 7 gate). */
   private liveShed = false;
+  /**
+   * Published block verdict (power_management_improvements Phase 2); null = live
+   * is allowed, and the field is then omitted from status() entirely. Owns the
+   * epoch-ms `since` stamp, which only moves when `reason` changes.
+   */
+  private liveBlock: LiveBlock | null = null;
   /** powerShedding namespace fingerprint — a change resets the policy (clears park). */
   private shedCfgKey: string;
   /** Serializes capture stop→start handovers (see applyVideo). */
@@ -361,6 +367,10 @@ export class RecordingManager {
       ...(this.bootDeferStatus !== null ? { bootDefer: this.bootDeferStatus } : {}),
       // Load-shedding rung (Phase 3); absent at full operation.
       ...(this.shedStatus !== null ? { powerShed: this.shedStatus } : {}),
+      // Why live streaming is parked (power management plan, Phase 2); ABSENT
+      // — never null, never {} — whenever live is allowed, so every consumer
+      // fails open on the field simply not being there.
+      ...(this.liveBlock !== null ? { liveBlock: this.liveBlock } : {}),
     };
   }
 
@@ -439,6 +449,7 @@ export class RecordingManager {
     // when recording is enabled), because the Phase 7 gate also holds LIVE.
     let record = this.cfg.video.enabled;
     let gateHoldsLive = false;
+    let gateWhy = "";
     if (cameras.length > 0) {
       const verdict = this.bootPolicy.evaluate({
         mode: this.cfg.video.bootDefer,
@@ -450,6 +461,7 @@ export class RecordingManager {
       });
       if (!verdict.allow) record = false;
       gateHoldsLive = verdict.holdLive;
+      gateWhy = verdict.why;
       this.noteBootDefer(verdict);
     }
     // Live streaming is held down by EITHER shed rung 1 or the Phase 7 gate —
@@ -459,6 +471,22 @@ export class RecordingManager {
       this.liveShed = liveParked;
       vo.setLiveShed?.(liveParked);
     }
+    // ...and the published REASON is derived here too, from the same two
+    // inputs and the same evaluation (README principle 5). A second evaluation
+    // anywhere else is how the reason and the reality come apart.
+    this.noteLiveBlock(
+      gateHoldsLive
+        ? // The gate wins when both are active: it is the one with a knowable
+          // end (an LTE attach or a GPS fix), so it is the more useful thing to
+          // tell the operator.
+          { reason: "gps-gate", detail: `waiting for LTE attach + GPS fix (${gateWhy})` }
+        : shed !== null && shed.level >= 1 && shed.reason !== null
+          ? { reason: shed.reason, detail: shed.detail ?? "" }
+          : // `shed.reason` is non-null by construction whenever level >= 1 (a
+            // rung is only ever entered on a firing trigger, which always
+            // carries a cause) — the check above is type narrowing.
+            null,
+    );
     // Shed rung 2: recording off, bridge-only (telemetry recording — the
     // crash evidence — keeps running; it is not touched by the ladder).
     if (record && shed !== null && shed.level >= 2) record = false;
@@ -571,6 +599,30 @@ export class RecordingManager {
       this.notifyStatus();
     }
     return verdict;
+  }
+
+  /**
+   * Publish the live-block verdict, stamping `since` ONCE per block.
+   *
+   * `since` is epoch ms (the payload's clock domain, beside `ts`) and must not
+   * move while a block holds — a value that ticks every second is useless for
+   * "blocked for 2m" and would defeat notifyStatus()'s change dedupe. So it is
+   * written on the transition into blocked and re-written only when the REASON
+   * changes; the same block under a fresher detail keeps its original stamp.
+   */
+  private noteLiveBlock(next: Omit<LiveBlock, "since"> | null): void {
+    const prev = this.liveBlock;
+    if (next === null) {
+      if (prev === null) return;
+      this.liveBlock = null;
+    } else if (prev === null || prev.reason !== next.reason) {
+      this.liveBlock = { ...next, since: Date.now() };
+    } else if (prev.detail !== next.detail) {
+      this.liveBlock = { ...next, since: prev.since };
+    } else {
+      return;
+    }
+    this.notifyStatus();
   }
 
   /**

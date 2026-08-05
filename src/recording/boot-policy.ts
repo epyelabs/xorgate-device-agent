@@ -510,6 +510,15 @@ export const POWER_SAMPLE_STALE_MS = 5_000;
  */
 export type ShedCause = "power" | "thermal";
 
+/**
+ * The same two cases as `ShedCause`, under the names the PUBLISHED contract
+ * uses (`liveBlock.reason`, power_management_improvements Phase 2). `"power"`
+ * covers the UV bit AND the rail arm, which is exactly what an operator reads
+ * as undervoltage — so this is a rename at the boundary, not a second
+ * discriminant. Never split it; never rename `ShedCause` to match.
+ */
+export type ShedBlockReason = "undervoltage" | "thermal";
+
 /** What the sample window currently says (pure, exported for tests). */
 export interface ShedSignals {
   trigger: boolean;
@@ -639,10 +648,32 @@ export interface ShedState {
   triggerLog: TriggerEdge[];
   /** Shed cycle starts (level 0 → 1) within the rolling hour. */
   shedStartsMs: number[];
+  /**
+   * LATCHED cause of the shed currently in force; null at full operation
+   * (power_management_improvements Phase 2).
+   *
+   * This has to be latched, not read from the live signals, because
+   * `ShedSignals.cause` is null on every tick the trigger is not *currently*
+   * firing while the ladder stays at its rung until the whole restore interval
+   * elapses. Bench run D (2026-08-05) sat shed for ~7 minutes with the trigger
+   * cleared after ~90 s — a reason derived per tick would blank out for the
+   * other 5½ minutes while the block visibly persisted.
+   */
+  cause: ShedCause | null;
+  /** The `ShedSignals.why` string that latched `cause`; null at full operation. */
+  causeDetail: string | null;
 }
 
 export function initialShedState(nowMs: number): ShedState {
-  return { level: 0, parked: false, lastChangeMs: nowMs, triggerLog: [], shedStartsMs: [] };
+  return {
+    level: 0,
+    parked: false,
+    lastChangeMs: nowMs,
+    triggerLog: [],
+    shedStartsMs: [],
+    cause: null,
+    causeDetail: null,
+  };
 }
 
 /**
@@ -725,6 +756,15 @@ export function decideShedTransition(
   };
 
   if (sig.trigger) {
+    // Latch the cause + its rationale for `liveBlock.reason` (Phase 2). Written
+    // on the level 0 → 1 edge and re-written only when the CAUSE itself changes
+    // — a thermal shed that then acquires a bad supply becomes "power" and
+    // escalates as power. Holding `causeDetail` steady while the cause is steady
+    // is what keeps the manager's `since` stamp stable across ticks.
+    if (sig.cause !== null && sig.cause !== s.cause) {
+      s.cause = sig.cause;
+      s.causeDetail = sig.why;
+    }
     if (s.level === 0) {
       s.level = 1;
       s.lastChangeMs = nowMs;
@@ -775,6 +815,12 @@ export function decideShedTransition(
     if (nowMs - anchor >= cfg.restoreSecs * 1000) {
       s.level = (s.level - 1) as ShedLevel;
       s.lastChangeMs = nowMs;
+      // Back at full operation: nothing is blocked, so the latch clears. Above
+      // rung 0 it is deliberately kept — rung 2 → 1 is still the same shed.
+      if (s.level === 0) {
+        s.cause = null;
+        s.causeDetail = null;
+      }
       return {
         state: s,
         event: {
@@ -794,6 +840,15 @@ export interface ShedVerdict {
   parked: boolean;
   /** Log-worthy transition this evaluation produced; null when steady. */
   event: ShedEvent | null;
+  /**
+   * LATCHED reason for the shed in force, under its published name — the
+   * `liveBlock.reason` input (Phase 2). Null at full operation; non-null for
+   * the whole time `level >= 1`, including the stretch after the trigger has
+   * cleared but before the restore interval elapses.
+   */
+  reason: ShedBlockReason | null;
+  /** The trigger rationale that latched `reason` (tooltip detail); null at full operation. */
+  detail: string | null;
 }
 
 export interface LoadShedPolicyOptions {
@@ -850,6 +905,8 @@ export class LoadShedPolicy {
         event: wasActive
           ? { level: "info", msg: "power shedding disabled by settings — restoring full operation" }
           : null,
+        reason: null,
+        detail: null,
       };
     }
     const horizonMs =
@@ -859,7 +916,16 @@ export class LoadShedPolicy {
     const signals = computeShedSignals(this.samples, cfg, nowMs);
     const { state, event } = decideShedTransition(cfg, this.state, signals, nowMs);
     this.state = state;
-    return { level: state.level, parked: state.parked, event };
+    return {
+      level: state.level,
+      parked: state.parked,
+      event,
+      // The one place the internal discriminant is renamed for the wire (see
+      // ShedBlockReason). "power" covers the UV bit and the rail alike.
+      reason:
+        state.cause === null ? null : state.cause === "power" ? "undervoltage" : "thermal",
+      detail: state.causeDetail,
+    };
   }
 
   /** Forget everything (settings change / monitor disarm — clears park + cap). */

@@ -871,6 +871,101 @@ describe("LoadShedPolicy — thermal arm (Phase 1)", () => {
     });
     expect(signals(cool(55))).toMatchObject({ trigger: false, cause: null, why: null });
   });
+
+  /**
+   * The LATCH (power_management_improvements Phase 2). `ShedVerdict.reason` is
+   * the `liveBlock.reason` input, so it must name the shed for the WHOLE time
+   * the rung is held — including the stretch after the trigger has cleared but
+   * before `restoreSecs` of clean has elapsed. Bench run D (2026-08-05) spent
+   * ~7 of its ~8½ shed minutes in exactly that stretch.
+   */
+  describe("ShedVerdict.reason — the latch Phase 2 publishes", () => {
+    it("holds the reason through a cleared trigger, and only drops it on restore", () => {
+      const { tick } = makePolicy();
+      let r = tick(16, cool(85));
+      expect(r.last).toMatchObject({
+        level: 1,
+        reason: "thermal",
+        detail: "cpu 85.0°C >= 80°C for 15s",
+      });
+      // Trigger gone (79 °C is below cpuTempC) but still above cpuTempRestoreC,
+      // so the rung holds — and so must the reason. Read per tick it would be
+      // null here for every one of these 400 seconds.
+      r = tick(400, cool(79));
+      expect(r.last).toMatchObject({
+        level: 1,
+        reason: "thermal",
+        detail: "cpu 85.0°C >= 80°C for 15s", // the detail that STARTED it, unchanged
+      });
+      // Genuinely cool: restore to full clears the latch with the rung.
+      r = tick(121, cool(60));
+      expect(r.last).toMatchObject({ level: 0, reason: null, detail: null });
+    });
+
+    it("names undervoltage for the UV bit AND for the rail (one published case)", () => {
+      const uv = makePolicy();
+      expect(uv.tick(3, { uv: true, railV: 5.05, tempC: 60 }).last).toMatchObject({
+        level: 1,
+        reason: "undervoltage",
+        detail: "undervoltage 3x in 30s",
+      });
+      const rail = makePolicy();
+      expect(rail.tick(16, { uv: false, railV: 4.7, tempC: 60 }).last).toMatchObject({
+        level: 1,
+        reason: "undervoltage",
+        detail: "rail 4.70V < 4.85V for 15s",
+      });
+    });
+
+    it("the firmware's 0x8 bit is thermal too", () => {
+      const { tick } = makePolicy();
+      expect(tick(1, { uv: false, railV: 5.05, tempC: 62, softTemp: true }).last).toMatchObject({
+        level: 1,
+        reason: "thermal",
+        detail: "cpu soft temp limit (throttle bit 0x8)",
+      });
+    });
+
+    it("a shed that changes cause is re-latched, and rung 2 → 1 keeps it", () => {
+      const { tick } = makePolicy();
+      // Hot first: rung 1, thermal.
+      expect(tick(16, cool(85)).last).toMatchObject({ level: 1, reason: "thermal" });
+      // Now the supply goes bad as well. Precedence makes the cause "power",
+      // which both re-latches the reason and unlocks escalation (D4/Q2).
+      const r = tick(70, { uv: true, railV: 4.7, tempC: 85 });
+      expect(r.last).toMatchObject({
+        level: 2,
+        reason: "undervoltage",
+        detail: "undervoltage 3x in 30s",
+      });
+      // Restoring 2 → 1 is still the SAME shed, so the latch survives it; only
+      // reaching full operation clears it.
+      const back = tick(121, cool(60));
+      expect(back.last).toMatchObject({ level: 1, reason: "undervoltage" });
+      expect(tick(121, cool(60)).last).toMatchObject({ level: 0, reason: null, detail: null });
+    });
+
+    it("a parked shed keeps its reason indefinitely (no restore to clear it)", () => {
+      const { tick } = makePolicy();
+      const cfg: ShedConfig = { ...CFG, maxShedsPerHour: 0 };
+      expect(tick(16, cool(85), cfg).last).toMatchObject({ level: 1, parked: true });
+      expect(tick(600, cool(50), cfg).last).toMatchObject({
+        level: 1,
+        parked: true,
+        reason: "thermal",
+      });
+    });
+
+    it("disabling power shedding drops the reason with the ladder", () => {
+      const { tick } = makePolicy();
+      expect(tick(16, cool(85)).last).toMatchObject({ level: 1, reason: "thermal" });
+      expect(tick(1, cool(85), { ...CFG, enabled: false }).last).toMatchObject({
+        level: 0,
+        reason: null,
+        detail: null,
+      });
+    });
+  });
 });
 
 /**

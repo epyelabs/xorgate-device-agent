@@ -155,6 +155,36 @@ export interface RecordingStatus {
    * exhausted. Absent at full operation (and on agents predating the feature).
    */
   powerShed?: string;
+  /**
+   * Why live KVS streaming is parked right now (power_management_improvements
+   * plan, Phase 2). ABSENT means live is allowed — consumers must treat absence,
+   * a malformed block, a stale feed and an agent too old to send it alike as
+   * "not blocked" (fail open, README principle 1). Never emitted as null or as
+   * an empty object.
+   */
+  liveBlock?: LiveBlock;
+}
+
+/** The published "may I watch this device right now, and if not, why" verdict. */
+export interface LiveBlock {
+  /**
+   * Stable machine reason; the UI keys its copy off this via a registry.
+   * OPEN SET by contract (plan Q7): this union documents today's values, it
+   * does NOT promise completeness. Consumers must parse it as a plain string
+   * and degrade gracefully on a reason they don't recognise — a newer device
+   * against an older web build is normal. Future candidates: a failed KVS
+   * master, a decommissioned device.
+   */
+  reason: "gps-gate" | "undervoltage" | "thermal";
+  /** Human detail for the tooltip, e.g. `cpu 84.1°C >= 80°C for 15s`. */
+  detail: string;
+  /**
+   * EPOCH ms the current block began — the payload's own clock domain, beside
+   * `ts`, unlike every internal interval in the policy, which stays monotonic.
+   * Stamped once on the transition into blocked and re-stamped only when
+   * `reason` changes, so the UI can render "blocked for 2m".
+   */
+  since: number;
 }
 
 export type RunMode = "sim" | "real";

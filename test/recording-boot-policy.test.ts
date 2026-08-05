@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   BootDeferPolicy,
+  computeShedSignals,
   decideBootDefer,
   LoadShedPolicy,
   TELEMETRY_STALE_MS,
@@ -12,6 +13,7 @@ import {
   type ShedConfig,
   type ShedVerdict,
 } from "../src/recording/boot-policy.js";
+import { powerReadingFromFields } from "../src/agent/collectors/index.js";
 import { cleanup, tempHome } from "./helpers.js";
 
 // Stage 1 only: the Phase 7 gate has its own describe block below.
@@ -410,6 +412,9 @@ describe("LoadShedPolicy (Phase 3 runtime undervoltage shedding)", () => {
     railLowSecs: 15,
     escalateDwellSecs: 60,
     escalateDutyPct: 70,
+    cpuTempC: 80,
+    cpuTempRestoreC: 70,
+    cpuTempSecs: 15,
     restoreSecs: 120,
     railRestoreVolts: 4.95,
     maxShedsPerHour: 4,
@@ -634,6 +639,237 @@ describe("LoadShedPolicy (Phase 3 runtime undervoltage shedding)", () => {
     policy.reset();
     expect(policy.evaluate(cfg)).toMatchObject({ level: 0, parked: false });
     expect(policy.statusString()).toBeNull();
+  });
+});
+
+/**
+ * Thermal arm (power_management_improvements plan, Phase 1). A third trigger
+ * beside the UV bit and the rail: the SoC at/above `cpuTempC` for
+ * `cpuTempSecs`, or the firmware's own soft-temp-limit bit (0x8).
+ *
+ * NOTE ON THE REGRESSION GUARD: every reading in the Phase 3 suite above omits
+ * `tempC`/`softTemp` entirely, which normalizes to `tempC: null` /
+ * `softTemp: false`. That whole suite passing unchanged IS the "thermal arm
+ * inert, UV/rail behave exactly as on main" guard; the explicit test below
+ * covers the case where a host reports a temperature that is simply never hot.
+ */
+describe("LoadShedPolicy — thermal arm (Phase 1)", () => {
+  const CFG: ShedConfig = {
+    enabled: true,
+    uvSamples: 3,
+    uvWindowSecs: 30,
+    railLowVolts: 4.85,
+    railLowSecs: 15,
+    escalateDwellSecs: 60,
+    escalateDutyPct: 70,
+    cpuTempC: 80,
+    cpuTempRestoreC: 70,
+    cpuTempSecs: 15,
+    restoreSecs: 120,
+    railRestoreVolts: 4.95,
+    maxShedsPerHour: 4,
+  };
+
+  /** A healthy supply, so only the thermal fields can move the ladder. */
+  const cool = (tempC: number): PowerSampleReading => ({ uv: false, railV: 5.05, tempC });
+
+  function makePolicy() {
+    const clock = { now: 0 };
+    const policy = new LoadShedPolicy({ monoMs: () => clock.now });
+    const tick = (secs: number, reading: PowerSampleReading, cfg: ShedConfig = CFG) => {
+      let last!: ShedVerdict;
+      const events: string[] = [];
+      for (let i = 0; i < secs; i++) {
+        clock.now += 1000;
+        policy.push(reading);
+        last = policy.evaluate(cfg);
+        if (last.event) events.push(last.event.msg);
+      }
+      return { last, events };
+    };
+    return { clock, policy, tick };
+  }
+
+  it("sustained heat sheds live at exactly cpuTempSecs, not before", () => {
+    const { policy, tick } = makePolicy();
+    const short = tick(15, cool(85));
+    expect(short.last.level).toBe(0); // the run spans 14 s — one second short
+    const r = tick(1, cool(85));
+    expect(r.last.level).toBe(1);
+    expect(r.events[0]).toContain("no-live");
+    expect(r.events[0]).toContain("cpu 85.0°C >= 80°C for 15s");
+    expect(policy.statusString()).toBe("no-live");
+  });
+
+  it("a single spike inside the window does not shed", () => {
+    const { tick } = makePolicy();
+    tick(10, cool(85));
+    tick(1, cool(75)); // one reading below the threshold resets the run
+    const r = tick(14, cool(85));
+    expect(r.last.level).toBe(0);
+  });
+
+  it("hysteresis: shedding at 80 does not restore at 79 — it needs cpuTempRestoreC", () => {
+    const { policy, tick } = makePolicy();
+    expect(tick(16, cool(85)).last.level).toBe(1);
+    // 79 °C: below the trigger, above the restore point. Not triggering is not
+    // the same as cool enough, so the restore anchor keeps being refreshed.
+    let r = tick(400, cool(79));
+    expect(r.last.level).toBe(1);
+    expect(policy.statusString()).toBe("no-live");
+    // Genuinely cool now: restore after a full restoreSecs of it.
+    r = tick(119, cool(69));
+    expect(r.last.level).toBe(1);
+    r = tick(2, cool(69));
+    expect(r.last.level).toBe(0);
+    expect(r.events[0]).toContain("restore → full");
+    expect(policy.statusString()).toBeNull();
+  });
+
+  it("thermal trigger requires fresh samples (a dead sampler cannot shed)", () => {
+    const { clock, policy, tick } = makePolicy();
+    tick(14, cool(85));
+    clock.now += 60_000; // sampler dies; the hot run now spans >15 s but is stale
+    expect(policy.evaluate(CFG).level).toBe(0);
+  });
+
+  it("a host that reports a cool temperature behaves exactly as it does with none", () => {
+    // Same rail trace as the Phase 3 "sustained rail low sheds" case, with a
+    // temperature present throughout: the thermal arm must not alter it.
+    const withTemp = makePolicy();
+    const r = withTemp.tick(16, { uv: false, railV: 4.8, tempC: 55, softTemp: false });
+    expect(r.last.level).toBe(1);
+    expect(r.events[0]).toContain("rail 4.80V < 4.85V");
+
+    const nullTemp = makePolicy();
+    const r2 = nullTemp.tick(120, { uv: false, railV: 5.05, tempC: null, softTemp: false });
+    expect(r2.last.level).toBe(0);
+  });
+
+  it("throttle bit 0x8 sheds on its own; 0x2 and 0x4 never do (Q3)", () => {
+    // 0x8 is the firmware's own thermal verdict, so it needs no dwell — but it
+    // must name itself, not a temperature it did not measure.
+    const soft = makePolicy();
+    const r = soft.tick(1, { uv: false, railV: 5.05, tempC: 62, softTemp: true });
+    expect(r.last.level).toBe(1);
+    expect(r.events[0]).toContain("cpu soft temp limit (throttle bit 0x8)");
+
+    // 0x2 (freq capped) / 0x4 (throttled) are consequences of EITHER cause, so
+    // the decoder never sets uv/softTemp for them and the ladder stays at 0.
+    for (const mask of [0x2, 0x4, 0x6]) {
+      const reading = powerReadingFromFields({ throttled: { value: mask }, cpu_temp: { value: 62 } });
+      expect(reading).toMatchObject({ uv: false, softTemp: false });
+      const p = makePolicy();
+      expect(p.tick(300, reading!).last.level).toBe(0);
+    }
+  });
+
+  /**
+   * D4/Q2 — THE regression test of this phase. The natural implementation (add
+   * a trigger, touch nothing else) escalates a merely-hot device to rung 2 and
+   * stops recording, which is the trade the plan explicitly rejects: heat is
+   * self-limiting, so degraded footage beats no footage.
+   */
+  it("a thermal-only trigger NEVER escalates past rung 1, however long it runs", () => {
+    const { policy, tick } = makePolicy();
+    expect(tick(16, cool(88)).last.level).toBe(1);
+    // 100 % duty for ten full escalation dwells. On `main`'s ladder this would
+    // have reached rung 2 at ~60 s past the shed.
+    const r = tick(600, cool(88));
+    expect(r.last.level).toBe(1);
+    expect(r.events.filter((m) => m.includes("bridge-only"))).toHaveLength(0);
+    expect(policy.statusString()).toBe("no-live");
+  });
+
+  it("the firmware's 0x8 bit is capped the same way (it is still thermal)", () => {
+    const { policy, tick } = makePolicy();
+    const hot: PowerSampleReading = { uv: false, railV: 5.05, tempC: 62, softTemp: true };
+    expect(tick(1, hot).last.level).toBe(1);
+    expect(tick(600, hot).last.level).toBe(1);
+    expect(policy.statusString()).toBe("no-live");
+  });
+
+  it("thermal PLUS a concurrent power trigger does escalate — the cap is cause-scoped", () => {
+    // Undervoltage while hot: `cause` is "power" by precedence, so the
+    // escalation branch proceeds exactly as it does today.
+    const uv = makePolicy();
+    const hotAndUv: PowerSampleReading = { uv: true, railV: 4.7, tempC: 88 };
+    expect(uv.tick(3, hotAndUv).last.level).toBe(1);
+    expect(uv.tick(59, hotAndUv).last.level).toBe(1); // one second short of the dwell
+    const r = uv.tick(2, hotAndUv);
+    expect(r.last.level).toBe(2);
+    expect(r.events[0]).toContain("bridge-only");
+    expect(r.events[0]).toContain("undervoltage");
+
+    // Same for the rail arm, with the UV bit clear.
+    const rail = makePolicy();
+    const hotAndSagging: PowerSampleReading = { uv: false, railV: 4.78, tempC: 88 };
+    expect(rail.tick(16, hotAndSagging).last.level).toBe(1);
+    expect(rail.tick(61, hotAndSagging).last.level).toBe(2);
+  });
+
+  it("a power shed that cools into a thermal-only one stops escalating", () => {
+    // The supply recovers but the SoC stays hot: the device must hold at rung 1
+    // rather than riding the power arm's duty history into rung 2.
+    const { policy, tick } = makePolicy();
+    expect(tick(16, { uv: false, railV: 4.78, tempC: 88 }).last.level).toBe(1);
+    tick(30, { uv: false, railV: 4.78, tempC: 88 });
+    const r = tick(600, cool(88)); // rail healthy again, still hot
+    expect(r.last.level).toBe(1);
+    expect(policy.statusString()).toBe("no-live");
+  });
+
+  it("a thermal-only shed still counts toward maxShedsPerHour and still parks", () => {
+    const cfg: ShedConfig = { ...CFG, maxShedsPerHour: 1, restoreSecs: 10 };
+    const { policy, tick } = makePolicy();
+    tick(16, cool(85), cfg); // cycle 1
+    expect(policy.statusString()).toBe("no-live");
+    tick(12, cool(65), cfg); // cool → restored
+    expect(policy.statusString()).toBeNull();
+    const r = tick(16, cool(85), cfg); // cycle 2 exceeds the 1/h cap
+    expect(r.last).toMatchObject({ level: 1, parked: true });
+    expect(r.events[0]).toContain("parked until reboot or settings change");
+    tick(600, cool(60), cfg);
+    expect(policy.statusString()).toBe("parked:no-live");
+  });
+
+  it("undervoltage names the event when both arms fire (precedence)", () => {
+    const { tick } = makePolicy();
+    const r = tick(3, { uv: true, railV: 5.0, tempC: 88 });
+    expect(r.events[0]).toContain("undervoltage 3x");
+    expect(r.events[0]).not.toContain("cpu 88");
+  });
+
+  it("computeShedSignals reports the cause discriminant Phase 2 will publish", () => {
+    /** 16 identical 1 Hz samples (a full cpuTempSecs run) + the matching now. */
+    function window(reading: PowerSampleReading) {
+      const samples = Array.from({ length: 16 }, (_, i) => ({
+        ...reading,
+        tempC: reading.tempC ?? null,
+        softTemp: reading.softTemp ?? false,
+        tMs: (i + 1) * 1000,
+      }));
+      return { samples, nowMs: 16_000 };
+    }
+    const signals = (reading: PowerSampleReading) => {
+      const w = window(reading);
+      return computeShedSignals(w.samples, CFG, w.nowMs);
+    };
+
+    expect(signals(cool(85))).toMatchObject({ trigger: true, cause: "thermal" });
+    expect(signals({ uv: false, railV: 5.05, tempC: 62, softTemp: true })).toMatchObject({
+      trigger: true,
+      cause: "thermal",
+    });
+    expect(signals({ uv: false, railV: 4.78, tempC: 88 })).toMatchObject({
+      trigger: true,
+      cause: "power",
+    });
+    expect(signals({ uv: true, railV: 5.05, tempC: 88 })).toMatchObject({
+      trigger: true,
+      cause: "power", // precedence: undervoltage names it even while hot
+    });
+    expect(signals(cool(55))).toMatchObject({ trigger: false, cause: null, why: null });
   });
 });
 

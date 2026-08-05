@@ -5,6 +5,7 @@ import {
   rail5vFrom,
   readMaxCurrentMa,
 } from "../src/hardware/power.js";
+import { powerReadingFromFields } from "../src/agent/collectors/index.js";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -101,5 +102,76 @@ describe("readMaxCurrentMa", () => {
 
   it("returns null when the node is absent", async () => {
     expect(await readMaxCurrentMa("/nonexistent/max_current")).toBeNull();
+  });
+});
+
+/**
+ * Load-shed sample decoding (power_management_improvements plan, Phase 1).
+ * Before the thermal arm this bailed to null unless `throttled` was a number,
+ * which would have made thermal shedding inert on any host without vcgencmd.
+ */
+describe("powerReadingFromFields", () => {
+  it("decodes a healthy Pi sample", () => {
+    expect(
+      powerReadingFromFields({
+        throttled: { value: 0 },
+        rail_5v: { value: 5.127 },
+        cpu_temp: { value: 57.1 },
+      }),
+    ).toEqual({ uv: false, railV: 5.127, tempC: 57.1, softTemp: false });
+  });
+
+  it("reads the undervoltage (0x1) and soft-temp (0x8) CAUSE bits", () => {
+    expect(powerReadingFromFields({ throttled: { value: 0x1 } })).toMatchObject({
+      uv: true,
+      softTemp: false,
+    });
+    expect(powerReadingFromFields({ throttled: { value: 0x8 } })).toMatchObject({
+      uv: false,
+      softTemp: true,
+    });
+    expect(powerReadingFromFields({ throttled: { value: 0x9 } })).toMatchObject({
+      uv: true,
+      softTemp: true,
+    });
+  });
+
+  it("ignores the CONSEQUENCE bits 0x2/0x4 and every sticky bit (Q3)", () => {
+    // 0x2 freq-capped + 0x4 throttled: set by the firmware for EITHER cause, so
+    // triggering on them would make the shed reason unattributable.
+    expect(powerReadingFromFields({ throttled: { value: 0x6 } })).toMatchObject({
+      uv: false,
+      softTemp: false,
+    });
+    // 0xe0008 as measured on the bench: sticky bits 16-19 are history and the
+    // agent only ever surfaces the CURRENT half — but assert it explicitly.
+    expect(powerReadingFromFields({ throttled: { value: 0xe0000 } })).toMatchObject({
+      uv: false,
+      softTemp: false,
+    });
+  });
+
+  it("returns a reading when only the temperature is readable (no vcgencmd)", () => {
+    expect(powerReadingFromFields({ cpu_temp: { value: 81.4 } })).toEqual({
+      uv: false,
+      railV: null,
+      tempC: 81.4,
+      softTemp: false,
+    });
+  });
+
+  it("returns a reading when only the throttle mask is readable (Pi 4, no PMIC ADC)", () => {
+    expect(powerReadingFromFields({ throttled: { value: 0x1 } })).toEqual({
+      uv: true,
+      railV: null,
+      tempC: null,
+      softTemp: false,
+    });
+  });
+
+  it("returns null with neither half readable — the feature stays inert off-Pi", () => {
+    expect(powerReadingFromFields({ cpu_usage: { value: 12 } })).toBeNull();
+    expect(powerReadingFromFields({})).toBeNull();
+    expect(powerReadingFromFields(undefined)).toBeNull();
   });
 });

@@ -29,6 +29,39 @@ export interface Collector {
   sample?(): Promise<GroupSample | null>;
 }
 
+/**
+ * Decode one `system` group sample into a load-shed power reading (pure,
+ * exported for tests).
+ *
+ * Returns a reading when EITHER the throttle mask OR the SoC temperature is
+ * readable (power_management_improvements Phase 1). Before the thermal arm this
+ * bailed unless `throttled` was a number, which would have made thermal
+ * shedding inert on any host without `vcgencmd`; now the absent half simply
+ * stays at `uv: false` / `railV: null` / `tempC: null`, so the arms that depend
+ * on it remain inert exactly as before. With neither half readable (a dev box)
+ * the answer is still null and the whole feature stays off.
+ */
+export function powerReadingFromFields(
+  fields: Record<string, unknown> | undefined,
+): PowerSampleReading | null {
+  const throttled = (fields?.throttled as { value?: unknown } | undefined)?.value;
+  const temp = (fields?.cpu_temp as { value?: unknown } | undefined)?.value;
+  const hasThrottle = typeof throttled === "number";
+  const hasTemp = typeof temp === "number";
+  if (!hasThrottle && !hasTemp) return null;
+  const rail = (fields?.rail_5v as { value?: unknown } | undefined)?.value;
+  return {
+    uv: hasThrottle && (throttled & 0x1) !== 0,
+    railV: typeof rail === "number" ? rail : null,
+    tempC: hasTemp ? temp : null,
+    // 0x8 = soft temperature limit — the firmware's own thermal verdict. 0x2
+    // (freq capped) and 0x4 (throttled) are consequences of EITHER cause and
+    // are deliberately not read: a shed triggered on them could not tell an
+    // operator whether to fix the supply or the cooling (PROGRESS Q3).
+    softTemp: hasThrottle && (throttled & 0x8) !== 0,
+  };
+}
+
 /** Minimal shape of a device model's declared I/O capabilities. */
 export interface IoCapabilities {
   sensors?: { imu?: boolean };
@@ -138,11 +171,7 @@ export function createCollector(
     async samplePower(): Promise<PowerSampleReading | null> {
       if (!system?.sample) return null;
       try {
-        const s = await system.sample();
-        const throttled = (s?.fields.throttled as { value?: unknown } | undefined)?.value;
-        if (typeof throttled !== "number") return null; // no vcgencmd → feature inert
-        const rail = (s?.fields.rail_5v as { value?: unknown } | undefined)?.value;
-        return { uv: (throttled & 0x1) !== 0, railV: typeof rail === "number" ? rail : null };
+        return powerReadingFromFields((await system.sample())?.fields);
       } catch {
         return null;
       }

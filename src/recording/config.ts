@@ -69,6 +69,12 @@ export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
     railLowSecs: 15,
     escalateDwellSecs: 60,
     escalateDutyPct: 70,
+    // Thermal arm STARTING values (power_management_improvements Phase 1, Q1):
+    // 5 °C below the Pi's 85 °C hard throttle, with a 10 °C anti-flap margin
+    // mirroring the rail arm's 4.85/4.95 split.
+    cpuTempC: 80,
+    cpuTempRestoreC: 70,
+    cpuTempSecs: 15,
     restoreSecs: 120,
     railRestoreVolts: 4.95,
     maxShedsPerHour: 4,
@@ -109,6 +115,9 @@ export function resolveRecordingConfig(s?: RecordingSettings): ResolvedRecording
       railLowSecs: s?.powerShedding?.railLowSecs ?? d.powerShedding.railLowSecs,
       escalateDwellSecs: s?.powerShedding?.escalateDwellSecs ?? d.powerShedding.escalateDwellSecs,
       escalateDutyPct: s?.powerShedding?.escalateDutyPct ?? d.powerShedding.escalateDutyPct,
+      cpuTempC: s?.powerShedding?.cpuTempC ?? d.powerShedding.cpuTempC,
+      cpuTempRestoreC: s?.powerShedding?.cpuTempRestoreC ?? d.powerShedding.cpuTempRestoreC,
+      cpuTempSecs: s?.powerShedding?.cpuTempSecs ?? d.powerShedding.cpuTempSecs,
       restoreSecs: s?.powerShedding?.restoreSecs ?? d.powerShedding.restoreSecs,
       railRestoreVolts: s?.powerShedding?.railRestoreVolts ?? d.powerShedding.railRestoreVolts,
       maxShedsPerHour: s?.powerShedding?.maxShedsPerHour ?? d.powerShedding.maxShedsPerHour,

@@ -97,7 +97,16 @@ export interface RecordingSettings {
      * a bouncing rail never satisfies — the 2026-07-30 crash.
      */
     escalateDutyPct?: number;
-    /** Clean interval (no UV, rail ≥ railRestoreVolts) per restored rung. */
+    /**
+     * Thermal arm (power_management_improvements Phase 1): shed live streaming
+     * when the SoC sits at/above cpuTempC for cpuTempSecs straight, restore
+     * only below cpuTempRestoreC. Thermal caps at rung 1 — it never stops
+     * recording (D4).
+     */
+    cpuTempC?: number;
+    cpuTempRestoreC?: number;
+    cpuTempSecs?: number;
+    /** Clean interval (no UV, rail ≥ railRestoreVolts, SoC ≤ cpuTempRestoreC) per restored rung. */
     restoreSecs?: number;
     railRestoreVolts?: number;
     /** Shed cycles per rolling hour before parking at the shed level. */
@@ -332,6 +341,7 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
       // 50 % floor: below "more triggered than not" the ladder would escalate
       // off noise; 100 = the pre-Phase-6 continuous-dwell rule.
       ["escalateDutyPct", 50, 100],
+      ["cpuTempSecs", 5, 120],
       ["restoreSecs", 10, 3600],
       ["maxShedsPerHour", 0, 60],
     ];
@@ -341,12 +351,16 @@ export function parseRecordingSettings(v: unknown): RecordingSettings | undefine
         (p as Record<string, unknown>)[field] = Math.min(max, Math.max(min, Math.round(v)));
       }
     }
-    // Voltage thresholds keep their decimals; bounds bracket plausible 5 V rails.
-    const volts: [keyof typeof p, number, number][] = [
+    // Voltage/temperature thresholds keep their decimals; bounds bracket
+    // plausible 5 V rails and plausible SoC trip points (the Pi hard-throttles
+    // at 85 °C, so a trigger above 90 would never be reached in time).
+    const decimals: [keyof typeof p, number, number][] = [
       ["railLowVolts", 4.0, 5.2],
       ["railRestoreVolts", 4.0, 5.4],
+      ["cpuTempC", 50, 90],
+      ["cpuTempRestoreC", 40, 85],
     ];
-    for (const [field, min, max] of volts) {
+    for (const [field, min, max] of decimals) {
       const v = (shed as Record<string, unknown>)[field];
       if (typeof v === "number" && Number.isFinite(v)) {
         (p as Record<string, unknown>)[field] = Math.min(max, Math.max(min, v));

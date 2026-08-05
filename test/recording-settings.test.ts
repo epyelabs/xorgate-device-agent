@@ -166,6 +166,23 @@ describe("parseRecordingSettings", () => {
     ).toEqual({ powerShedding: { enabled: false } });
   });
 
+  it("accepts and clamps the thermal-arm thresholds (Phase 1)", () => {
+    // Temperatures keep their decimals, like the rail voltages; the window is
+    // an integer second count.
+    expect(
+      parseRecordingSettings({
+        powerShedding: { cpuTempC: 72.5, cpuTempRestoreC: 64.5, cpuTempSecs: 20 },
+      }),
+    ).toEqual({ powerShedding: { cpuTempC: 72.5, cpuTempRestoreC: 64.5, cpuTempSecs: 20 } });
+    // Out of range clamps rather than disabling protection (device posture).
+    expect(
+      parseRecordingSettings({
+        powerShedding: { cpuTempC: 200, cpuTempRestoreC: 0, cpuTempSecs: 9999 },
+      }),
+    ).toEqual({ powerShedding: { cpuTempC: 90, cpuTempRestoreC: 40, cpuTempSecs: 120 } });
+    expect(parseRecordingSettings({ powerShedding: { cpuTempC: "hot" } })).toBeUndefined();
+  });
+
   it("resolves powerShedding defaults (on, Q4 starting thresholds)", () => {
     const cfg = resolveRecordingConfig(undefined);
     expect(cfg.powerShedding).toEqual({
@@ -176,6 +193,9 @@ describe("parseRecordingSettings", () => {
       railLowSecs: 15,
       escalateDwellSecs: 60,
       escalateDutyPct: 70,
+      cpuTempC: 80,
+      cpuTempRestoreC: 70,
+      cpuTempSecs: 15,
       restoreSecs: 120,
       railRestoreVolts: 4.95,
       maxShedsPerHour: 4,

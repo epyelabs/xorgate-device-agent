@@ -437,6 +437,20 @@ export interface ShedConfig {
    * bounce back above any usable threshold every few seconds).
    */
   escalateDutyPct: number;
+  /**
+   * ... OR the SoC runs at/above this for cpuTempSecs straight (°C).
+   *
+   * Thermal arm (power_management_improvements plan, Phase 1). A STARTING value
+   * of 80: the Pi hard-throttles at 85 °C, so this sheds with a 5 °C margin
+   * before the firmware caps clocks on its own. Deliberately NOT justified by
+   * any assumed firmware soft-limit default — `vcgencmd get_config
+   * temp_soft_limit` reads 0 (unset) on the CM5, so the effective point cannot
+   * be read off the device (PROGRESS Q1).
+   */
+  cpuTempC: number;
+  /** Restore needs the SoC at/below this — the anti-flap margin (°C). */
+  cpuTempRestoreC: number;
+  cpuTempSecs: number;
   /** Clean interval (no UV, rail at/above railRestoreVolts) per restored rung. */
   restoreSecs: number;
   railRestoreVolts: number;
@@ -444,17 +458,38 @@ export interface ShedConfig {
   maxShedsPerHour: number;
 }
 
-/** One ~1 Hz power reading (see agent/collectors samplePower). */
+/**
+ * One ~1 Hz power reading (see agent/collectors samplePower).
+ *
+ * The two thermal fields are OPTIONAL on purpose: absent means "this host has
+ * no thermal reading", which resolves to no-shed (README principle 1, fail
+ * open). Producers that predate the thermal arm therefore keep their exact
+ * pre-Phase-1 behavior with no change at all — which is also what makes the
+ * untouched Phase-3 test suite a regression guard for it.
+ */
 export interface PowerSampleReading {
   /** CURRENT undervoltage bit (0x1) of the throttle mask. */
   uv: boolean;
   /** EXT5V rail voltage; null when the PMIC ADC is unavailable (Pi 4). */
   railV: number | null;
+  /** SoC temperature in °C; null/absent when /sys/class/thermal is unreadable. */
+  tempC?: number | null;
+  /**
+   * CURRENT soft-temperature-limit bit (0x8) of the throttle mask — the
+   * firmware's own thermal verdict. Bits 0x2 (arm frequency capped) and 0x4
+   * (currently throttled) are deliberately NOT read: they are consequences the
+   * firmware sets for EITHER undervoltage or heat, so triggering on them would
+   * make the shed reason unattributable (PROGRESS Q3).
+   */
+  softTemp?: boolean;
 }
 
 interface PowerSample extends PowerSampleReading {
   /** MONOTONIC ms at the reading (see the module TIME note). */
   tMs: number;
+  /** Normalized at push(): null = no thermal reading on this host. */
+  tempC: number | null;
+  softTemp: boolean;
 }
 
 /**
@@ -464,20 +499,39 @@ interface PowerSample extends PowerSampleReading {
  */
 export const POWER_SAMPLE_STALE_MS = 5_000;
 
+/**
+ * Which KIND of condition is triggering. `"power"` covers both power arms (the
+ * UV bit and the rail), `"thermal"` covers both thermal ones (our own sustained
+ * temperature and the firmware's 0x8 bit). Derived by the same precedence as
+ * `why`, so when a hot device is ALSO on a bad supply the cause is `"power"`.
+ *
+ * Two consumers: the rung 1 → 2 escalation cap below (D4/Q2 — thermal must
+ * never cost recording), and Phase 2's `liveBlock.reason`.
+ */
+export type ShedCause = "power" | "thermal";
+
 /** What the sample window currently says (pure, exported for tests). */
 export interface ShedSignals {
   trigger: boolean;
   /**
    * Is the NEWEST sample itself unhealthy by the trigger's own thresholds (UV
-   * bit set, or rail below railLowVolts)? This is the escalation duty-cycle's
-   * input (Phase 6): the debounced `trigger` drops out on every bounce back
-   * over the threshold, while the samples themselves stay predominantly bad —
-   * which is exactly the field state that crashed the device at rung 1.
+   * bit set, rail below railLowVolts, or SoC at/above cpuTempC)? This is the
+   * escalation duty-cycle's input (Phase 6): the debounced `trigger` drops out
+   * on every bounce back over the threshold, while the samples themselves stay
+   * predominantly bad — which is exactly the field state that crashed the
+   * device at rung 1.
    */
   dirty: boolean;
   /** Trigger rationale for the transition log; null when not triggering. */
   why: string | null;
-  /** Newest "dirty" sample (UV, or rail below railRestoreVolts); null if none in window. */
+  /** What is triggering (see ShedCause); null when not triggering. */
+  cause: ShedCause | null;
+  /**
+   * Newest "dirty" sample — UV, rail below railRestoreVolts, or SoC at/above
+   * cpuTempRestoreC. Null if none in window. This is the restore anchor, so it
+   * uses the RESTORE thresholds, not the trigger ones: coming back down to
+   * "not triggering" is not the same as being cool/clean enough to restore.
+   */
   lastDirtyMs: number | null;
 }
 
@@ -505,23 +559,63 @@ export function computeShedSignals(
   const railLow =
     fresh && lowRunStartMs !== null && nowMs - lowRunStartMs >= cfg.railLowSecs * 1000;
 
+  // Sustained SoC heat — the same run-walk as the rail, mirrored (at/above a
+  // threshold rather than below one). Samples with no temperature are skipped,
+  // not treated as a break: a host that loses its thermal zone for one tick
+  // must not silently restart the run.
+  let highRunStartMs: number | null = null;
+  let lastTemp: number | null = null;
+  for (let i = samples.length - 1; i >= 0; i--) {
+    const t = samples[i].tempC;
+    if (t === null) continue;
+    if (lastTemp === null) lastTemp = t;
+    if (t < cfg.cpuTempC) break;
+    highRunStartMs = samples[i].tMs;
+  }
+  const tempHigh =
+    fresh && highRunStartMs !== null && nowMs - highRunStartMs >= cfg.cpuTempSecs * 1000;
+  // The firmware's own thermal verdict (0x8). Needs the freshness guard for the
+  // same reason the rail run does: it is a level, not an event that ages out of
+  // a window, so a dead sampler would otherwise hold the trigger on forever and
+  // block restore. Measured 2026-08-05 on the bench CM5: 0x8 appears at ~82 °C,
+  // i.e. the 80 °C threshold above fires first and this is the backstop.
+  const softTemp = fresh && newest !== undefined && newest.softTemp;
+
   let lastDirtyMs: number | null = null;
   for (const s of samples) {
-    if (s.uv || (s.railV !== null && s.railV < cfg.railRestoreVolts)) lastDirtyMs = s.tMs;
+    if (
+      s.uv ||
+      (s.railV !== null && s.railV < cfg.railRestoreVolts) ||
+      (s.tempC !== null && s.tempC >= cfg.cpuTempRestoreC) ||
+      s.softTemp
+    ) {
+      lastDirtyMs = s.tMs;
+    }
   }
 
   const dirty =
     fresh &&
     newest !== undefined &&
-    (newest.uv || (newest.railV !== null && newest.railV < cfg.railLowVolts));
+    (newest.uv ||
+      (newest.railV !== null && newest.railV < cfg.railLowVolts) ||
+      (newest.tempC !== null && newest.tempC >= cfg.cpuTempC) ||
+      newest.softTemp);
 
+  // Precedence: undervoltage, then rail, then thermal. Undervoltage is the one
+  // that crashes the device, so it names the event.
   const why =
     uvCount >= cfg.uvSamples
       ? `undervoltage ${uvCount}x in ${cfg.uvWindowSecs}s`
       : railLow
         ? `rail ${lastRail?.toFixed(2)}V < ${cfg.railLowVolts}V for ${cfg.railLowSecs}s`
-        : null;
-  return { trigger: why !== null, dirty, why, lastDirtyMs };
+        : tempHigh
+          ? `cpu ${lastTemp?.toFixed(1)}°C >= ${cfg.cpuTempC}°C for ${cfg.cpuTempSecs}s`
+          : softTemp
+            ? `cpu soft temp limit (throttle bit 0x8)`
+            : null;
+  const cause: ShedCause | null =
+    why === null ? null : uvCount >= cfg.uvSamples || railLow ? "power" : "thermal";
+  return { trigger: why !== null, dirty, why, cause, lastDirtyMs };
 }
 
 /**
@@ -642,7 +736,19 @@ export function decideShedTransition(
       }
       return { state: s, event: { level: "warn", msg } };
     }
-    if (s.level === 1) {
+    // D4/Q2: THERMAL CAPS AT RUNG 1 and must never reach rung 2. Undervoltage
+    // is existential — a sagging rail hard-resets the Pi, which corrupts the
+    // in-flight recording and wedges GNSS (the 2026-07-28 finding) — so trading
+    // recording away to survive it is a good trade. Heat is self-limiting: the
+    // firmware throttles clocks at ~85 °C and the device keeps running, so
+    // killing recording would cost the product's actual output to avert a
+    // condition that was never fatal. Degraded footage beats no footage.
+    //
+    // Scoped to the CAUSE, not a blanket disable: a hot device on a bad supply
+    // has `cause === "power"` by the precedence in computeShedSignals, so it
+    // escalates exactly as it does today. A merely-hot device holds at rung 1
+    // for as long as it stays hot, still refreshing the restore anchor.
+    if (s.level === 1 && sig.cause === "power") {
       const duty = triggerDutyCycle(s.triggerLog, s.lastChangeMs, nowMs, dwellMs);
       if (duty !== null && duty * 100 >= cfg.escalateDutyPct) {
         s.level = 2;
@@ -673,7 +779,9 @@ export function decideShedTransition(
         state: s,
         event: {
           level: "info",
-          msg: `power shed restore → ${SHED_LEVELS[s.level]} (rail clean for ${cfg.restoreSecs}s)`,
+          // "clean" spans every arm: no UV, rail at/above railRestoreVolts, AND
+          // the SoC at/below cpuTempRestoreC for the whole interval.
+          msg: `power shed restore → ${SHED_LEVELS[s.level]} (clean for ${cfg.restoreSecs}s)`,
         },
       };
     }
@@ -717,7 +825,14 @@ export class LoadShedPolicy {
 
   /** Record one power reading (manager's ~1 Hz tick). */
   push(reading: PowerSampleReading): void {
-    this.samples.push({ ...reading, tMs: this.now() });
+    // Normalize the optional thermal halves once, here, so the pure decision
+    // core only ever sees "a reading, or an explicit null".
+    this.samples.push({
+      ...reading,
+      tempC: reading.tempC ?? null,
+      softTemp: reading.softTemp ?? false,
+      tMs: this.now(),
+    });
     // Backstop prune so a caller that only pushes can never grow unbounded;
     // evaluate() prunes precisely per config.
     if (this.samples.length > 4000) this.samples.splice(0, this.samples.length - 4000);
@@ -738,7 +853,8 @@ export class LoadShedPolicy {
       };
     }
     const horizonMs =
-      Math.max(cfg.uvWindowSecs, cfg.railLowSecs, cfg.restoreSecs) * 1000 + POWER_SAMPLE_STALE_MS;
+      Math.max(cfg.uvWindowSecs, cfg.railLowSecs, cfg.cpuTempSecs, cfg.restoreSecs) * 1000 +
+      POWER_SAMPLE_STALE_MS;
     this.samples = this.samples.filter((s) => nowMs - s.tMs <= horizonMs);
     const signals = computeShedSignals(this.samples, cfg, nowMs);
     const { state, event } = decideShedTransition(cfg, this.state, signals, nowMs);

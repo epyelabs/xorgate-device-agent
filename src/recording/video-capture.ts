@@ -16,7 +16,7 @@
  * today's direct .gst pipelines stream. The record branch's caps come from the
  * preset; the bridge branch scales/rates down to the fixed contract.
  */
-import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
 import { setPriority } from "node:os";
 import { join } from "node:path";
 import { watch, type FSWatcher } from "node:fs";
@@ -42,6 +42,24 @@ const MAX_QUICK_FAILURES = 3;
 const PARKED_RETRY_MS = 60_000;
 /** fs.watch fallback: a slow sweep still closes fragments if events are missed. */
 const SWEEP_POLL_MS = 10_000;
+/**
+ * Progress watchdog (hardware-reproduced 2026-08-06, `1080p30-4mbps` on the
+ * bench IMX290): a capture child can spawn cleanly, negotiate its stream, and
+ * then never receive a single frame — every thread parked in futex/poll,
+ * 0.3 s of CPU in 25 s, a 0-byte fragment, and NOTHING on stderr. The process
+ * never exits, so crash/backoff/quickFailures never fire and the run sits at
+ * "running" forever while the device reports `recording: true`. Liveness is
+ * therefore not evidence of capture: a run that has put no bytes on disk for
+ * this long is treated as failed.
+ *
+ * Deliberately generous — a false positive kills a HEALTHY capture. mp4mux
+ * (fragment-duration=1000) lands real bytes within ~2-4 s of the first frame
+ * even at the cheapest preset, so 45 s is ~10x margin, and the check rides
+ * the 10 s sweep so detection costs at most one extra tick.
+ */
+const STALL_MS = 45_000;
+/** Consecutive stalls before the camera parks on the slow retry. */
+const MAX_STALL_FAILURES = 3;
 
 export interface CaptureCamera {
   streamKey: string;
@@ -250,6 +268,8 @@ export interface VideoCaptureOptions {
   spawn?: CaptureSpawn;
   stableMs?: number;
   sweepPollMs?: number;
+  /** Progress-watchdog patience; defaults to STALL_MS. */
+  stallMs?: number;
 }
 
 interface CameraRun {
@@ -269,6 +289,19 @@ interface CameraRun {
   watcher: FSWatcher | null;
   sweepTimer: NodeJS.Timeout | null;
   sweeping: boolean;
+  /** Progress watchdog: the fragment last seen growing, its size, and when. */
+  progressPath: string | null;
+  progressBytes: number;
+  progressAt: number;
+  /** This run is being torn down by the progress watchdog (not a crash). */
+  stalled: boolean;
+  /**
+   * Consecutive stalls. Unlike `quickFailures` this is NOT cleared by the
+   * stable timer — a stalled child stays up well past STABLE_MS, so anything
+   * the liveness timer resets would never accumulate. Only observed bytes
+   * clear it.
+   */
+  stallFailures: number;
 }
 
 /**
@@ -349,6 +382,11 @@ export class VideoCaptureSupervisor {
         watcher: null,
         sweepTimer: null,
         sweeping: false,
+        progressPath: null,
+        progressBytes: 0,
+        progressAt: 0,
+        stalled: false,
+        stallFailures: 0,
       };
       this.runs.set(cam.streamKey, run);
       const delayMs = index * staggerMs;
@@ -417,7 +455,7 @@ export class VideoCaptureSupervisor {
   /** True while any camera is actively capturing TO DISK (payload media.recording flag). */
   anyRecording(): boolean {
     if (!this.opts.record) return false;
-    return [...this.runs.values()].some((r) => r.state === "running" || r.state === "starting");
+    return [...this.runs.values()].some((r) => this.isRecording(r));
   }
 
   status(): CaptureStatus[] {
@@ -425,9 +463,22 @@ export class VideoCaptureSupervisor {
       streamKey: r.cam.streamKey,
       state: r.state,
       sessionId: r.sessionId,
-      recording:
-        this.opts.record && (r.state === "running" || r.state === "starting"),
+      recording: this.opts.record && this.isRecording(r),
     }));
+  }
+
+  /**
+   * "Recording" = the child is up AND we still have reason to believe it is
+   * writing. Being up is reason enough only until this camera has stalled
+   * once; after that the claim must be earned by observed bytes. Without that
+   * second clause a permanently stalled camera would keep reporting
+   * `recording: true` for the ~45 s of every kill/retry cycle — the very lie
+   * this watchdog exists to stop — while still being honest about the couple
+   * of seconds a healthy child needs before its first fragment appears.
+   */
+  private isRecording(r: CameraRun): boolean {
+    if (r.state !== "running" && r.state !== "starting") return false;
+    return r.stallFailures === 0 || r.progressBytes > 0;
   }
 
   shmSocketPath(streamKey: string): string {
@@ -480,6 +531,12 @@ export class VideoCaptureSupervisor {
     }
     run.state = "starting";
     run.startedAt = Date.now();
+    // Fresh watchdog baseline per child; `stallFailures` deliberately survives
+    // the respawn so a camera that stalls every time eventually parks.
+    run.progressPath = null;
+    run.progressBytes = 0;
+    run.progressAt = run.startedAt;
+    run.stalled = false;
 
     // A socket file left by a killed predecessor makes the new shmsink accept
     // nothing ("Connection refused" on the KVS side) — verified on hardware.
@@ -539,6 +596,8 @@ export class VideoCaptureSupervisor {
       run.stableTimer = null;
     }
     run.handle = null;
+    const stalled = run.stalled;
+    run.stalled = false;
     this.stopWatching(run);
 
     // Close out whatever the child left: clean stop (EOS ran) → the last
@@ -571,6 +630,32 @@ export class VideoCaptureSupervisor {
       run.state = "failed";
       this.opts.onEvent?.("warn", `video capture ${streamKey}: gst-launch-1.0 not found; parking`);
       this.scheduleRestart(run, PARKED_RETRY_MS);
+      this.opts.onStatus?.();
+      return;
+    }
+    // Watchdog kill: accounted separately from crashes. A stall always outlives
+    // STABLE_MS, so the branch below would read it as "ran fine, then exited"
+    // and restart forever at 2 s — a hot loop against a camera that may simply
+    // be unable to deliver this mode.
+    if (stalled) {
+      run.stallFailures += 1;
+      if (run.stallFailures >= MAX_STALL_FAILURES) {
+        run.state = "failed";
+        this.opts.onEvent?.(
+          "warn",
+          `video capture ${streamKey} stalled ${run.stallFailures}x in a row; ` +
+            `parking for ${PARKED_RETRY_MS / 1000}s (sensor mode unsupported? camera wedged?)`,
+        );
+        this.scheduleRestart(run, PARKED_RETRY_MS);
+      } else {
+        run.state = "retrying";
+        this.opts.onEvent?.(
+          "warn",
+          `video capture ${streamKey} stalled; ` +
+            `retry ${run.stallFailures}/${MAX_STALL_FAILURES} in ${BASE_BACKOFF_MS}ms`,
+        );
+        this.scheduleRestart(run, BASE_BACKOFF_MS);
+      }
       this.opts.onStatus?.();
       return;
     }
@@ -666,9 +751,63 @@ export class VideoCaptureSupervisor {
           /* rotated away mid-sweep — fine */
         }
       }
+      this.checkProgress(run, res.activePath);
     } finally {
       run.sweeping = false;
     }
+  }
+
+  /**
+   * Progress watchdog tick, riding the sweep cadence. Progress is "the active
+   * fragment moved on, or grew" — NOT "a fragment closed". splitmuxsink cuts
+   * at `segmentSeconds` (60 s by default), so segment closure is far too
+   * coarse a heartbeat to tell a stalled source from a fragment still filling;
+   * the active file's size is the signal that moves every second.
+   */
+  private checkProgress(run: CameraRun, activePath: string | null): void {
+    if (!this.opts.record || this.stopped || run.retiring || run.stalled) return;
+    if (!run.handle) return;
+    let bytes = 0;
+    if (activePath !== null) {
+      try {
+        bytes = statSync(activePath).size;
+      } catch {
+        bytes = 0; // evicted/rotated mid-sweep — the next tick re-reads
+      }
+    }
+    // A rotation counts as progress even though the new fragment starts small:
+    // closed fragments are deleted once uploaded, so byte TOTALS are not
+    // monotonic and only the active file can be compared against itself.
+    const advanced =
+      activePath !== null &&
+      bytes > 0 &&
+      (activePath !== run.progressPath || bytes > run.progressBytes);
+    if (advanced) {
+      run.progressPath = activePath;
+      run.progressBytes = bytes;
+      run.progressAt = Date.now();
+      run.stallFailures = 0;
+      return;
+    }
+    const stallMs = this.opts.stallMs ?? STALL_MS;
+    if (Date.now() - run.progressAt < stallMs) return;
+
+    run.stalled = true;
+    run.state = "failed";
+    this.stopWatching(run);
+    this.opts.onEvent?.(
+      "warn",
+      `video capture ${run.cam.streamKey} stalled: no bytes written for ` +
+        `${Math.round(stallMs / 1000)}s (session ${run.sessionId?.slice(0, 8) ?? "?"}…) — ` +
+        `killing and restarting`,
+    );
+    this.opts.onStatus?.();
+    // SIGKILL, not the usual SIGINT: `-e` turns SIGINT into an EOS request, and
+    // EOS has to travel the very pipeline that has stopped moving (observed:
+    // every thread parked in futex/poll), so the child would never exit. The
+    // active fragment is 0 bytes by definition here — there is nothing an
+    // orderly finalize could save.
+    run.handle.stop("SIGKILL");
   }
 
   private finalSweep(run: CameraRun, cleanStop: boolean): void {

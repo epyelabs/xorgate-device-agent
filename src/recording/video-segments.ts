@@ -286,15 +286,19 @@ export function sweepSessionDir(
         /* next fragment raced an eviction — fall back to fstat anchoring */
       }
     }
-    // A 0-byte fragment is a power-cut artifact (data died in page cache —
-    // observed on hardware); there is nothing to salvage and a sidecar would
-    // send garbage through the Phase 4 uploader. Only reap it when the
-    // session is closed (includeNewest) — live, the newest is still filling.
+    // A 0-byte fragment has two known causes and this sweep cannot tell them
+    // apart: a power cut (data died in the page cache — observed on hardware)
+    // and a source that never delivered a frame (observed 2026-08-06 —
+    // `1080p30-4mbps` on the bench IMX290; the capture supervisor's progress
+    // watchdog is what distinguishes THAT case, while the run is still alive).
+    // Either way there is nothing to salvage and a sidecar would send garbage
+    // through the Phase 4 uploader. Only reap it when the session is closed
+    // (includeNewest) — live, the newest is still filling.
     if (st.size === 0) {
       if (opts.includeNewest) {
         try {
           unlinkSync(mp4Path);
-          console.warn(`[recording] dropped empty power-cut fragment ${mp4Path}`);
+          console.warn(`[recording] dropped empty fragment ${mp4Path}`);
         } catch {
           /* best effort */
         }

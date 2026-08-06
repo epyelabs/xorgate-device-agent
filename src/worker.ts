@@ -12,7 +12,8 @@
  * read it. This file must NOT import ink/React — keep the detached process lean.
  */
 import { loadConfig } from "./agent/config.js";
-import { applyCloudConfig, parseCloudConfig } from "./agent/cloud-config.js";
+import { applyCloudConfig, parseCloudMessage } from "./agent/cloud-config.js";
+import { ConfigSync } from "./agent/config-sync.js";
 import { createClockStepper, resolveTimeSyncConfig } from "./agent/clock-step.js";
 import type { GpsClockReading } from "./agent/collectors/gps.js";
 import type { GnssView } from "./lib/sky-state.js";
@@ -225,8 +226,9 @@ await recording.start();
 // RTC/fake-hwclock via the sudo helper. Self-disarms once NTP syncs; the
 // timeSync.offlineSources setting is the kill switch. Real mode only — the
 // simulator has no GPS/modem, and a dev box must never have its clock touched.
+let clockStepper: ReturnType<typeof createClockStepper> | null = null;
 if (config.mode === "real") {
-  const clockStepper = createClockStepper({
+  clockStepper = createClockStepper({
     config: () => resolveTimeSyncConfig(loadSettings().timeSync),
     gpsClock: () => source.gpsClock?.() ?? null,
     onStepped: (stepSource) => {
@@ -268,18 +270,50 @@ process.on("unhandledRejection", (reason) => {
 
 const client = connect(config);
 
+/**
+ * The reported half of the config plane (settings-management plan, Phase 3):
+ * owns the rev guard, `config-sync.json`, and the debounced publisher that
+ * echoes what this device actually holds back to the cloud.
+ *
+ * Deliberately constructed with only READ hooks into the running agent —
+ * `recording.status()` and the clock stepper's `status()` are already-published
+ * snapshots. Nothing below may be awaited by, or able to block, an apply path
+ * (design.md §7): every call into it is fire-and-forget and swallows its own
+ * errors, so a broken report path degrades to pre-Phase-3 behaviour.
+ */
+const configSync = new ConfigSync({
+  deviceId: config.deviceId,
+  topic: config.configReportedTopic,
+  publish: (topic, payload) => client.publish(topic, payload, { qos: 1, retain: false }),
+  hints: () => {
+    const status = recording.status();
+    return {
+      bootDefer: status.bootDefer ?? null,
+      powerShed: status.powerShed ?? null,
+      clockStepperArmed: clockStepper?.status().armed,
+    };
+  },
+  onEvent: (level, msg) => {
+    const t = Date.now();
+    console[level === "warn" ? "warn" : "log"](`[agent] ${msg}`);
+    store.event(level, msg, t);
+    store.flush(t, true);
+  },
+});
+
 // Cloud config messages (retained; re-delivered on every connect). Persist into
 // settings.json — the sim7600-lte daemon polls the file and applies gnssAntBias
 // live.
 function handleConfigMessage(payload: Buffer): void {
   const now = Date.now();
-  const parsed = parseCloudConfig(payload);
-  if (parsed === null) {
+  const message = parseCloudMessage(payload);
+  if (message === null) {
     console.error("[agent] ignoring malformed config message");
     store.event("warn", "ignoring malformed cloud config message", now);
     store.flush(now, true);
     return;
   }
+  const { raw, config: parsed } = message;
   // uploadBucket backfill (Phase 6.2): devices fielded before Phase 2 have no
   // uploadBucket in kvs.json and silently cannot upload; the retained config
   // message now carries it. Persist + re-arm the uploader live (the retained
@@ -299,22 +333,41 @@ function handleConfigMessage(payload: Buffer): void {
       store.flush(now, true);
     }
   }
+  // Rev guard (Phase 3): this message is RETAINED, so the broker replays it on
+  // every single connect. Re-applying a document the device has already applied
+  // is what makes local state revert on reconnect; skipping it here is what
+  // stops that. `rev` absent/0 means a pre-Phase-2 backend — apply
+  // unconditionally, exactly as before.
+  const shouldApply = configSync.shouldApply(parsed.rev);
+  let applied = false;
   try {
-    const { changed } = applyCloudConfig(parsed);
+    if (shouldApply) {
+      const { changed } = applyCloudConfig(parsed);
+      applied = true;
+      if (changed) {
+        const summary = JSON.stringify(parsed);
+        console.log(`[agent] cloud config applied: ${summary}`);
+        store.event("info", `cloud config applied: ${summary}`, now);
+        store.flush(now, true);
+      }
+    } else {
+      console.log(`[agent] cloud config rev ${parsed.rev} already applied — not re-applying`);
+    }
     // Cloud config can (from Phase 5) carry the recording namespace; re-reading
     // settings here is how a cloud change applies without an agent restart.
+    // Called on the skipped path too, so the apply machinery's cadence is
+    // byte-identical to pre-Phase-3 (it is a no-op re-read when nothing moved).
     recording.reapply();
-    if (changed) {
-      const summary = JSON.stringify(parsed);
-      console.log(`[agent] cloud config applied: ${summary}`);
-      store.event("info", `cloud config applied: ${summary}`, now);
-      store.flush(now, true);
-    }
   } catch (err) {
     console.error("[agent] cloud config apply failed", (err as Error).message);
     store.event("warn", `cloud config apply failed: ${(err as Error).message}`, now);
     store.flush(now, true);
   }
+  // Echo the verdict to the cloud even when the apply FAILED — a failure the
+  // cloud never hears about is exactly the divergence this plane exists to end.
+  // `applied` gates only whether the rev advances.
+  configSync.noteCloudConfig(parsed.rev, raw, parsed, applied);
+  configSync.request("cloud");
 }
 
 /** How long to wait for the ack's PUBACK before going down anyway. */
@@ -472,6 +525,13 @@ client.on("connect", () => {
     });
   }
 
+  // Assert current config state to the cloud. Coalesced with the report the
+  // retained config message triggers ~0.5 s from now, so a connect costs one
+  // report, not two. The hourly heartbeat is the repair backstop for a report
+  // published into a link that was already gone.
+  configSync.request("boot");
+  configSync.startHeartbeat();
+
   if (timer) return; // already running across a reconnect
   timer = setInterval(async () => {
     if (shuttingDown) return;
@@ -561,6 +621,7 @@ function shutdown(sig: string): void {
   console.log(`\n[agent] shutting down (${sig})…`);
   if (timer) clearInterval(timer);
   clearInterval(heartbeat);
+  configSync.stop(); // no report may be queued into a client we are about to end
   // Finalize the active recording segment (sync) so a clean stop never leaves
   // an orphan .jsonl for the next boot's crash recovery to mop up.
   recording.stop();

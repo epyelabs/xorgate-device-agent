@@ -83,6 +83,13 @@ export interface AgentConfig {
   statusTopic: string;
   /** Retained cloud->device config messages (e.g. gnssAntBias) arrive here. */
   configTopic: string;
+  /**
+   * Device->cloud echo of what was actually applied (settings-management plan,
+   * Phase 3). Published QoS 1 and NOT retained — Postgres is the durable
+   * mirror. Covered by the existing device IoT policy, which grants publish on
+   * `xorgate/devices/${thingName}/*`.
+   */
+  configReportedTopic: string;
   /** Non-retained one-shot cloud->device commands (reboot, power_off) arrive here. */
   commandTopic: string;
   /** Accept/reject/fail acks for commandTopic are published here. */
@@ -237,6 +244,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     telemetryTopic: `xorgate/devices/${deviceId}/telemetry`,
     statusTopic: `xorgate/devices/${deviceId}/status`,
     configTopic: `xorgate/devices/${deviceId}/config`,
+    configReportedTopic: `xorgate/devices/${deviceId}/config/reported`,
     commandTopic: `xorgate/devices/${deviceId}/command`,
     commandResponseTopic: `xorgate/devices/${deviceId}/command/response`,
     certPath,

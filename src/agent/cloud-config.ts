@@ -8,13 +8,20 @@
  * each tick.
  *
  * Payload shape (full config object, not a delta — idempotent by design):
- *   { "v": 1, "gnssAntBias": boolean,
+ *   { "v": 1, "rev": <monotonic desired revision, optional>,
+ *     "gnssAntBias": boolean,
  *     "imuMount": { enabled, rollDeg, pitchDeg, yawDeg },
  *     "recording": { telemetry, video, upload, retention },
  *     "lteRecovery": { gpsFixResetPolicy, deadZoneProfile },
  *     "timeSync": { offlineSources, stepThresholdSecs, maxStepsPerBoot },
  *     "ts": <epoch ms> }
  * Future cloud-configurable knobs slot in as additional keys.
+ *
+ * `rev` (settings-management plan, Phase 2/3) is the cloud's monotonic
+ * `devices.config_rev`. It is metadata, not config: nothing here ever writes it
+ * into settings.json. The worker uses it as a guard (skip a document already
+ * applied) and echoes it back on the reported topic — see `config-sync.ts`,
+ * which is the other half of this seam.
  *
  * `lteRecovery` (lte_gnss_recovery plan, R8) follows the same REPLACE
  * semantics as `recording`: present → settings.json's `lteRecovery` becomes
@@ -45,6 +52,16 @@ import {
 import { parseImuMount, type ImuMount } from "../lib/orientation.js";
 
 export interface CloudConfig {
+  /**
+   * Monotonic desired-config revision (`devices.config_rev`), added additively
+   * in Phase 2 of the settings-management plan. ABSENT or 0 means the backend
+   * predates it — the worker then applies unconditionally, exactly like it did
+   * before, which is what keeps a new agent working against an old backend.
+   * When present, the worker skips a document whose rev it has already applied
+   * (see `agent/config-sync.ts`), so reconnect redelivery stops reverting
+   * state the device already holds.
+   */
+  rev?: number;
   gnssAntBias?: boolean;
   imuMount?: ImuMount;
   /**
@@ -77,20 +94,52 @@ export interface CloudConfig {
 }
 
 /**
- * Parse + validate a config message payload. Returns null when the payload is
- * not a v1 config object; unknown keys are ignored, known keys with the wrong
- * type are dropped (a partial-but-valid message still applies).
+ * A parsed config message plus the RAW object it came from.
+ *
+ * The reported plane (Phase 3) needs both halves: `config` is what the device
+ * will actually hold, `raw` is what the cloud asked for, and the difference
+ * between them is exactly the `adjusted` verdict the cloud can otherwise never
+ * see (two different cloud payloads can clamp to one stored value, and today
+ * nothing says so).
  */
-export function parseCloudConfig(payload: Buffer | string): CloudConfig | null {
+export interface CloudConfigMessage {
+  /** Every top-level key as delivered, before the tolerant parse. */
+  raw: Record<string, unknown>;
+  config: CloudConfig;
+}
+
+/**
+ * Parse a config message into its raw + normalized halves. Returns null when
+ * the payload is not a v1 config object.
+ */
+export function parseCloudMessage(payload: Buffer | string): CloudConfigMessage | null {
   let obj: unknown;
   try {
     obj = JSON.parse(payload.toString());
   } catch {
     return null;
   }
-  if (!obj || typeof obj !== "object") return null;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
   if ((obj as { v?: unknown }).v !== 1) return null;
+  const config = parseNamespaces(obj as Record<string, unknown>);
+  return { raw: obj as Record<string, unknown>, config };
+}
+
+/**
+ * Parse + validate a config message payload. Returns null when the payload is
+ * not a v1 config object; unknown keys are ignored, known keys with the wrong
+ * type are dropped (a partial-but-valid message still applies).
+ */
+export function parseCloudConfig(payload: Buffer | string): CloudConfig | null {
+  return parseCloudMessage(payload)?.config ?? null;
+}
+
+function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   const out: CloudConfig = {};
+  // Additive Phase 2 field. Anything not a positive finite integer is treated
+  // as absent, i.e. "always apply" — the compat path, never a hard failure.
+  const rev = (obj as { rev?: unknown }).rev;
+  if (typeof rev === "number" && Number.isFinite(rev) && rev > 0) out.rev = Math.floor(rev);
   const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
   if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
   const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);

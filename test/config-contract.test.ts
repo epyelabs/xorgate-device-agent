@@ -4,6 +4,7 @@ import { RECORDING_DEFAULTS } from "../src/recording/config.js";
 import { TIME_SYNC_DEFAULTS } from "../src/agent/clock-step.js";
 import { videoPresetNames, DEFAULT_VIDEO_PRESET } from "../src/recording/video-presets.js";
 import { parseRecordingSettings, parseTimeSyncSettings } from "../src/daemon/settings.js";
+import { CONFIG_APPLY_CLASSES } from "../src/agent/config-sync.js";
 
 /**
  * Contract test against `config-contract.json` — the artifact the CLOUD's
@@ -166,5 +167,17 @@ describe("config contract: the agent matches the cloud registry", () => {
     ]));
     const value = { powerShedding: { cpuTempC: 82, cpuTempRestoreC: 73, cpuTempSecs: 20 } };
     expect(parseRecordingSettings(value)).toEqual(value);
+  });
+
+  // The reported plane (Phase 3) tells the cloud HOW a namespace reaches the
+  // hardware, so the cloud can say whether "saved" already means "in force".
+  // That only means anything while both ends classify the namespaces the same
+  // way — and the agent's map is what a namespace added cloud-side has to pass
+  // through before the worker can honestly report on it.
+  it("the agent's apply classes match the published ones", () => {
+    const published = Object.fromEntries(
+      Object.entries(contract.namespaces).map(([key, ns]) => [key, ns.applyClass]),
+    );
+    expect(CONFIG_APPLY_CLASSES).toEqual(published);
   });
 });

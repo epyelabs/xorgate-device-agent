@@ -16,7 +16,15 @@
  * today's direct .gst pipelines stream. The record branch's caps come from the
  * preset; the bridge branch scales/rates down to the fixed contract.
  */
-import { closeSync, fsyncSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { setPriority } from "node:os";
 import { join } from "node:path";
 import { watch, type FSWatcher } from "node:fs";
@@ -60,6 +68,12 @@ const SWEEP_POLL_MS = 10_000;
 const STALL_MS = 45_000;
 /** Consecutive stalls before the camera parks on the slow retry. */
 const MAX_STALL_FAILURES = 3;
+/**
+ * Where shmsink's POSIX shared-memory areas land (`shm_open` → tmpfs on Linux).
+ * It names them `shmpipe.<pid>.<n>` and unlinks them in its OWN cleanup — which
+ * a SIGKILL skips, stranding `shm-size` (20 MB) of RAM until reboot.
+ */
+const SHM_SEGMENT_DIR = "/dev/shm";
 
 export interface CaptureCamera {
   streamKey: string;
@@ -270,6 +284,8 @@ export interface VideoCaptureOptions {
   sweepPollMs?: number;
   /** Progress-watchdog patience; defaults to STALL_MS. */
   stallMs?: number;
+  /** Where to reap orphaned shmsink segments; defaults to SHM_SEGMENT_DIR. */
+  shmSegmentDir?: string;
 }
 
 interface CameraRun {
@@ -595,10 +611,14 @@ export class VideoCaptureSupervisor {
       clearTimeout(run.stableTimer);
       run.stableTimer = null;
     }
+    const pid = run.handle?.pid;
     run.handle = null;
     const stalled = run.stalled;
     run.stalled = false;
     this.stopWatching(run);
+    // The child is gone (its `done` has resolved), so anything of its still
+    // sitting in the shm tmpfs is orphaned by definition.
+    this.reapShmSegments(pid);
 
     // Close out whatever the child left: clean stop (EOS ran) → the last
     // fragment is finalized; crash → it may be truncated. Either way it gets a
@@ -692,6 +712,41 @@ export class VideoCaptureSupervisor {
       run.backoffMs = Math.min(run.backoffMs * 2, MAX_BACKOFF_MS);
     }
     this.opts.onStatus?.();
+  }
+
+  /**
+   * Unlink the shm areas belonging to a child that has just exited.
+   *
+   * shmsink unlinks its own `shmpipe.<pid>.<n>` on clean shutdown, so for an
+   * EOS/SIGINT stop this finds nothing. It matters for the SIGKILL paths — the
+   * progress watchdog (which CANNOT use SIGINT: with `-e` that is an EOS
+   * request, and EOS has to travel the pipeline that has stopped moving) and
+   * stopAndWait()'s grace-period escalation. Without it a camera that stalls
+   * repeatedly strands 20 MB per kill until reboot; bench-observed 2026-08-06,
+   * 104 orphaned segments totalling 286 MB of a 4 GB device.
+   *
+   * Matched on the dead child's OWN pid, and only once it has exited. pid reuse
+   * is theoretically possible but would need the wrapped-around pid to also be
+   * a shmsink writer in the same instant.
+   */
+  private reapShmSegments(pid: number | undefined): void {
+    if (pid === undefined) return;
+    const dir = this.opts.shmSegmentDir ?? SHM_SEGMENT_DIR;
+    const prefix = `shmpipe.${pid}.`;
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return; // no shm tmpfs (non-Linux dev box, restricted container) — nothing to do
+    }
+    for (const name of names) {
+      if (!name.startsWith(prefix)) continue;
+      try {
+        unlinkSync(join(dir, name));
+      } catch {
+        /* raced another reaper, or not ours to remove — best effort */
+      }
+    }
   }
 
   private scheduleRestart(run: CameraRun, delayMs = run.backoffMs): void {

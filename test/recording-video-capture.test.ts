@@ -375,16 +375,18 @@ describe("VideoCaptureSupervisor progress watchdog", () => {
 
   it("counts a rotation as progress even though the new fragment is smaller", async () => {
     const spawner = fakeSpawner();
-    const sup = makeSup({ spawner });
+    const sup = makeSup({ spawner, stallMs: 200 });
     sup.start();
     const dir = join(home, "recordings", "video", "cam0", sup.status()[0].sessionId!);
     writeFileSync(join(dir, "00000.mp4"), Buffer.alloc(50_000, 1));
-    await delay(60);
+    await delay(150);
     // Rotation: the ACTIVE file is now a small, freshly-opened 00001 — byte
     // totals are not monotonic (closed fragments are deleted once uploaded),
     // so only "the active file moved on" can carry this.
     writeFileSync(join(dir, "00001.mp4"), Buffer.alloc(120, 1));
-    await delay(140);
+    await delay(120);
+    // By now it is ~270 ms since the last byte GREW — comfortably past stallMs.
+    // Only the rotation resetting the clock keeps this child alive.
     expect(spawner.spawns[0].stopped).toBeNull();
     sup.stop();
   });
@@ -405,6 +407,40 @@ describe("VideoCaptureSupervisor progress watchdog", () => {
     expect(spawner.spawns.length).toBe(3);
     sup.stop();
   }, 20_000);
+
+  it("reaps the killed child's orphaned shmsink segments, and only its own", async () => {
+    const spawner = fakeSpawner();
+    const shmSegDir = join(home, "devshm");
+    mkdirSync(shmSegDir, { recursive: true });
+    // shmsink names its area shmpipe.<pid>.<n> and unlinks it on CLEAN exit
+    // only — a SIGKILL strands 20 MB of tmpfs per stall.
+    writeFileSync(join(shmSegDir, "shmpipe.4242.    0"), Buffer.alloc(8));
+    writeFileSync(join(shmSegDir, "shmpipe.4242.    1"), Buffer.alloc(8));
+    writeFileSync(join(shmSegDir, "shmpipe.9999.    0"), Buffer.alloc(8)); // another process
+    writeFileSync(join(shmSegDir, "lttng-ust-wait-8"), Buffer.alloc(8)); // unrelated
+
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "dev-1",
+      cameras: [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+      record: true,
+      preset,
+      segmentSeconds: 60,
+      videoRoot: join(home, "recordings", "video"),
+      shmDir: join(home, "shm"),
+      timeSource: () => "ntp",
+      spawn: (cmd, args) => ({ ...spawner.spawn(cmd, args), pid: 4242 }),
+      stableMs: 10,
+      sweepPollMs: 15,
+      stallMs: 120,
+      shmSegmentDir: shmSegDir,
+    });
+    sup.start();
+    await delay(220); // stall → SIGKILL → onExit reaps
+
+    expect(spawner.spawns[0].stopped).toBe("SIGKILL");
+    expect(readdirSync(shmSegDir).sort()).toEqual(["lttng-ust-wait-8", "shmpipe.9999.    0"]);
+    sup.stop();
+  });
 
   it("bridge-only mode has no disk signal and is never watchdogged", async () => {
     const spawner = fakeSpawner();

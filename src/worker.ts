@@ -13,7 +13,8 @@
  */
 import { loadConfig } from "./agent/config.js";
 import { applyCloudConfig, parseCloudMessage } from "./agent/cloud-config.js";
-import { ConfigSync } from "./agent/config-sync.js";
+import { ConfigSync, ensureConfigSyncBaseline } from "./agent/config-sync.js";
+import { migrateMediaEnabled } from "./daemon/settings-migrate.js";
 import { createClockStepper, resolveTimeSyncConfig } from "./agent/clock-step.js";
 import type { GpsClockReading } from "./agent/collectors/gps.js";
 import type { GnssView } from "./lib/sky-state.js";
@@ -44,6 +45,29 @@ const WRITTEN_BY = "xorgate-device-agent@0.2.0";
 
 const config = loadConfig();
 ensureHome();
+
+// settings.json upgrades, before ANY other reader or writer touches the file.
+//
+// Order matters twice over. The config-sync baseline is captured FIRST so that
+// a first boot after upgrade adopts the file as-is rather than reporting every
+// namespace as a local edit; the `mediaEnabled` conversion then runs as a real
+// local change, which is exactly right — an operator's media opt-out has to
+// reach the cloud, or the next retained document (which replaces the whole
+// `recording` namespace) would turn the cameras straight back on.
+ensureConfigSyncBaseline();
+{
+  const streamKeys = (loadManifest(config.media.manifestPath)?.channels ?? []).map(
+    (c) => c.streamKey,
+  );
+  const migration = migrateMediaEnabled(streamKeys);
+  if (migration.result === "cameras-disabled") {
+    console.log(
+      `[agent] mediaEnabled:false migrated to disabled cameras: ${migration.cameras.join(", ") || "(none in manifest)"}`,
+    );
+  } else if (migration.result === "dropped") {
+    console.log("[agent] dropped the retired mediaEnabled setting from settings.json");
+  }
+}
 
 // Real mode enables every self-detecting collector; each one stays inert when
 // its hardware is absent, so the worker is healthy with or without it:
@@ -285,6 +309,12 @@ const configSync = new ConfigSync({
   deviceId: config.deviceId,
   topic: config.configReportedTopic,
   publish: (topic, payload) => client.publish(topic, payload, { qos: 1, retain: false }),
+  // Reported-only (Q4): `effective.agent.mode` lets the cloud show a field
+  // device stuck in `sim`. There is deliberately no cloud-writable counterpart.
+  mode: config.mode,
+  // Gates retiring a local change: a report published into a dead link never
+  // reached the mirror, so it must stay pending and be re-sent on connect.
+  online: () => store.snapshot().connection === "connected",
   hints: () => {
     const status = recording.status();
     return {
@@ -300,6 +330,13 @@ const configSync = new ConfigSync({
     store.flush(t, true);
   },
 });
+
+// The local half of the config plane (Phase 4): fingerprint settings.json and
+// report anything this worker did not write — `xorgate set`, the manage TUI, a
+// hand-edit with vim. Started before MQTT connects on purpose: an edit made
+// while the agent was stopped is just as real, and `config-sync.json` carries
+// the baseline that makes it detectable.
+configSync.startWatcher();
 
 // Cloud config messages (retained; re-delivered on every connect). Persist into
 // settings.json — the sim7600-lte daemon polls the file and applies gnssAntBias

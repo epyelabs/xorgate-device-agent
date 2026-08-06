@@ -59,7 +59,6 @@ export function MonitorApp({
   const [operating, setOperating] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [modeChoice, setModeChoice] = useState<RunMode | null>(null);
-  const [mediaChoice, setMediaChoice] = useState<boolean | null>(null);
   const [settingsRow, setSettingsRow] = useState(0);
   // WiFi row state: live presence/enabled, an "applying" flag, a self-cutoff
   // confirm gate, and a nonce we bump to re-probe after a toggle.
@@ -73,12 +72,13 @@ export function MonitorApp({
   const snapshot = running ? status.state : null;
   const selectedModule = MODULES[selected];
   const onSettings = selectedModule.id === "settings";
-  // Show the EFFECTIVE media state from the live daemon snapshot (like the run-mode
-  // row), so the pane is correct regardless of how it was enabled (settings.json or
-  // the MEDIA_ENABLED env). The toggle still edits settings.json on apply.
-  const mediaEnabled = snapshot?.mediaEnabled ?? false;
-  // Number of focusable Settings rows: mode, media, and wifi (only when present).
-  const settingsRowCount = wifi?.present ? 3 : 2;
+  // Number of focusable Settings rows: mode, and wifi (only when present). The
+  // media row went away with the `mediaEnabled` setting (settings-management
+  // plan, Phase 4) — cameras are turned off individually instead, from the
+  // cloud or `xorgate set recording.video.cameras.<key> off`.
+  const settingsRowCount = wifi?.present ? 2 : 1;
+  /** Index of the WiFi row; also the sentinel for "not the mode row". */
+  const WIFI_ROW = 1;
 
   // Probe the WiFi device while the Settings pane is selected; re-probe after a
   // toggle (wifiNonce). Detection runs only here, never on the telemetry path.
@@ -131,25 +131,16 @@ export function MonitorApp({
         } else if (key.downArrow || input === "j") {
           setWifiConfirm(false);
           setSettingsRow((r) => (r + 1) % settingsRowCount);
-        } else if (settingsRow === 2) {
+        } else if (settingsRow === WIFI_ROW) {
           // WiFi row: space/↵ apply immediately (OS-level, no daemon restart).
           if (input === " " || key.return || input === "a" || input === "A") {
             toggleWifi();
           }
         } else if (input === " ") {
-          // mode/media: toggle the focused row's pending value.
-          if (settingsRow === 0) {
-            setModeChoice((c) => ((c ?? snapshot?.mode ?? "sim") === "sim" ? "real" : "sim"));
-          } else {
-            setMediaChoice((c) => !(c ?? mediaEnabled));
-          }
+          setModeChoice((c) => ((c ?? snapshot?.mode ?? "sim") === "sim" ? "real" : "sim"));
         } else if (key.return || input === "a" || input === "A") {
-          // Persist mode/media choices, then restart so loadConfig picks them up.
-          saveSettings({
-            ...loadSettings(),
-            mode: modeChoice ?? snapshot?.mode ?? "sim",
-            mediaEnabled: mediaChoice ?? mediaEnabled,
-          });
+          // Persist the mode choice, then restart so loadConfig picks it up.
+          saveSettings({ ...loadSettings(), mode: modeChoice ?? snapshot?.mode ?? "sim" });
           controls.restart();
           setOperating(false);
         }
@@ -163,7 +154,6 @@ export function MonitorApp({
     } else if ((key.return || key.rightArrow) && running) {
       if (onSettings) {
         setModeChoice(snapshot?.mode ?? loadSettings().mode ?? "sim");
-        setMediaChoice(snapshot?.mediaEnabled ?? false);
         setSettingsRow(0);
       }
       setOperating(true);
@@ -213,8 +203,6 @@ export function MonitorApp({
           snapshot={snapshot}
           now={now}
           modeChoice={modeChoice ?? undefined}
-          mediaChoice={mediaChoice ?? undefined}
-          mediaEnabled={mediaEnabled}
           row={settingsRow}
           operating={operating}
           wifi={wifi}

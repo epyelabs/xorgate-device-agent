@@ -101,9 +101,13 @@ describe("applyCloudConfig", () => {
   });
 
   it("merges without clobbering other operator settings", () => {
-    saveSettings({ mode: "real", mediaEnabled: true });
+    saveSettings({ mode: "real", timeSync: { offlineSources: false } });
     applyCloudConfig({ gnssAntBias: true });
-    expect(loadSettings()).toEqual({ mode: "real", mediaEnabled: true, gnssAntBias: true });
+    expect(loadSettings()).toEqual({
+      mode: "real",
+      timeSync: { offlineSources: false },
+      gnssAntBias: true,
+    });
   });
 
   it("is a no-op when the value is unchanged (retained re-delivery)", () => {

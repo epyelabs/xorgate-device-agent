@@ -444,20 +444,19 @@ const media: Module = {
 };
 
 /**
- * Settings detail — the one interactive pane. A small two-row form: run mode
- * (sim/real) and the KVS WebRTC media runtime (on/off). Key handling (move row,
- * toggle value, apply + restart) lives in MonitorApp, which passes the in-progress
- * choices, the focused `row`, and the `operating` flag down. The current media
- * value comes via `mediaEnabled` (the persisted settings.json value) since the
- * state snapshot doesn't carry it. Extra props are optional so this still
+ * Settings detail — the one interactive pane. A small form: run mode (sim/real)
+ * and the WiFi radio. Key handling (move row, toggle value, apply + restart)
+ * lives in MonitorApp, which passes the in-progress choices, the focused `row`,
+ * and the `operating` flag down. Extra props are optional so this still
  * satisfies the generic `Module.Detail` (React.FC<DetailProps>) signature.
+ *
+ * The KVS media row was removed with the `mediaEnabled` setting
+ * (settings-management plan, Phase 4): cameras are now turned off individually,
+ * from the cloud or `xorgate set recording.video.cameras.<key> off`.
  */
 interface SettingsDetailProps extends DetailProps {
   modeChoice?: RunMode;
-  mediaChoice?: boolean;
-  /** Current persisted media toggle (settings.json); snapshot doesn't carry it. */
-  mediaEnabled?: boolean;
-  /** Focused row while operating: 0 = run mode, 1 = media, 2 = wifi. */
+  /** Focused row while operating: 0 = run mode, 1 = wifi. */
   row?: number;
   operating?: boolean;
   /** Live WiFi presence/state for the wifi row (null while probing). */
@@ -470,8 +469,6 @@ interface SettingsDetailProps extends DetailProps {
 export function SettingsDetail({
   snapshot,
   modeChoice,
-  mediaChoice,
-  mediaEnabled,
   row = 0,
   operating,
   wifi,
@@ -479,19 +476,14 @@ export function SettingsDetail({
   wifiConfirm,
 }: SettingsDetailProps) {
   const curMode = snapshot?.mode ?? "sim";
-  const curMedia = mediaEnabled ?? false;
   const valMode = operating ? (modeChoice ?? curMode) : curMode;
-  const valMedia = operating ? (mediaChoice ?? curMedia) : curMedia;
 
-  const rows = [
-    { label: "run mode", value: valMode, changed: valMode !== curMode },
-    { label: "media", value: valMedia ? "on" : "off", changed: valMedia !== curMedia },
-  ];
+  const rows = [{ label: "run mode", value: valMode, changed: valMode !== curMode }];
 
   return (
     <Box flexDirection="column">
       <DetailTitle>Settings</DetailTitle>
-      <Text color="gray">Run mode (sim/real), KVS WebRTC media, and the WiFi radio.</Text>
+      <Text color="gray">Run mode (sim/real) and the WiFi radio.</Text>
       <Box marginTop={1} flexDirection="column">
         {rows.map((r, i) => {
           const focused = !!operating && row === i;
@@ -509,7 +501,7 @@ export function SettingsDetail({
         })}
         <WifiRow
           wifi={wifi}
-          focused={!!operating && row === 2}
+          focused={!!operating && row === rows.length}
           busy={!!wifiBusy}
           confirm={!!wifiConfirm}
         />
@@ -517,7 +509,7 @@ export function SettingsDetail({
       <Box marginTop={1}>
         <Text color="gray" dimColor>
           {operating
-            ? row === 2
+            ? row === rows.length
               ? "↑↓ field · space/↵ toggle wifi · ←/q back"
               : "↑↓ field · space toggle · ↵ apply & restart · ←/q back"
             : "↵ to edit settings"}

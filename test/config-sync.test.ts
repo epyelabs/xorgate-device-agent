@@ -8,16 +8,21 @@ import {
   CONFIG_APPLY_CLASSES,
   ConfigSync,
   configSyncPath,
+  diffNamespaces,
+  ensureConfigSyncBaseline,
   loadConfigSyncState,
+  namespacesOf,
   readModemBias,
+  readSettingsHash,
   saveConfigSyncState,
   shouldApplyRev,
   type ConfigReport,
+  type ConfigSyncOptions,
   type DesiredSnapshot,
   type ModemBiasSample,
 } from "../src/agent/config-sync.js";
-import { parseCloudMessage } from "../src/agent/cloud-config.js";
-import { settingsPath } from "../src/daemon/settings.js";
+import { applyCloudConfig, parseCloudMessage } from "../src/agent/cloud-config.js";
+import { saveSettings, settingsPath } from "../src/daemon/settings.js";
 import { cleanup, delay, tempHome } from "./helpers.js";
 
 let home: string;
@@ -473,6 +478,224 @@ describe("ConfigSync", () => {
     sync.request("cloud");
     await delay(30);
     expect(sent).toHaveLength(0);
+  });
+});
+
+// --- Phase 4: local writers -------------------------------------------------
+
+describe("namespace snapshots and diffs", () => {
+  it("takes only the synced namespaces, never `mode`", () => {
+    expect(
+      namespacesOf({ mode: "real", gnssAntBias: true, timeSync: { offlineSources: false } }),
+    ).toEqual({ gnssAntBias: true, timeSync: { offlineSources: false } });
+  });
+
+  it("reports a changed value, an added namespace and a removed one", () => {
+    expect(
+      diffNamespaces(
+        { gnssAntBias: true, timeSync: { offlineSources: true } },
+        { gnssAntBias: false, imuMount: { enabled: true, rollDeg: 0, pitchDeg: 0, yawDeg: 0 } },
+      ),
+    ).toEqual({
+      gnssAntBias: false,
+      imuMount: { enabled: true, rollDeg: 0, pitchDeg: 0, yawDeg: 0 },
+      // Removed locally = revert this namespace to device defaults, the same
+      // erase `PATCH /config` expresses with null.
+      timeSync: null,
+    });
+  });
+
+  it("is key-order insensitive, so a re-serialized file is not a change", () => {
+    expect(
+      diffNamespaces(
+        { imuMount: { enabled: true, rollDeg: 1, pitchDeg: 2, yawDeg: 3 } },
+        { imuMount: { yawDeg: 3, pitchDeg: 2, rollDeg: 1, enabled: true } },
+      ),
+    ).toEqual({});
+  });
+});
+
+describe("ensureConfigSyncBaseline", () => {
+  it("adopts the current file once, and never re-adopts it", () => {
+    saveSettings({ mode: "real", gnssAntBias: true });
+    const first = ensureConfigSyncBaseline();
+    expect(first.namespaces).toEqual({ gnssAntBias: true });
+
+    // A change made after baselining must stay visible as a change — this is
+    // the guard against the migration/upgrade write being swallowed.
+    saveSettings({ mode: "real", gnssAntBias: false });
+    expect(ensureConfigSyncBaseline().namespaces).toEqual({ gnssAntBias: true });
+  });
+
+  it("leaves a Phase-3 sync file's rev intact", () => {
+    saveConfigSyncState({ lastAppliedRev: 12, lastReportTs: 5 });
+    expect(ensureConfigSyncBaseline().lastAppliedRev).toBe(12);
+  });
+});
+
+describe("the settings.json fingerprint watcher", () => {
+  function watcher(over: Partial<ConfigSyncOptions> = {}): {
+    sync: ConfigSync;
+    sent: ConfigReport[];
+  } {
+    const sent: ConfigReport[] = [];
+    const sync = new ConfigSync({
+      deviceId: "dev-1",
+      topic: "xorgate/devices/dev-1/config/reported",
+      publish: (_topic, payload) => sent.push(JSON.parse(payload) as ConfigReport),
+      modem: async () => NO_MODEM,
+      debounceMs: 1,
+      watchMs: 5,
+      ...over,
+    });
+    return { sync, sent };
+  }
+
+  it("reports an out-of-band edit as origin `local` with the changed namespace", async () => {
+    saveSettings({ mode: "real", gnssAntBias: true });
+    ensureConfigSyncBaseline();
+    const { sync, sent } = watcher();
+    sync.startWatcher();
+
+    // Someone else writes the file: `xorgate set`, the TUI, or vim.
+    saveSettings({ mode: "real", gnssAntBias: false });
+    await delay(40);
+    sync.stop();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].origin).toBe("local");
+    expect(sent[0].changed).toEqual({ gnssAntBias: false });
+    // Retired once it has gone out, so the next poll says nothing.
+    expect(sync.syncState.localPending).toBeFalsy();
+    expect(sync.syncState.namespaces).toEqual({ gnssAntBias: false });
+  });
+
+  it("catches an edit made while the agent was stopped", async () => {
+    saveSettings({ gnssAntBias: true });
+    ensureConfigSyncBaseline();
+    saveSettings({ gnssAntBias: false }); // agent down for this write
+    const { sync, sent } = watcher();
+    sync.startWatcher(); // checks once immediately
+    await delay(30);
+    sync.stop();
+    expect(sent.map((r) => r.origin)).toEqual(["local"]);
+    expect(sent[0].changed).toEqual({ gnssAntBias: false });
+  });
+
+  it("says nothing about a write that moved no synced namespace", async () => {
+    saveSettings({ mode: "real", gnssAntBias: true });
+    ensureConfigSyncBaseline();
+    const { sync, sent } = watcher();
+    sync.startWatcher();
+    saveSettings({ mode: "sim", gnssAntBias: true }); // `mode` is reported-only
+    await delay(40);
+    sync.stop();
+    expect(sent).toHaveLength(0);
+    // The hash still advanced, so the same write is never re-examined.
+    expect(sync.syncState.settingsHash).toBe(readSettingsHash());
+  });
+
+  it("does not mistake the worker's own cloud apply for a local change", async () => {
+    saveSettings({ gnssAntBias: true });
+    ensureConfigSyncBaseline();
+    const { sync, sent } = watcher();
+    sync.startWatcher();
+
+    // What the worker does: apply, then tell the sync object what it wrote.
+    const message = parseCloudMessage(JSON.stringify({ v: 1, rev: 4, gnssAntBias: false }));
+    if (message === null) throw new Error("test message did not parse");
+    applyCloudConfig(message.config);
+    sync.noteCloudConfig(4, message.raw, message.config, true);
+    sync.request("cloud");
+
+    await delay(40);
+    sync.stop();
+    // One report, and it is the `cloud` echo — never a `local` claim.
+    expect(sent.map((r) => r.origin)).toEqual(["cloud"]);
+    expect(sent[0].changed).toBeUndefined();
+  });
+
+  it("keeps a pending local change the cloud document did not overwrite", async () => {
+    saveSettings({ gnssAntBias: true, timeSync: { offlineSources: true } });
+    ensureConfigSyncBaseline();
+    const { sync, sent } = watcher({ online: () => false });
+    sync.startWatcher();
+
+    saveSettings({ gnssAntBias: true, timeSync: { offlineSources: false } });
+    await delay(30);
+    expect(sync.syncState.localPending).toBe(true); // published into a dead link
+
+    // A cloud document lands carrying only `gnssAntBias`. Re-baselining that
+    // namespace must not swallow the still-unreported timeSync edit.
+    const message = parseCloudMessage(JSON.stringify({ v: 1, rev: 7, gnssAntBias: false }));
+    if (message === null) throw new Error("test message did not parse");
+    applyCloudConfig(message.config);
+    sync.noteCloudConfig(7, message.raw, message.config, true);
+    await delay(30);
+    sync.stop();
+
+    const local = sent.filter((r) => r.origin === "local");
+    expect(local.at(-1)?.changed).toEqual({ timeSync: { offlineSources: false } });
+  });
+
+  it("re-sends a local report on the next connect when the link was down", async () => {
+    saveSettings({ gnssAntBias: true });
+    ensureConfigSyncBaseline();
+    let online = false;
+    const { sync, sent } = watcher({ online: () => online });
+    sync.startWatcher();
+    saveSettings({ gnssAntBias: false });
+    await delay(30);
+    expect(sent.map((r) => r.origin)).toEqual(["local"]);
+    expect(sync.syncState.localPending).toBe(true);
+
+    // The worker's on-connect assertion is a `boot` request; a pending local
+    // change upgrades it, which is the retry path.
+    online = true;
+    sync.request("boot");
+    await delay(30);
+    sync.stop();
+    expect(sent.map((r) => r.origin)).toEqual(["local", "local"]);
+    expect(sync.syncState.localPending).toBeFalsy();
+  });
+
+  it("downgrades to `boot` when the edit was reverted before the report went out", async () => {
+    saveSettings({ gnssAntBias: true });
+    ensureConfigSyncBaseline();
+    const { sync, sent } = watcher({ debounceMs: 40 });
+    sync.startWatcher();
+    saveSettings({ gnssAntBias: false });
+    await delay(10);
+    saveSettings({ gnssAntBias: true }); // put it back before the debounce fires
+    await delay(80);
+    sync.stop();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].origin).toBe("boot");
+    expect(sent[0].changed).toBeUndefined();
+  });
+});
+
+describe("reported-only agent state", () => {
+  it("carries `agent.mode` in effective and never in status", () => {
+    const report = buildConfigReport({
+      deviceId: "dev-1",
+      ts: 5,
+      origin: "boot",
+      lastAppliedRev: 3,
+      settings: { gnssAntBias: true },
+      modem: FRESH,
+      desired: desiredFrom({ rev: 3, gnssAntBias: true }),
+      mode: "real",
+    });
+    expect(report.effective.agent).toEqual({ mode: "real" });
+    expect(report.status.agent).toBeUndefined();
+    // The desired document has no `agent` namespace at all, so nothing here can
+    // ever be compared against one.
+    expect(Object.keys(report.status)).toEqual(["gnssAntBias"]);
+  });
+
+  it("omits it entirely when the caller does not supply a mode", () => {
+    expect(buildEffective({}, NO_MODEM)).toEqual({});
   });
 });
 

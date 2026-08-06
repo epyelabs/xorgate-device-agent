@@ -21,10 +21,11 @@ export interface CredBundle {
 }
 
 /**
- * KVS WebRTC media-runtime config. `enabled` follows the same precedence as
- * `mode` (flag > settings.json > env > default-off) and is forced off when
- * offline (the runtime needs real AWS). The channels + IoT endpoints come from
- * the on-device manifest (kvs.json), not from here.
+ * KVS WebRTC media-runtime config. `enabled` is simply "not offline" since
+ * Phase 4 of the settings-management plan — the operator switch it used to
+ * follow is gone, and per-camera enables (`recording.video.cameras`) are the
+ * supported way to turn media off. The channels + IoT endpoints come from the
+ * on-device manifest (kvs.json), not from here.
  */
 export interface MediaConfig {
   enabled: boolean;
@@ -104,7 +105,7 @@ export interface AgentConfig {
 }
 
 /** Flags that take no value. Everything else consumes the following token. */
-export const BOOLEAN_FLAGS = new Set(["offline", "media"]);
+export const BOOLEAN_FLAGS = new Set(["offline"]);
 
 /**
  * Parse `--flag value` and boolean `--flag` out of an argv slice. Boolean flags
@@ -203,14 +204,16 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     }
   }
 
-  // Media-runtime enabled precedence: --media flag > settings.json > MEDIA_ENABLED
-  // env > off. settings.json wins over the env when explicitly set (true OR false),
-  // mirroring `mode`; the `--media` flag can only force-on. Forced off when offline
-  // (the KVS runtime needs real AWS). Like the collectors, it then self-gates on
-  // arch/binary/manifest, so "on" is safe even when the runtime can't actually start.
-  const mediaEnabled =
-    !offline &&
-    (truthy(args.media) || (settings.mediaEnabled ?? truthy(process.env.MEDIA_ENABLED)));
+  // Media runtime: on for any provisioned device, off when offline (the KVS
+  // runtime needs real AWS). There is no operator switch any more — the
+  // `mediaEnabled` setting, its `--media` flag and its MEDIA_ENABLED env were
+  // removed in Phase 4 of the settings-management plan (Q4): they were
+  // redundant with the per-camera enables in `recording.video.cameras`, which
+  // are cloud-managed and per-device precise. Like the collectors, the runtime
+  // then self-gates on arch/binary/manifest, so "on" is safe on a host that
+  // cannot actually start it, and KVS idle teardown makes a viewer-less stream
+  // ~free.
+  const mediaEnabled = !offline;
   const mediaBin = resolve(
     get("media-bin", "KVS_RUNTIME_BIN", "/opt/xorgate/media/xorgate-kvs-webrtc")!,
   );

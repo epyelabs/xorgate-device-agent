@@ -1,8 +1,8 @@
 /**
  * `xorgate set <key> <value>` — persist an agent setting and apply it.
  *
- * Supported keys: `mode` (<sim|real>), `media` (<on|off>, the KVS WebRTC
- * runtime toggle), `gps-antenna` (<active|passive>, the GNSS antenna bias),
+ * Supported keys: `mode` (<sim|real>),
+ * `gps-antenna` (<active|passive>, the GNSS antenna bias),
  * `gps-fix-reset-policy` (<defer|veto-deadzone>) and `deadzone-profile`
  * (<conservative|balanced|aggressive>) — the two lteRecovery policy knobs
  * (lte_gnss_recovery plan R8), applied live by the sim7600-lte daemon at its
@@ -43,6 +43,8 @@
  *   recording.powerShedding.escalateDutyPct <50-100>
  *   recording.powerShedding.restoreSecs <10-3600>   recording.powerShedding.railRestoreVolts <4-5.4>
  *   recording.powerShedding.maxShedsPerHour <0-60>
+ *   recording.powerShedding.cpuTempC <50-90>      recording.powerShedding.cpuTempRestoreC <40-85>
+ *   recording.powerShedding.cpuTempSecs <5-120>
  * (powerShedding.* is the Phase 3 runtime undervoltage load-shedding ladder —
  * live streaming sheds first, recording last, restore with hysteresis;
  * escalateDutyPct is the Phase 6 duty-cycle escalation rule.)
@@ -75,7 +77,7 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, media <on|off>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>)";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>)";
 
 /** Parse an on/off/true/false/1/0 CLI value; undefined when unrecognizable. */
 function parseBoolValue(v: string | undefined): boolean | undefined {
@@ -144,7 +146,12 @@ function setRecordingCommand(key: string, value: string | undefined): void {
     field === "escalateDutyPct" ||
     field === "restoreSecs" ||
     field === "railRestoreVolts" ||
-    field === "maxShedsPerHour"
+    field === "maxShedsPerHour" ||
+    // Thermal trio: cloud-settable since the power-management plan but
+    // CLI-invisible until now (settings-management plan, phase-4 §4).
+    field === "cpuTempC" ||
+    field === "cpuTempRestoreC" ||
+    field === "cpuTempSecs"
   ) {
     if (!Number.isFinite(num) || num < 0) {
       console.error(`${key} must be a non-negative number, got '${value ?? ""}'`);
@@ -332,13 +339,15 @@ export async function setCommand(rest: string[]): Promise<void> {
     next.mode = value;
     applied = `mode set to ${value}`;
   } else if (key === "media") {
-    if (value !== "on" && value !== "off") {
-      console.error(`media must be 'on' or 'off', got '${value ?? ""}'`);
-      process.exitCode = 1;
-      return;
-    }
-    next.mediaEnabled = value === "on";
-    applied = `media ${value} (KVS WebRTC runtime)`;
+    // Removed in Phase 4 of the settings-management plan (Q4). Answered
+    // explicitly rather than falling into the generic "unknown setting" error,
+    // because it lived in muscle memory and in older docs.
+    console.error(
+      "'media' was removed: turn cameras off individually instead, e.g. " +
+        "xorgate set recording.video.cameras.cam0 off",
+    );
+    process.exitCode = 1;
+    return;
   } else if (key === "gps-antenna") {
     if (value !== "active" && value !== "passive") {
       console.error(`gps-antenna must be 'active' or 'passive', got '${value ?? ""}'`);
@@ -382,7 +391,7 @@ export async function setCommand(rest: string[]): Promise<void> {
     return;
   } else {
     console.error(
-      `unknown setting '${key}' (supported: mode, media, gps-antenna, gps-fix-reset-policy, deadzone-profile, wifi, recording.*, timeSync.*)`,
+      `unknown setting '${key}' (supported: mode, gps-antenna, gps-fix-reset-policy, deadzone-profile, wifi, recording.*, timeSync.*)`,
     );
     process.exitCode = 1;
     return;

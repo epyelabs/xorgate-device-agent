@@ -7,10 +7,16 @@
  * loadConfig() so a restart (manual or systemd) picks up the choice. loadSettings
  * NEVER throws: a missing/corrupt file is treated as "no overrides".
  *
- * Apply semantics differ per key: `mode` and `mediaEnabled` take effect on the
- * next agent (re)start via loadConfig; `gnssAntBias` is instead applied LIVE by
- * the sim7600-lte daemon, which re-reads this file in its health loop and
- * toggles the antenna bias without a restart.
+ * Apply semantics differ per key: `mode` takes effect on the next agent
+ * (re)start via loadConfig; `gnssAntBias` is instead applied LIVE by the
+ * sim7600-lte daemon, which re-reads this file in its health loop and toggles
+ * the antenna bias without a restart.
+ *
+ * ⚠️ This is an ALLOWLIST rewriter: `loadSettings` drops every key it does not
+ * know, so the next save by ANY writer destroys it. New persisted agent state
+ * belongs in its own file (see `agent/config-sync.ts`), not here. The
+ * sim7600-lte daemon also greps this file by exact path, so namespace names are
+ * load-bearing and never renamed.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -191,8 +197,14 @@ export function parseTimeSyncSettings(v: unknown): TimeSyncSettings | undefined 
 
 export interface AgentSettings {
   mode?: RunMode;
-  /** Operator toggle for the KVS WebRTC media runtime (off unless explicitly enabled). */
-  mediaEnabled?: boolean;
+  /*
+   * `mediaEnabled` was REMOVED here (settings-management plan, Phase 4 / Q4):
+   * the media master switch was redundant with the per-camera enables in
+   * `recording.video.cameras`, and the media collector already self-gates on
+   * arch/binary/manifest. A device that had it explicitly `false` is converted
+   * to all-cameras-disabled once, by `migrateMediaEnabled` — see
+   * `daemon/settings-migrate.ts`.
+   */
   /**
    * GNSS antenna bias: true powers an active GPS antenna's LNA over the coax
    * (modem AT+CVAUXV/AT+CVAUXS). Absent/false = passive antenna, bias off (the
@@ -398,8 +410,6 @@ export function loadSettings(path: string = settingsPath()): AgentSettings {
       const out: AgentSettings = {};
       const mode = (obj as { mode?: unknown }).mode;
       if (mode === "sim" || mode === "real") out.mode = mode;
-      const mediaEnabled = (obj as { mediaEnabled?: unknown }).mediaEnabled;
-      if (typeof mediaEnabled === "boolean") out.mediaEnabled = mediaEnabled;
       const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
       if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
       const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);

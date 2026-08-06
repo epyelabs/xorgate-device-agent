@@ -17,15 +17,12 @@ describe("settings persistence", () => {
     expect(loadSettings()).toEqual({ mode: "sim" });
   });
 
-  it("round-trips the media toggle alongside the mode", () => {
-    saveSettings({ mode: "real", mediaEnabled: true });
-    expect(loadSettings()).toEqual({ mode: "real", mediaEnabled: true });
-    saveSettings({ mode: "real", mediaEnabled: false });
-    expect(loadSettings()).toEqual({ mode: "real", mediaEnabled: false });
-  });
-
-  it("ignores a non-boolean mediaEnabled", () => {
-    writeFileSync(settingsPath(), JSON.stringify({ mode: "real", mediaEnabled: "yes" }));
+  // `mediaEnabled` was retired in Phase 4 of the settings-management plan. The
+  // allowlist rewriter drops it like any other unknown key, which is what makes
+  // the one-shot conversion in daemon/settings-migrate.ts necessary — by the
+  // time loadSettings has run, the operator's choice is already gone.
+  it("drops the retired mediaEnabled key", () => {
+    writeFileSync(settingsPath(), JSON.stringify({ mode: "real", mediaEnabled: false }));
     expect(loadSettings()).toEqual({ mode: "real" });
   });
 

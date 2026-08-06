@@ -11,7 +11,15 @@
  *     "rev": <last applied desired rev; 0 = never received one>,
  *     "origin": "cloud" | "local" | "boot",
  *     "effective": { <namespace>: <value actually in force>, ... },
- *     "status":    { <namespace>: { state, at, detail?, reason? }, ... } }
+ *     "status":    { <namespace>: { state, at, detail?, reason? }, ... },
+ *     "changed":   { <namespace>: <value|null> }   // origin "local" only }
+ *
+ * Phase 4 adds the LOCAL half: a fingerprint watcher over settings.json spots a
+ * change this module did not make (`xorgate set`, the manage TUI, a human with
+ * vim) and publishes `origin: "local"` carrying `changed` — the namespaces that
+ * moved, as the device now holds them. The mirror Lambda folds those into
+ * `devices.config`, so a local tweak stops being reverted on the next reconnect
+ * and starts showing up in the web UI instead.
  *
  * QoS 1, retain FALSE — Postgres is the durable mirror, and a retained report
  * would only add a stale-clear lifecycle. No IAM change is needed: the device
@@ -30,11 +38,12 @@
  * (daemon/settings.ts) that destroys unknown keys on the next save by any
  * writer, and the sim7600-lte daemon greps settings.json by exact path.
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "../lib/atomicWrite.js";
 import { runtimeHome } from "../daemon/runtime.js";
-import { loadSettings, type AgentSettings } from "../daemon/settings.js";
+import { loadSettings, settingsPath, type AgentSettings } from "../daemon/settings.js";
 import { readModemTelemetry, LTE_TELEMETRY_FILE } from "../hardware/modem.js";
 import type { CloudConfig } from "./cloud-config.js";
 
@@ -85,6 +94,16 @@ export interface ConfigReport {
   origin: ReportOrigin;
   effective: Record<string, unknown>;
   status: Record<string, NamespaceStatus>;
+  /**
+   * `origin: "local"` ONLY: the namespaces that moved since the cloud last knew,
+   * as settings.json now holds them (`null` = the namespace was removed locally,
+   * i.e. revert it to device defaults). The mirror Lambda merges exactly this
+   * into `devices.config` — never `effective`, which for `gnssAntBias` carries
+   * the modem's APPLIED value and can still be the pre-edit one for ~30 s after
+   * a local change (mirroring that would republish the old value and undo the
+   * very edit we are reporting).
+   */
+  changed?: Record<string, unknown>;
 }
 
 /**
@@ -110,6 +129,32 @@ export interface ConfigSyncState {
   lastAppliedRev: number;
   /** Epoch ms of the last report we published (diagnostics only). */
   lastReportTs: number;
+  /**
+   * sha256 of settings.json as of the last time we looked at it (Phase 4). The
+   * cheap "has anything at all touched this file" gate for the watcher — a
+   * mismatch costs one parse, a match costs nothing.
+   */
+  settingsHash?: string;
+  /**
+   * The synced namespaces as the CLOUD is believed to know them: advanced after
+   * every write this worker performs (from the file, post-`loadSettings`) and
+   * after a local report actually goes out. A local edit is exactly
+   * `diffNamespaces(namespaces, current)`.
+   *
+   * Absent means "never baselined" — a fresh device, or the first boot after
+   * upgrading from Phase 3. It must be INITIALIZED from the current file, never
+   * treated as `{}`: an empty baseline would report every namespace as a local
+   * change and merge the device's clamped values over the cloud's desired
+   * document.
+   */
+  namespaces?: Record<string, unknown>;
+  /**
+   * A detected local change whose report has not gone out on a live link yet
+   * (agent started offline, LTE down, crash between detect and publish).
+   * Survives a restart, so the edit converges on the next connect instead of
+   * being silently lost.
+   */
+  localPending?: boolean;
 }
 
 const EMPTY_SYNC_STATE: ConfigSyncState = { lastAppliedRev: 0, lastReportTs: 0 };
@@ -130,11 +175,22 @@ export function loadConfigSyncState(path: string = configSyncPath()): ConfigSync
       const src = obj as Record<string, unknown>;
       const rev = src.lastAppliedRev;
       const ts = src.lastReportTs;
-      return {
+      const out: ConfigSyncState = {
         lastAppliedRev:
           typeof rev === "number" && Number.isFinite(rev) && rev > 0 ? Math.floor(rev) : 0,
         lastReportTs: typeof ts === "number" && Number.isFinite(ts) && ts > 0 ? Math.floor(ts) : 0,
       };
+      // Phase 4 fields. Each is independently optional: a Phase-3 file simply
+      // has none of them, which reads as "never baselined" and self-heals on
+      // the first watcher tick.
+      const hash = src.settingsHash;
+      if (typeof hash === "string" && hash.length > 0) out.settingsHash = hash;
+      const ns = src.namespaces;
+      if (ns && typeof ns === "object" && !Array.isArray(ns)) {
+        out.namespaces = ns as Record<string, unknown>;
+      }
+      if (src.localPending === true) out.localPending = true;
+      return out;
     }
   } catch {
     /* missing / corrupt — fall through to zeros */
@@ -171,6 +227,87 @@ export function saveConfigSyncState(
 export function shouldApplyRev(rev: number | undefined, lastAppliedRev: number): boolean {
   if (rev === undefined || rev <= 0) return true;
   return rev > lastAppliedRev;
+}
+
+// --- local-writer detection (Phase 4) ---------------------------------------
+
+/**
+ * Fingerprint of settings.json — sha256 of the raw bytes, or "" when the file
+ * is missing/unreadable.
+ *
+ * This is the cheap gate, not the decision: the file is rewritten wholesale by
+ * `atomicWriteJson`, so key reordering or a re-save of identical values changes
+ * the hash without changing any setting. Only the namespace diff below decides
+ * whether the cloud hears about it.
+ */
+export function readSettingsHash(path: string = settingsPath()): string {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The synced namespaces out of a parsed settings object, in registry order.
+ * Deliberately post-`loadSettings`: the allowlist rewriter normalizes and
+ * clamps, so this is what the device WILL hold — not what a writer typed.
+ * `mode` is excluded (reported-only, never part of the desired document).
+ */
+export function namespacesOf(settings: AgentSettings): Record<string, unknown> {
+  const src = settings as unknown as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of CONFIG_NAMESPACE_KEYS) {
+    if (src[key] !== undefined) out[key] = src[key];
+  }
+  return out;
+}
+
+/**
+ * Namespaces that moved from `base` to `next`. A namespace that disappeared
+ * maps to `null` — the same "revert to device defaults" erase the cloud PATCH
+ * API uses, so a `xorgate set`-then-delete round trip is expressible.
+ */
+export function diffNamespaces(
+  base: Record<string, unknown>,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of CONFIG_NAMESPACE_KEYS) {
+    const before = base[key];
+    const after = next[key];
+    if (before === undefined && after === undefined) continue;
+    if (after === undefined) out[key] = null;
+    else if (!deepEqual(before, after)) out[key] = after;
+  }
+  return out;
+}
+
+/**
+ * Give the sync file a namespace baseline if it has none, from settings.json as
+ * it stands right now.
+ *
+ * Call this at startup BEFORE anything else writes settings.json (notably the
+ * `mediaEnabled` upgrade migration), and never later: the whole point is that a
+ * first boot after upgrade adopts the current file silently, while every write
+ * that follows is a change the cloud deserves to hear about. Without it, the
+ * first watcher tick would diff against nothing and either report every
+ * namespace as "locally changed" or (worse) adopt the file and never notice a
+ * genuine edit.
+ */
+export function ensureConfigSyncBaseline(
+  statePath: string = configSyncPath(),
+  file: string = settingsPath(),
+): ConfigSyncState {
+  const state = loadConfigSyncState(statePath);
+  if (state.namespaces !== undefined) return state;
+  const next: ConfigSyncState = {
+    ...state,
+    namespaces: namespacesOf(loadSettings(file)),
+    settingsHash: readSettingsHash(file),
+  };
+  saveConfigSyncState(next, statePath);
+  return next;
 }
 
 // --- effective values -------------------------------------------------------
@@ -245,10 +382,18 @@ export interface ReportHints {
  * defaults into the report instead would freeze today's values into every
  * stored report and hide the difference between "configured to the default"
  * and "never configured".
+ *
+ * `agent.mode` (Phase 4, Q4) is the one REPORTED-ONLY key: it rides `effective`
+ * so the cloud can show a field device stuck in `sim`, it never appears in the
+ * desired document, and it never gets a `status` entry (`buildStatus` walks the
+ * namespace list, which does not contain it). Flipping a fielded device to sim
+ * remotely would silently replace real data with synthetic data, so there is
+ * deliberately no cloud-writable path.
  */
 export function buildEffective(
   settings: AgentSettings,
   modem: ModemBiasSample,
+  mode?: string,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   // The APPLIED bias, not the requested one; omitted entirely when the modem
@@ -258,6 +403,7 @@ export function buildEffective(
   if (settings.recording !== undefined) out.recording = settings.recording;
   if (settings.lteRecovery !== undefined) out.lteRecovery = settings.lteRecovery;
   if (settings.timeSync !== undefined) out.timeSync = settings.timeSync;
+  if (mode !== undefined) out.agent = { mode };
   return out;
 }
 
@@ -418,12 +564,16 @@ export interface ReportInput {
   modem: ModemBiasSample;
   desired: DesiredSnapshot | null;
   hints?: ReportHints;
+  /** The run mode in force (`config.mode`) — reported-only, see buildEffective. */
+  mode?: string;
+  /** Locally-changed namespaces; only meaningful on an `origin: "local"` report. */
+  changed?: Record<string, unknown>;
 }
 
 /** Assemble a complete report. Pure — every input is supplied by the caller. */
 export function buildConfigReport(input: ReportInput): ConfigReport {
-  const effective = buildEffective(input.settings, input.modem);
-  return {
+  const effective = buildEffective(input.settings, input.modem, input.mode);
+  const report: ConfigReport = {
     v: 1,
     deviceId: input.deviceId,
     ts: input.ts,
@@ -432,6 +582,12 @@ export function buildConfigReport(input: ReportInput): ConfigReport {
     effective,
     status: buildStatus(input.desired, effective, input.modem, input.ts, input.hints),
   };
+  // Only a local report carries `changed`; on any other origin the cloud is the
+  // author of the desired document and has nothing to learn from us about it.
+  if (input.origin === "local" && input.changed && Object.keys(input.changed).length > 0) {
+    report.changed = input.changed;
+  }
+  return report;
 }
 
 // --- the worker-facing sync object ------------------------------------------
@@ -448,6 +604,18 @@ export interface ConfigSyncOptions {
   onEvent?: (level: "info" | "warn", msg: string) => void;
   now?: () => number;
   statePath?: string;
+  /** settings.json — watched for writes this module did not make. */
+  settingsFile?: string;
+  /** The run mode in force; rides `effective.agent.mode` (reported-only). */
+  mode?: string;
+  /**
+   * Is the MQTT link up? A local report published into a dead link is lost, so
+   * `localPending` is only cleared when this says the report actually went
+   * somewhere. Absent = assume connected (tests, offline stub).
+   */
+  online?: () => boolean;
+  /** Fingerprint poll interval; aligned with the recording settings poll. */
+  watchMs?: number;
   /**
    * Coalescing window. A connect and the retained config message that follows
    * it ~0.5 s later are one event as far as the cloud is concerned; without
@@ -466,6 +634,14 @@ export interface ConfigSyncOptions {
 
 const DEFAULT_DEBOUNCE_MS = 2000;
 const DEFAULT_HEARTBEAT_MS = 3_600_000;
+
+/**
+ * How often to fingerprint settings.json. Matched to the recording manager's
+ * own settings poll: a local edit is already live on the device within ~5 s, so
+ * anything slower would leave the cloud lagging the hardware for no reason, and
+ * anything faster buys nothing (the check is a stat + hash of a few KB).
+ */
+const DEFAULT_WATCH_MS = 5000;
 
 /**
  * The settle re-report, and why it exists.
@@ -505,6 +681,7 @@ export class ConfigSync {
   private timer: NodeJS.Timeout | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
   private settleTimer: NodeJS.Timeout | null = null;
+  private watcher: NodeJS.Timeout | null = null;
   /** Settle re-reports left for the current desired rev (see DEFAULT_SETTLE_*). */
   private settleBudget = 0;
   private pendingOrigin: ReportOrigin | null = null;
@@ -517,6 +694,29 @@ export class ConfigSync {
 
   get lastAppliedRev(): number {
     return this.state.lastAppliedRev;
+  }
+
+  /** Test/diagnostic view of the persisted sync bookkeeping. */
+  get syncState(): ConfigSyncState {
+    return { ...this.state };
+  }
+
+  private get statePath(): string {
+    return this.opts.statePath ?? configSyncPath();
+  }
+
+  private get settingsFile(): string {
+    return this.opts.settingsFile ?? settingsPath();
+  }
+
+  private loadSettings(): AgentSettings {
+    return (this.opts.settings ?? loadSettings)();
+  }
+
+  /** Merge into the sync state and persist. Never throws (see saveConfigSyncState). */
+  private persist(patch: Partial<ConfigSyncState>): void {
+    this.state = { ...this.state, ...patch };
+    saveConfigSyncState(this.state, this.statePath);
   }
 
   /** Should the worker apply a retained document carrying this `rev`? */
@@ -541,9 +741,15 @@ export class ConfigSync {
     // failed to settle into is no longer the question being asked.
     this.settleBudget = this.opts.settleReports ?? DEFAULT_SETTLE_REPORTS;
     if (!applied) return;
+    // The worker just wrote settings.json (or confirmed it needed no write).
+    // Re-baseline the namespaces this document actually carried, so its own
+    // write is never mistaken for a local edit — and, just as important, so a
+    // namespace the document did NOT carry keeps whatever local change is still
+    // waiting to be reported.
+    this.noteSettingsWritten(Object.keys(raw));
     if (rev !== undefined && rev > this.state.lastAppliedRev) {
       this.state = { ...this.state, lastAppliedRev: rev };
-      if (!saveConfigSyncState(this.state, this.opts.statePath ?? configSyncPath())) {
+      if (!saveConfigSyncState(this.state, this.statePath)) {
         // In-memory only from here: the guard still holds for this run, and a
         // restart simply falls back to pre-Phase-3 "apply every redelivery".
         this.opts.onEvent?.("warn", "config sync state could not be persisted");
@@ -551,9 +757,102 @@ export class ConfigSync {
     }
   }
 
-  /** Queue a report. Coalesces with anything already queued in the window. */
+  /**
+   * Re-baseline after a write the WORKER performed, for the namespaces that
+   * write could have touched.
+   *
+   * Read back from the FILE, never from the value we meant to write:
+   * `loadSettings()` is an allowlist rewriter that clamps and normalizes, so
+   * baselining our intent would leave a permanent phantom diff and the watcher
+   * would report our own write as a local change on every poll.
+   *
+   * The residual race (a local writer landing between `applyCloudConfig`'s write
+   * and this read) adopts the local value as the baseline, so the cloud never
+   * hears about it as a local change — but the very next report still says
+   * `adjusted`/"changed locally?" because effective ≠ desired, so it is visible
+   * rather than silently lost.
+   */
+  noteSettingsWritten(touched: readonly string[]): void {
+    try {
+      const current = namespacesOf(this.loadSettings());
+      const base = { ...(this.state.namespaces ?? current) };
+      for (const key of touched) {
+        if (!CONFIG_NAMESPACE_KEYS.includes(key)) continue;
+        if (current[key] === undefined) delete base[key];
+        else base[key] = current[key];
+      }
+      this.persist({ namespaces: base, settingsHash: readSettingsHash(this.settingsFile) });
+    } catch {
+      /* bookkeeping only — an unreadable file must never break config delivery */
+    }
+  }
+
+  /**
+   * Start the settings.json fingerprint watcher (design.md §5) — the mechanism
+   * that makes `xorgate set`, the manage TUI and a hand-edit with vim
+   * first-class writers without any of them learning about MQTT.
+   *
+   * Checks once immediately: an edit made while the agent was stopped is
+   * exactly as real as one made while it was running, and the persisted
+   * baseline is what makes it detectable.
+   */
+  startWatcher(): void {
+    if (this.watcher || this.stopped) return;
+    this.checkLocalChange();
+    this.watcher = setInterval(
+      () => this.checkLocalChange(),
+      this.opts.watchMs ?? DEFAULT_WATCH_MS,
+    );
+    this.watcher.unref?.();
+  }
+
+  /**
+   * One watcher tick. Cheap path first: an unchanged hash means nobody has
+   * written the file at all.
+   *
+   * The hash advances even when no namespace moved, so the same edit is never
+   * re-examined; the namespace BASELINE deliberately does not, so a change
+   * detected while offline keeps accumulating into one honest diff until a
+   * report actually goes out.
+   */
+  checkLocalChange(): void {
+    if (this.stopped) return;
+    try {
+      const hash = readSettingsHash(this.settingsFile);
+      if (hash === this.state.settingsHash) return;
+      const current = namespacesOf(this.loadSettings());
+      if (this.state.namespaces === undefined) {
+        // Never baselined (fresh device, or a sync file written by Phase 3).
+        // Adopt the file silently — see ensureConfigSyncBaseline.
+        this.persist({ namespaces: current, settingsHash: hash });
+        return;
+      }
+      const changed = diffNamespaces(this.state.namespaces, current);
+      const keys = Object.keys(changed);
+      if (keys.length === 0) {
+        // A rewrite that moved nothing we sync — `mode`, key reordering, or the
+        // cloud apply we already baselined.
+        this.persist({ settingsHash: hash });
+        return;
+      }
+      this.persist({ settingsHash: hash, localPending: true });
+      this.opts.onEvent?.("info", `local settings change detected: ${keys.join(", ")}`);
+      this.request("local");
+    } catch {
+      /* a failed check is a missed poll, never a thrown error */
+    }
+  }
+
+  /**
+   * Queue a report. Coalesces with anything already queued in the window.
+   *
+   * A pending local change upgrades a `boot` request to `local`: the connect
+   * assertion and the hourly heartbeat then double as the retry path for a
+   * local report that was published into a link that turned out to be down.
+   */
   request(origin: ReportOrigin): void {
     if (this.stopped) return;
+    if (origin === "boot" && this.state.localPending) origin = "local";
     if (this.pendingOrigin === null || ORIGIN_RANK[origin] > ORIGIN_RANK[this.pendingOrigin]) {
       this.pendingOrigin = origin;
     }
@@ -582,9 +881,11 @@ export class ConfigSync {
     if (this.timer) clearTimeout(this.timer);
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.settleTimer) clearTimeout(this.settleTimer);
+    if (this.watcher) clearInterval(this.watcher);
     this.timer = null;
     this.heartbeat = null;
     this.settleTimer = null;
+    this.watcher = null;
   }
 
   /**
@@ -595,8 +896,26 @@ export class ConfigSync {
     if (this.stopped) return;
     try {
       const now = (this.opts.now ?? Date.now)();
-      const settings = (this.opts.settings ?? loadSettings)();
+      const settings = this.loadSettings();
       const modem = await (this.opts.modem ?? readModemBias)(now);
+
+      // The local diff is computed HERE, not when the change was detected, so
+      // several edits between two reports collapse into one honest statement of
+      // "what moved since the cloud last knew".
+      const current = namespacesOf(settings);
+      let changed: Record<string, unknown> | undefined;
+      if (origin === "local") {
+        changed = diffNamespaces(this.state.namespaces ?? current, current);
+        if (Object.keys(changed).length === 0) {
+          // The edit was reverted (or overwritten by a cloud apply) before this
+          // report went out. There is nothing for the cloud to merge, so send a
+          // plain state assertion instead of an empty local claim.
+          origin = "boot";
+          changed = undefined;
+          this.persist({ localPending: false });
+        }
+      }
+
       const report = buildConfigReport({
         deviceId: this.opts.deviceId,
         ts: now,
@@ -606,10 +925,20 @@ export class ConfigSync {
         modem,
         desired: this.desired,
         hints: this.opts.hints?.(),
+        mode: this.opts.mode,
+        changed,
       });
       this.opts.publish(this.opts.topic, JSON.stringify(report));
-      this.state = { ...this.state, lastReportTs: now };
-      saveConfigSyncState(this.state, this.opts.statePath ?? configSyncPath());
+
+      const patch: Partial<ConfigSyncState> = { lastReportTs: now };
+      // Only a report that actually left the device retires the local change.
+      // Published into a dead link it stays pending, and the next connect (or
+      // the hourly heartbeat) re-sends it — see `request`.
+      if (origin === "local" && (this.opts.online?.() ?? true)) {
+        patch.namespaces = current;
+        patch.localPending = false;
+      }
+      this.persist(patch);
       this.scheduleSettleReport(report);
     } catch (err) {
       this.opts.onEvent?.("warn", `config report failed: ${(err as Error).message}`);

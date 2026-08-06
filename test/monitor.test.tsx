@@ -119,7 +119,7 @@ describe("MonitorApp", () => {
     unmount();
   });
 
-  it("opens Settings and edits the run mode + media rows", async () => {
+  it("opens Settings and edits the run mode, then moves to the wifi row", async () => {
     const running: DaemonStatus = {
       kind: "running",
       record,
@@ -138,8 +138,10 @@ describe("MonitorApp", () => {
     await delay(80);
     let frame = lastFrame() ?? "";
     expect(frame).toContain("run mode"); // setting rows render
-    expect(frame).toContain("media");
     expect(frame).toContain("wifi"); // wifi row present (on/off or "not present")
+    // The media toggle was removed with the `mediaEnabled` setting
+    // (settings-management plan, Phase 4) — cameras are disabled individually.
+    expect(frame).not.toContain("▶ media");
 
     stdin.write("\r"); // open (enter operating); row 0 = run mode focused
     await delay(60);
@@ -151,10 +153,13 @@ describe("MonitorApp", () => {
     frame = lastFrame() ?? "";
     expect(frame).toContain("real");
 
-    stdin.write("j"); // move focus to the media row
+    // With the media row gone and no WiFi adapter on the test host, run mode is
+    // the only focusable row — moving down wraps straight back onto it.
+    stdin.write("j");
     await delay(60);
     frame = lastFrame() ?? "";
-    expect(frame).toContain("▶ media");
+    expect(frame).toContain("▶ run mode");
+    expect(frame).toContain("wifi      — not present");
 
     unmount();
   });

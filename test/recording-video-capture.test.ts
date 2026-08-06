@@ -297,6 +297,141 @@ describe("VideoCaptureSupervisor", () => {
   });
 });
 
+/**
+ * Progress watchdog: the `1080p30-4mbps` stall (bench-reproduced 2026-08-06) is
+ * a child that spawns, negotiates, then never receives a frame — alive, silent,
+ * 0 bytes, 0 % CPU. Liveness said "running"; the disk said nothing was written.
+ */
+describe("VideoCaptureSupervisor progress watchdog", () => {
+  function makeSup(opts: {
+    spawner: ReturnType<typeof fakeSpawner>;
+    events?: string[];
+    stallMs?: number;
+  }) {
+    return new VideoCaptureSupervisor({
+      deviceId: "dev-1",
+      cameras: [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+      record: true,
+      preset,
+      segmentSeconds: 60,
+      videoRoot: join(home, "recordings", "video"),
+      shmDir: join(home, "shm"),
+      timeSource: () => "ntp",
+      onEvent: (_l, m) => opts.events?.push(m),
+      spawn: opts.spawner.spawn,
+      stableMs: 10,
+      sweepPollMs: 15,
+      stallMs: opts.stallMs ?? 120,
+    });
+  }
+
+  it("kills a live-but-silent child and stops reporting recording", async () => {
+    const spawner = fakeSpawner();
+    const events: string[] = [];
+    const sup = makeSup({ spawner, events });
+    sup.start();
+
+    // The stalled shape exactly: child up, promoted to "running", zero bytes.
+    await delay(40);
+    expect(sup.status()[0].state).toBe("running");
+    expect(sup.anyRecording()).toBe(true);
+
+    await delay(180); // past stallMs, with sweeps in between
+    expect(spawner.spawns[0].stopped).toBe("SIGKILL");
+    expect(events.some((e) => /stalled: no bytes written/.test(e))).toBe(true);
+    expect(sup.anyRecording()).toBe(false);
+    expect(sup.status()[0].recording).toBe(false);
+    expect(sup.status()[0].state).toBe("retrying");
+    sup.stop();
+  });
+
+  it("a 0-byte fragment is not progress — an existing file is no defence", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup({ spawner });
+    sup.start();
+    const dir = join(home, "recordings", "video", "cam0", sup.status()[0].sessionId!);
+    // splitmuxsink DOES create the file at spawn; it just never fills it.
+    writeFileSync(join(dir, "00000.mp4"), Buffer.alloc(0));
+    await delay(200);
+    expect(spawner.spawns[0].stopped).toBe("SIGKILL");
+    sup.stop();
+  });
+
+  it("leaves a child that keeps writing alone", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup({ spawner });
+    sup.start();
+    const dir = join(home, "recordings", "video", "cam0", sup.status()[0].sessionId!);
+    // Four stall windows' worth of a fragment that keeps growing.
+    for (let i = 1; i <= 16; i++) {
+      writeFileSync(join(dir, "00000.mp4"), Buffer.alloc(i * 1000, 1));
+      await delay(30);
+    }
+    expect(spawner.spawns[0].stopped).toBeNull();
+    expect(sup.anyRecording()).toBe(true);
+    expect(spawner.spawns.length).toBe(1);
+    sup.stop();
+  });
+
+  it("counts a rotation as progress even though the new fragment is smaller", async () => {
+    const spawner = fakeSpawner();
+    const sup = makeSup({ spawner });
+    sup.start();
+    const dir = join(home, "recordings", "video", "cam0", sup.status()[0].sessionId!);
+    writeFileSync(join(dir, "00000.mp4"), Buffer.alloc(50_000, 1));
+    await delay(60);
+    // Rotation: the ACTIVE file is now a small, freshly-opened 00001 — byte
+    // totals are not monotonic (closed fragments are deleted once uploaded),
+    // so only "the active file moved on" can carry this.
+    writeFileSync(join(dir, "00001.mp4"), Buffer.alloc(120, 1));
+    await delay(140);
+    expect(spawner.spawns[0].stopped).toBeNull();
+    sup.stop();
+  });
+
+  it("parks after three consecutive stalls instead of hot-looping", async () => {
+    const spawner = fakeSpawner();
+    const events: string[] = [];
+    const sup = makeSup({ spawner, events, stallMs: 60 });
+    sup.start();
+    // Each cycle: stall → SIGKILL → 2 s backoff → respawn, still silent.
+    await delay(4600);
+    expect(events.some((e) => /stalled; retry 1\/3/.test(e))).toBe(true);
+    expect(events.some((e) => /stalled; retry 2\/3/.test(e))).toBe(true);
+    expect(events.some((e) => /stalled 3x in a row; parking for 60s/.test(e))).toBe(true);
+    expect(sup.status()[0].state).toBe("failed");
+    expect(sup.status()[0].recording).toBe(false);
+    // Three children, not a spawn storm.
+    expect(spawner.spawns.length).toBe(3);
+    sup.stop();
+  }, 20_000);
+
+  it("bridge-only mode has no disk signal and is never watchdogged", async () => {
+    const spawner = fakeSpawner();
+    const events: string[] = [];
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "dev-1",
+      cameras: [{ streamKey: "cam0", cameraName: "/base/cam0@1a" }],
+      record: false,
+      preset,
+      segmentSeconds: 60,
+      videoRoot: join(home, "recordings", "video"),
+      shmDir: join(home, "shm"),
+      timeSource: () => "ntp",
+      onEvent: (_l, m) => events.push(m),
+      spawn: spawner.spawn,
+      stableMs: 10,
+      sweepPollMs: 15,
+      stallMs: 60,
+    });
+    sup.start();
+    await delay(200);
+    expect(spawner.spawns[0].stopped).toBeNull();
+    expect(events.some((e) => /stalled/.test(e))).toBe(false);
+    sup.stop();
+  });
+});
+
 describe("RecordingManager video wiring", () => {
   let manager: RecordingManager | null = null;
   afterEach(() => {

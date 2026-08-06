@@ -122,6 +122,7 @@ export interface RecordingVideoOptions {
   spawn?: CaptureSpawn;
   stableMs?: number;
   sweepPollMs?: number;
+  stallMs?: number;
 }
 
 /** Video state for the payload/state.json media block. */
@@ -678,6 +679,7 @@ export class RecordingManager {
       spawn: vo.spawn,
       stableMs: vo.stableMs,
       sweepPollMs: vo.sweepPollMs,
+      stallMs: vo.stallMs,
     });
     this.videoCapture.start();
   }

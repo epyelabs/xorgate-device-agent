@@ -187,6 +187,8 @@ src/
   agent/             # telemetry core: config (+offline), mqtt (+stub), simulator, collectors
   monitor/           # ink master/detail dashboard: MonitorHeader, modules, hooks
   hardware/led.ts    # RGB status LED driver (pinctrl; pins hardcoded for Argus CM5 Rev1)
+  lib/led-state.ts   # the LED ladder + PURE resolveLedState(signals) — no clocks, no I/O
+  agent/led-manager.ts  # ticks the LED off the worker's 1 Hz loop; owns the flash overlay
   components/ lib/ hardware/ dashboard/   # reusable UI (shared with argus-cli)
 test/                # vitest: pidfile/state/process/manager logic + monitor UI smoke
 ```

@@ -45,7 +45,23 @@ Environment=XORGATE_HOME=/var/lib/xorgate
 # the default service CWD "/" isn't writable by the service user, which makes
 # `import board` fail. /var/lib/xorgate is created + owned by the service user.
 WorkingDirectory=/var/lib/xorgate
+# RGB status LED (plans/rgb_led_events). Both hooks reuse the CLI wrapper
+# install.sh already writes — there is no scripts/ dir under /opt/xorgate, so a
+# new helper would need a deployment path in the backend installer AND in
+# `xorgate update`. They run as the drop-in service user (pi), not root;
+# `pinctrl` needs no sudo.
+#
+# `exit-state` reads $SERVICE_RESULT, which systemd sets for ExecStopPost:
+# `success` (systemctl stop/restart, reboot — our SIGTERM path exits 0) blanks
+# the LED; a crash (exit-code/signal/core-dump/watchdog/timeout) latches solid
+# red. A crash-loop ends red: Restart=always retries, and once StartLimitBurst
+# is exhausted systemd gives up with the last ExecStopPost's red still showing.
+#
+# Both are prefixed `-` so the LED can NEVER stop the agent: without it, a
+# non-zero ExecStartPre aborts the start entirely.
+ExecStartPre=-/usr/local/bin/xorgate led boot
 ExecStart=/usr/bin/env node /opt/xorgate/dist/worker.js
+ExecStopPost=-/usr/local/bin/xorgate led exit-state
 
 # Restart on every exit (including a clean exit 0 after SIGTERM). Recovers from
 # a brief IoT/cert outage and from operator-induced stops.

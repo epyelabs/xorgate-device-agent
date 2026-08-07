@@ -34,6 +34,7 @@ import { loadManifest, persistUploadBucket } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
 import { s3Put } from "./recording/s3-put.js";
 import { RecordingManager, type RecordingUploadOptions } from "./recording/manager.js";
+import { LedManager } from "./agent/led-manager.js";
 import type { PowerSampleReading } from "./recording/boot-policy.js";
 import { resolveBridgedCameras } from "./recording/video-capture.js";
 import type { StateSnapshot, TelemetryPayload, TelemetryReading } from "./agent/telemetry.js";
@@ -87,6 +88,7 @@ const source: {
   samplePower?: () => Promise<PowerSampleReading | null>;
   gpsClock?: () => GpsClockReading | null;
   gnssView?: () => GnssView | null;
+  lteStatus?: () => string | null;
 } =
   config.mode === "real"
     ? createCollector(
@@ -275,10 +277,34 @@ let seq = 0;
 let shuttingDown = false;
 let timer: NodeJS.Timeout | null = null;
 
+/**
+ * RGB status LED (plans/rgb_led_events). A pure renderer over verdicts other
+ * modules already publish — it derives nothing of its own, and goes inert on
+ * any host without the hardware. All three reads below are cached accessors,
+ * so this adds no I/O and no poller.
+ */
+let ledStarting = true;
+const led = new LedManager({
+  signals: () => ({
+    connection: store.snapshot().connection,
+    recording: recording.status(),
+    lte: source.lteStatus ? { status: source.lteStatus() ?? undefined } : null,
+    gnss: source.gnssView?.() ?? null,
+    starting: ledStarting,
+  }),
+});
+await led.start();
+
 // Heartbeat: while not yet connected (or reconnecting/closed), force a state
 // flush so a healthy-but-still-connecting daemon never shows as "stale".
+//
+// The LED ticks from HERE and not from the publish loop below, because that
+// loop only starts on a successful mqtt connect — a device that never reaches
+// the cloud is exactly the device that most needs to say so.
 const heartbeat = setInterval(() => {
   if (shuttingDown) return;
+  led.tick();
+  ledStarting = false;
   if (store.snapshot().connection !== "connected") store.flush(Date.now(), true);
 }, 1000);
 
@@ -386,6 +412,10 @@ function handleConfigMessage(payload: Buffer): void {
         console.log(`[agent] cloud config applied: ${summary}`);
         store.event("info", `cloud config applied: ${summary}`, now);
         store.flush(now, true);
+        // Two white flashes. Gated on `changed` on purpose: this message is
+        // RETAINED, so the broker replays it on every reconnect, and flashing
+        // for a no-op re-delivery would make the acknowledgement meaningless.
+        led.configApplied();
       }
     } else {
       console.log(`[agent] cloud config rev ${parsed.rev} already applied — not re-applying`);
@@ -658,6 +688,10 @@ function shutdown(sig: string): void {
   console.log(`\n[agent] shutting down (${sig})…`);
   if (timer) clearInterval(timer);
   clearInterval(heartbeat);
+  // Best-effort blank (pinctrl is ~1 ms/call, and this runs well before the
+  // exit below). systemd's ExecStopPost=`xorgate led exit-state` is the actual
+  // guarantee — and unlike us it can tell a clean stop from a crash.
+  led.stop();
   configSync.stop(); // no report may be queued into a client we are about to end
   // Finalize the active recording segment (sync) so a clean stop never leaves
   // an orphan .jsonl for the next boot's crash recovery to mop up.

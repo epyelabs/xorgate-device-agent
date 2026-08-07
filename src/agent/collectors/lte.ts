@@ -26,8 +26,15 @@ export const GNSS_HEALTH_CODES: Record<GnssHealth, number> = {
  * Self-gates: returns {} when the daemon hasn't published yet or the signal is
  * unknown (CSQ 99), so the worker omits the `lte` group.
  */
-export function createLteCollector(): Collector {
+export function createLteCollector(): Collector & { lastStatus: () => string | null } {
   let warned = false;
+
+  // The daemon's `status` string ("connected"/"connecting"/"disconnected"/
+  // "dead_zone") is NOT publishable — cloud telemetry leaves are numbers-only —
+  // but the status LED needs it (rung 5, and `dead_zone` is what keeps a
+  // settled no-coverage device green). Captured from the read this collector
+  // already performs each tick, so nothing re-reads the file: "no new pollers".
+  let lastStatus: string | null = null;
 
   // Recorder-side cache: the daemon file updates on its own slow cadence, so
   // sample() re-reads it at most once per second and stamps updatedMono only
@@ -60,15 +67,22 @@ export function createLteCollector(): Collector {
 
   return {
     group: "lte",
+    /** Daemon link status for the status LED; null when the file is unreadable. */
+    lastStatus: () => lastStatus,
     async read() {
       const t = await readModemTelemetry();
       if (!t) {
+        lastStatus = null;
         if (!warned) {
           console.warn("[lte] no telemetry yet — is sim7600-lte.service running?");
           warned = true;
         }
         return {};
       }
+      // Captured BEFORE the CSQ gate: an unknown signal (csq 99) still has a
+      // meaningful link status, and dropping it would light the LED purple on a
+      // device the daemon considers settled.
+      lastStatus = typeof t.status === "string" ? t.status : null;
       warned = false; // recovered; allow a fresh warning if it drops again
       return mapTelemetry(t) ?? {};
     },
@@ -77,6 +91,7 @@ export function createLteCollector(): Collector {
       if (now - lastPollAt >= 1000) {
         lastPollAt = now;
         const t = await readModemTelemetry();
+        if (t) lastStatus = typeof t.status === "string" ? t.status : null;
         const fields = t ? mapTelemetry(t) : null;
         if (!fields) {
           cached = null;

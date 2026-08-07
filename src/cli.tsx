@@ -127,9 +127,9 @@ Commands:
   pipeline   Manage per-stream KVS pipelines: 'pipeline list|show|set|clear <streamKey> [file]'
   recording  On-device recording maintenance: 'recording reset-counters' zeroes the
              cumulative droppedSegments counter (applied live, no restart)
-  led        Drive the RGB status LED by hand: 'led <colour> [pattern]', 'led off',
-             or 'led test' to walk the whole status ladder printing each label
-             (manual instrument — no policy, no settings; inert off-device)
+  led        RGB status LED: 'led <colour> [pattern]', 'led off', or 'led test' to
+             walk the whole status ladder printing each label. The agent drives it
+             automatically; these are for bench work. Inert off-device.
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)

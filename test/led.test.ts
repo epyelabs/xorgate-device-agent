@@ -135,6 +135,54 @@ describe("pattern playback", () => {
   });
 });
 
+describe("write elision", () => {
+  it("only writes channels that change within a running pattern", async () => {
+    const { driver, writes } = recorder();
+    await driver.init();
+    const running = driver.play("green", "blink-slow");
+    await new Promise((r) => setTimeout(r, 1300)); // ~2 more transitions
+    driver.stop();
+    await running;
+
+    // The first apply drives all three; after that only GPIO21 (green) moves.
+    expect(writes.slice(0, 3)).toEqual(triple("green"));
+    const afterFirst = writes.slice(3);
+    expect(afterFirst.length).toBeGreaterThan(0);
+    expect(afterFirst.every((w) => w.startsWith("21="))).toBe(true);
+  });
+
+  it("always writes all three on a new state, never trusting a stale cache", async () => {
+    // A bench operator running `xorgate led purple` behind the agent's back
+    // would otherwise leave red/blue latched through the next pattern.
+    const { driver, writes } = recorder();
+    await driver.init();
+    await driver.set("green");
+    writes.length = 0;
+    await driver.set("green"); // same colour, but a NEW state
+    expect(writes).toEqual(triple("green"));
+  });
+
+  it("writes all three on the fail-safe blank even if they look unchanged", async () => {
+    let fail = false;
+    const writes: string[] = [];
+    const driver = new LedDriver({
+      map: STATUS_LED_MAP,
+      log: () => {},
+      probe: async () => ({ ok: true }),
+      write: async (pin, high) => {
+        writes.push(`${pin}=${high ? 1 : 0}`);
+        return !fail;
+      },
+    });
+    await driver.init();
+    await driver.set("off");
+    fail = true;
+    writes.length = 0;
+    await driver.set("red");
+    expect(writes.slice(-3)).toEqual(["12=0", "21=0", "16=0"]);
+  });
+});
+
 describe("pin-map validation", () => {
   it("accepts the hardcoded Argus CM5 Rev1 map", () => {
     expect(STATUS_LED_MAP.pins).toEqual({ r: 12, g: 21, b: 16 });

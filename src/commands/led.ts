@@ -19,33 +19,17 @@ import {
   type LedColour,
   type LedPattern,
 } from "../hardware/led.js";
-
-interface LadderState {
-  pri: string;
-  colour: LedColour;
-  pattern: LedPattern;
-  label: string;
-  holdMs?: number;
-}
+import { LED_LADDER, rung } from "../lib/led-state.js";
 
 /**
- * The agreed ladder (plan §5), in priority order, for `led test`. Phase 1 only
- * *shows* these — nothing here decides when they apply; that is Phase 2's pure
- * `resolveLedState`.
+ * How long to hold rungs that need more than the default to judge, keyed by
+ * machine reason. `healthy` needs to repeat — the point of the heartbeat is
+ * that it is dark ~95% of the time, and one cycle alone does not show that.
  */
-const LADDER: LadderState[] = [
-  { pri: "0", colour: "white", pattern: "solid", label: "Starting up (no real state yet)" },
-  { pri: "1", colour: "red", pattern: "solid", label: "Agent not running" },
-  { pri: "2", colour: "red", pattern: "blink-fast", label: "Power fault — undervoltage / shedding" },
-  { pri: "3", colour: "red", pattern: "blink-slow", label: "Data loss — storage full, segments dropping" },
-  { pri: "4", colour: "cyan", pattern: "blink-slow", label: "Running hot — thermal shed, still recording" },
-  { pri: "5", colour: "purple", pattern: "blink-fast", label: "Network trouble — LTE/cloud down, recovering" },
-  { pri: "6", colour: "blue", pattern: "blink-slow", label: "Waiting for a GPS fix" },
-  // Long enough to see the double-pulse repeat: the point of "healthy" is that
-  // it is dark ~95% of the time, and one cycle alone does not show that.
-  { pri: "7", colour: "green", pattern: "heartbeat", label: "Healthy", holdMs: 12000 },
-  { pri: "—", colour: "white", pattern: "flash2", label: "Settings applied / command accepted", holdMs: 2500 },
-];
+const HOLD_OVERRIDES: Record<string, number> = {
+  healthy: 12_000,
+  "config-applied": 2_500,
+};
 
 const HOLD_MS = 4000;
 const GAP_MS = 700;
@@ -58,13 +42,14 @@ export async function ledCommand(rest: string[]): Promise<void> {
     usage();
     return;
   }
-  if (sub !== "test" && !isLedColour(sub)) {
+  const isHook = sub === "boot" || sub === "exit-state";
+  if (sub !== "test" && !isHook && !isLedColour(sub)) {
     console.error(`unknown colour or subcommand '${sub}'`);
     usage();
     process.exitCode = 1;
     return;
   }
-  if (sub !== "test" && pos[1] !== undefined && !isLedPattern(pos[1])) {
+  if (sub !== "test" && !isHook && pos[1] !== undefined && !isLedPattern(pos[1])) {
     console.error(`unknown pattern '${pos[1]}'`);
     usage();
     process.exitCode = 1;
@@ -92,6 +77,10 @@ export async function ledCommand(rest: string[]): Promise<void> {
     await walkLadder(driver);
     return;
   }
+  if (isHook) {
+    await runHook(driver, sub);
+    return;
+  }
 
   const colour = sub;
   const pattern: LedPattern = (pos[1] as LedPattern | undefined) ?? "solid";
@@ -116,12 +105,43 @@ export async function ledCommand(rest: string[]): Promise<void> {
   await driver.blank();
 }
 
+/**
+ * systemd lifecycle hooks. `$SERVICE_RESULT` already distinguishes a deliberate
+ * stop from a crash, so neither of these guesses at anything.
+ *
+ * These run as the service user (`pi`), not root — the installer's 10-user.conf
+ * drop-in overrides the unit's `User=root`. `pinctrl` needs no sudo.
+ */
+async function runHook(driver: LedDriver, hook: "boot" | "exit-state"): Promise<void> {
+  if (hook === "boot") {
+    // ExecStartPre: something is lit from the moment systemd starts us, so the
+    // window before LedManager takes over is never mistaken for "unpowered".
+    await driver.set(rung("starting").colour);
+    console.log("led: boot (white)");
+    return;
+  }
+
+  // ExecStopPost. `success` covers `systemctl stop`/`restart` and machine
+  // reboot — our SIGTERM path exits 0 — and is NOT a fault. Everything else
+  // (exit-code, signal, core-dump, watchdog, timeout) is a crash, and solid red
+  // is correct to latch: Restart=always retries, and once StartLimitBurst is
+  // exhausted systemd gives up with the LED still red.
+  const result = process.env.SERVICE_RESULT ?? "success";
+  if (result === "success") {
+    await driver.blank();
+    console.log("led: off (clean stop)");
+    return;
+  }
+  await driver.set(rung("agent-down").colour);
+  console.log(`led: red solid (SERVICE_RESULT=${result})`);
+}
+
 /** Show every rung long enough to judge, with a dark gap between them. */
 async function walkLadder(driver: LedDriver): Promise<void> {
   console.log("Walking the LED ladder — watch the device.\n");
-  for (const state of LADDER) {
+  for (const state of LED_LADDER) {
     console.log(`  [${state.pri}] ${pad(`${state.colour} ${state.pattern}`)} ${state.label}`);
-    await show(driver, state.colour, state.pattern, state.holdMs ?? HOLD_MS);
+    await show(driver, state.colour, state.pattern, HOLD_OVERRIDES[state.reason] ?? HOLD_MS);
     await driver.blank();
     await delay(GAP_MS);
   }
@@ -161,6 +181,10 @@ function usage(): void {
   led off    turn the LED off
   led test   walk every state in the status ladder, printing each label —
              this is the one to run with someone watching the device
+
+  led boot        systemd ExecStartPre hook — white while the agent comes up
+  led exit-state  systemd ExecStopPost hook — blank on a clean stop, solid red
+                  on a crash (reads $SERVICE_RESULT)
 
   'solid' stays lit after the command exits; every other pattern lasts as long
   as the process (Ctrl-C leaves the LED dark). No settings, no cloud, no policy:

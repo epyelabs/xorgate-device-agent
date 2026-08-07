@@ -247,6 +247,8 @@ export class LedDriver {
   /** Bumped by stop()/set() so an in-flight pattern knows it was superseded. */
   private generation = 0;
   private wake: (() => void) | null = null;
+  /** Last levels we know we wrote; null = unknown, write everything. */
+  private lastLevels: LedChannels | null = null;
 
   constructor(opts: LedDriverOptions = {}) {
     this.map = opts.map ?? STATUS_LED_MAP;
@@ -296,6 +298,9 @@ export class LedDriver {
   /** Cancel a running pattern. Leaves the LED wherever the pattern left it. */
   stop(): void {
     this.generation++;
+    // Every new colour/pattern starts from "levels unknown", so the first write
+    // of a state always drives all three pins even if we think one matches.
+    this.lastLevels = null;
     const wake = this.wake;
     this.wake = null;
     wake?.();
@@ -328,11 +333,24 @@ export class LedDriver {
   private async apply(colour: LedColour): Promise<void> {
     if (!this.ready) return;
     const want = LED_COLOURS[colour];
+
+    // Skip channels already at the wanted level. Every write is a `pinctrl`
+    // process spawn, and the healthy-device heartbeat toggles four times per
+    // 5.5 s cycle forever — writing all three each time would burn ~2.2
+    // spawns/s to move one pin. The cache is dropped on every stop() (i.e. on
+    // every new colour/pattern), so it only elides toggles WITHIN one running
+    // pattern; anything that changes the pins behind our back is corrected by
+    // the next state change rather than persisting.
+    const last = this.lastLevels;
     const ok =
-      (await this.writeChannel(this.map.pins.r, want.r)) &&
-      (await this.writeChannel(this.map.pins.g, want.g)) &&
-      (await this.writeChannel(this.map.pins.b, want.b));
-    if (ok) return;
+      (await this.writeIfChanged(this.map.pins.r, want.r, last?.r)) &&
+      (await this.writeIfChanged(this.map.pins.g, want.g, last?.g)) &&
+      (await this.writeIfChanged(this.map.pins.b, want.b, last?.b));
+    if (ok) {
+      this.lastLevels = { ...want };
+      return;
+    }
+    this.lastLevels = null; // the pins are in an unknown state; trust nothing
 
     // Fail safe: a half-written colour is a lie. Stop, dark, log once.
     this.generation++;
@@ -345,6 +363,11 @@ export class LedDriver {
       this.loggedFailure = true;
       this.log("pin write failed — LED blanked (further failures not logged)");
     }
+  }
+
+  private writeIfChanged(pin: number, lit: boolean, was: boolean | undefined): Promise<boolean> {
+    if (was === lit) return Promise.resolve(true);
+    return this.writeChannel(pin, lit);
   }
 
   private async writeChannel(pin: number, lit: boolean): Promise<boolean> {

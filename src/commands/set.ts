@@ -59,6 +59,7 @@ import {
   parseRecordingSettings,
   parseTimeSyncSettings,
   saveSettings,
+  settingsPath,
   RECORDING_RATE_HZ_MAX,
   RECORDING_RATE_HZ_MIN,
   STREAM_KEY_RE,
@@ -66,6 +67,8 @@ import {
   type RecordingSettings,
   type TimeSyncSettings,
 } from "../daemon/settings.js";
+import { pidPath, runtimeHome } from "../daemon/runtime.js";
+import { fileOwner, isRoot, usernameForUid } from "../lib/privilege.js";
 import { inspect, restart } from "../daemon/manager.js";
 import { setWifi } from "../daemon/radios.js";
 import { findVideoPreset, videoPresetNames } from "../recording/video-presets.js";
@@ -295,6 +298,30 @@ function setTimeSyncCommand(key: string, value: string | undefined): void {
   console.log("  the agent's clock stepper reads it live within ~30 s (no restart needed)");
 }
 
+/**
+ * Say once that `sudo` is not needed here (settings-sync-hardening plan, phase
+ * 1, Q1 → "warn and continue").
+ *
+ * Running the CLI as root used to leave settings.json `root:root` and lock the
+ * unprivileged agent out of its own file. `atomicWriteJson` now hands ownership
+ * back, so this is purely educational — it warns and the write proceeds
+ * normally, because a refusal would break existing runbooks for no remaining
+ * benefit.
+ *
+ * The agent's identity comes from the filesystem, in preference to shelling out
+ * to `systemctl show xorgate-agent -p User`: the CLI has to keep working on a
+ * non-systemd install. Nothing here throws — an install with no state dir yet
+ * simply gets no note.
+ */
+function warnIfNeedlessSudo(): void {
+  if (!isRoot()) return;
+  const owner = fileOwner(pidPath()) ?? fileOwner(runtimeHome()) ?? fileOwner(settingsPath());
+  if (!owner || owner.uid === 0) return; // agent runs as root too, or we can't tell
+  const who = usernameForUid(owner.uid) ?? `uid ${owner.uid}`;
+  console.error(`note: the xorgate agent runs as '${who}' — you don't need sudo for settings.`);
+  console.error(`  writing anyway; settings.json keeps its '${who}' ownership.`);
+}
+
 export async function setCommand(rest: string[]): Promise<void> {
   const noRestart = rest.includes("--no-restart");
   const force = rest.includes("--force");
@@ -313,6 +340,10 @@ export async function setCommand(rest: string[]): Promise<void> {
     await setWifiCommand(value, force);
     return;
   }
+
+  // Everything from here down writes settings.json. `wifi` is deliberately
+  // above this line: it is an OS-level toggle that genuinely may need root.
+  warnIfNeedlessSudo();
 
   // Recording keys are applied live by the worker's settings poll — no restart.
   if (key.startsWith("recording.")) {

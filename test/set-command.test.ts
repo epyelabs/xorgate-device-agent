@@ -1,7 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setCommand } from "../src/commands/set.js";
-import { loadSettings, saveSettings } from "../src/daemon/settings.js";
 import { cleanup, tempHome } from "./helpers.js";
+
+/**
+ * The sudo note (settings-sync-hardening plan, phase 1, Q1 → warn and continue)
+ * needs to look like "root running a CLI whose agent is somebody else". Rather
+ * than requiring a root suite, stub the two filesystem facts it reads.
+ */
+const priv = vi.hoisted(() => ({ root: false, agentUid: null as number | null }));
+vi.mock("../src/lib/privilege.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/lib/privilege.js")>();
+  return {
+    ...actual,
+    isRoot: () => priv.root || actual.isRoot(),
+    fileOwner: (p: string) =>
+      priv.agentUid === null
+        ? actual.fileOwner(p)
+        : { uid: priv.agentUid, gid: priv.agentUid, mode: 0o600 },
+    usernameForUid: (uid: number) => (priv.agentUid === uid ? "pi" : actual.usernameForUid(uid)),
+  };
+});
+
+const { setCommand } = await import("../src/commands/set.js");
+const { loadSettings, saveSettings } = await import("../src/daemon/settings.js");
 
 /**
  * `xorgate set` paths that neither restart the daemon nor touch the OS:
@@ -11,6 +31,8 @@ import { cleanup, tempHome } from "./helpers.js";
 let home: string;
 beforeEach(() => {
   home = tempHome();
+  priv.root = false;
+  priv.agentUid = null;
   process.exitCode = undefined;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -50,6 +72,36 @@ describe("xorgate set recording.powerShedding.*", () => {
       enabled: true,
       cpuTempSecs: 15,
     });
+  });
+});
+
+describe("running `xorgate set` under sudo", () => {
+  const stderr = (): string => vi.mocked(console.error).mock.calls.flat().join(" ");
+
+  it("warns that the agent runs as somebody else, and still performs the write", async () => {
+    priv.root = true;
+    priv.agentUid = 1000;
+    await setCommand(["gps-antenna", "passive"]);
+
+    expect(process.exitCode).toBeUndefined();
+    expect(loadSettings().gnssAntBias).toBe(false); // warn AND continue
+    expect(stderr()).toMatch(/agent runs as 'pi'.*don't need sudo/);
+  });
+
+  it("says nothing when the agent runs as root too", async () => {
+    priv.root = true;
+    priv.agentUid = 0;
+    await setCommand(["timeSync.offlineSources", "off"]);
+
+    expect(loadSettings().timeSync?.offlineSources).toBe(false);
+    expect(stderr()).not.toMatch(/sudo/);
+  });
+
+  it("says nothing for an ordinary unprivileged run", async () => {
+    await setCommand(["recording.telemetry.rateHz", "5"]);
+
+    expect(loadSettings().recording?.telemetry?.rateHz).toBe(5);
+    expect(stderr()).not.toMatch(/sudo/);
   });
 });
 

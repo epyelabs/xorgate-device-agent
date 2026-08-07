@@ -1,5 +1,15 @@
-import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  fchmodSync,
+  fchownSync,
+  fsyncSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
+import { fileOwner, isRoot, type FileOwner } from "./privilege.js";
 
 /**
  * Atomically and durably write JSON to `path`: write a temp file in the SAME
@@ -15,16 +25,30 @@ import { dirname, join } from "node:path";
  *
  * The pid + a monotonic-ish counter in the temp name keep two writers from
  * colliding. (Date.now() is avoided so this stays usable in any context.)
+ *
+ * OWNERSHIP. The rename is also how this helper used to lock the agent out of
+ * its own settings: a temp file created by a root process belongs to root, and
+ * a rename needs only directory write permission, so `sudo xorgate set …` left
+ * `settings.json` as `root:root 0600` while the agent runs as the provisioning
+ * user. Reads then failed with EACCES and cloud↔device sync stalled in both
+ * directions (settings-sync-hardening plan, phase 1). So: when we are root and
+ * the target already exists, the temp file is handed back to that target's
+ * owner and mode before the rename. Non-root callers make no extra syscall —
+ * this helper is on the hot path for state.json and every segment sidecar.
  */
 let tmpCounter = 0;
 
 export function atomicWriteJson(path: string, obj: unknown): void {
   const dir = dirname(path);
   const tmp = join(dir, `.${pathBase(path)}.tmp.${process.pid}.${tmpCounter++}`);
+  // Root only, and only when there is an existing owner to preserve: a first
+  // write is the installer's job and the installer sets ownership itself.
+  const prior = isRoot() ? fileOwner(path) : undefined;
   const fd = openSync(tmp, "w", 0o600);
   try {
     writeSync(fd, JSON.stringify(obj));
-    fsyncSync(fd);
+    if (prior) preserveOwnership(fd, prior);
+    fsyncSync(fd); // after the chown/chmod, so the metadata is durable too
   } finally {
     closeSync(fd);
   }
@@ -40,6 +64,28 @@ export function atomicWriteJson(path: string, obj: unknown): void {
     throw err;
   }
   fsyncDir(dir);
+}
+
+/**
+ * Give the temp file the owner and mode of the target it is about to replace.
+ * Called only when we are root AND the target exists.
+ *
+ * Deliberately best-effort: a durable write that is cosmetically root-owned is
+ * a far better outcome than a write that throws, so a chown/chmod failure is
+ * swallowed and the rename proceeds. chown first, then chmod — chown(2) clears
+ * the set-user-ID/set-group-ID bits, which would undo a mode set before it.
+ */
+function preserveOwnership(fd: number, prior: FileOwner): void {
+  try {
+    fchownSync(fd, prior.uid, prior.gid);
+  } catch {
+    /* never fail a settings write over ownership */
+  }
+  try {
+    fchmodSync(fd, prior.mode);
+  } catch {
+    /* ditto */
+  }
 }
 
 /** Best-effort fsync of a directory so a rename survives a power loss on Linux. */

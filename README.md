@@ -518,6 +518,21 @@ just supervised in-process with restart-on-crash. A device with multiple cameras
 Status shows in the monitor's **Media** pane (per-channel state) and in the
 telemetry payload's `media.kvs` / `media.streams`.
 
+## Audio (I2S mic) — present on the board, not used
+
+The Argus carrier has an input-only I2S MEMS microphone (GPIO18/19/20), but
+nothing in this product uses it: no `audio0` channel in `kvs.json`, no audio
+pipeline, and the agent never opens the card. The `audio0` entry in the device
+model's `io_capabilities` is aspirational.
+
+⚠️ **Do not enable it with `dtoverlay=googlevoicehat-soundcard`.** That overlay
+describes a mic **plus speaker-amplifier** board, so it also reserves GPIO16
+and GPIO21 — which on this carrier are the **blue and green status LEDs**.
+GPIO16 in particular gets a real gpiod consumer (`sdmode`), so libgpiod refuses
+the line and the LED driver cannot own it. Use `dtoverlay=audioinjector-bare-i2s`
+instead: same three mic pins, no GPIO claims. Details, evidence and the
+device-tree alternative are in [`docs/audio-i2s.md`](docs/audio-i2s.md).
+
 ## Build & test
 
 ```sh

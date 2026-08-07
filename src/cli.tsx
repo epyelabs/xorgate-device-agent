@@ -17,6 +17,7 @@ import { updateCommand } from "./commands/update.js";
 import { setCommand } from "./commands/set.js";
 import { pipelineCommand } from "./commands/pipeline.js";
 import { recordingCommand } from "./commands/recording.js";
+import { ledCommand } from "./commands/led.js";
 
 const VERSION = "0.2.0";
 /** Flags that take a value — skipped when locating the subcommand token. */
@@ -87,6 +88,9 @@ async function main(): Promise<void> {
     case "recording":
       await recordingCommand(rest);
       break;
+    case "led":
+      await ledCommand(rest);
+      break;
     case "monitor": // deprecated alias for `manage`, kept working for one release
     case "manage": {
       if (cmd === "monitor") console.error("[xorgate] 'monitor' is deprecated; use 'manage'");
@@ -123,6 +127,9 @@ Commands:
   pipeline   Manage per-stream KVS pipelines: 'pipeline list|show|set|clear <streamKey> [file]'
   recording  On-device recording maintenance: 'recording reset-counters' zeroes the
              cumulative droppedSegments counter (applied live, no restart)
+  led        Drive the RGB status LED by hand: 'led <colour> [pattern]', 'led off',
+             or 'led test' to walk the whole status ladder printing each label
+             (manual instrument — no policy, no settings; inert off-device)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)

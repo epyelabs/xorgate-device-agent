@@ -181,10 +181,12 @@ Media-runtime env (see the **Media runtime (KVS WebRTC)** section below):
 src/
   cli.tsx            # `xorgate` dispatcher → commands/* (only `manage` loads ink)
   worker.ts          # detached daemon entry: 1 Hz publish loop + state-file writer
-  commands/          # start, stop, restart, status, logs, manage, set, update
+  commands/          # start, stop, restart, status, logs, manage, set, update, pipeline,
+                     #   recording, led
   daemon/            # process manager (no React): runtime, pidfile, process, state, manager, settings
   agent/             # telemetry core: config (+offline), mqtt (+stub), simulator, collectors
   monitor/           # ink master/detail dashboard: MonitorHeader, modules, hooks
+  hardware/led.ts    # RGB status LED driver (pinctrl; pins hardcoded for Argus CM5 Rev1)
   components/ lib/ hardware/ dashboard/   # reusable UI (shared with argus-cli)
 test/                # vitest: pidfile/state/process/manager logic + monitor UI smoke
 ```

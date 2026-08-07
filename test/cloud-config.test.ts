@@ -34,9 +34,24 @@ describe("parseCloudConfig", () => {
   it("parses an imuMount object and drops malformed ones", () => {
     const m = { enabled: true, rollDeg: 90, pitchDeg: 0, yawDeg: 180 };
     expect(parseCloudConfig(JSON.stringify({ v: 1, imuMount: m }))).toEqual({ imuMount: m });
+    // An all-invalid OBJECT now maps to null ("clear this namespace"), the same
+    // as recording/lteRecovery/timeSync. It used to parse to absent ("leave the
+    // local value alone"), which made imuMount the one namespace an empty
+    // object could not revert — settings_sync_hardening finding 2.
     expect(
       parseCloudConfig(JSON.stringify({ v: 1, imuMount: { enabled: true, rollDeg: "90" } })),
-    ).toEqual({});
+    ).toEqual({ imuMount: null });
+    // Non-object values are still ignored entirely.
+    expect(parseCloudConfig(JSON.stringify({ v: 1, imuMount: "on" }))).toEqual({});
+    expect(parseCloudConfig(JSON.stringify({ v: 1, imuMount: [1] }))).toEqual({});
+  });
+
+  it("maps an empty imuMount object to null (the cloud's revert marker)", () => {
+    expect(parseCloudConfig(JSON.stringify({ v: 1, imuMount: {} }))).toEqual({
+      imuMount: null,
+    });
+    // Absent key stays absent (not null) — leaves local settings alone.
+    expect(parseCloudConfig(JSON.stringify({ v: 1 }))).toEqual({});
   });
 
   it("parses a recording namespace (normalized like local settings)", () => {
@@ -108,6 +123,31 @@ describe("applyCloudConfig", () => {
       timeSync: { offlineSources: false },
       gnssAntBias: true,
     });
+  });
+
+  // settings_sync_hardening finding 2: `PATCH {"imuMount": null}` reaches the
+  // device as `imuMount: {}`, and it has to actually revert.
+  it("clears imuMount when the cloud sends the revert marker", () => {
+    saveSettings({ mode: "real", imuMount: { enabled: true, rollDeg: 90, pitchDeg: 0, yawDeg: 90 } });
+    expect(applyCloudConfig({ imuMount: null })).toEqual({ changed: true });
+    // The KEY is gone, not set to a zeroed mount — absent is what "device
+    // defaults" means on this side of the wire.
+    expect(loadSettings()).toEqual({ mode: "real" });
+  });
+
+  it("leaves imuMount alone when the cloud never mentions it", () => {
+    const mount = { enabled: true, rollDeg: 90, pitchDeg: 0, yawDeg: 90 };
+    saveSettings({ mode: "real", imuMount: mount });
+    expect(applyCloudConfig({ gnssAntBias: true })).toEqual({ changed: true });
+    expect(loadSettings()).toEqual({ mode: "real", imuMount: mount, gnssAntBias: true });
+  });
+
+  it("is a no-op when the revert marker arrives and there is nothing to clear", () => {
+    // The retained message redelivers on every connect; a cleared namespace
+    // stays `{}` on the wire forever, so this is the common path.
+    saveSettings({ mode: "real" });
+    expect(applyCloudConfig({ imuMount: null })).toEqual({ changed: false });
+    expect(loadSettings()).toEqual({ mode: "real" });
   });
 
   it("is a no-op when the value is unchanged (retained re-delivery)", () => {

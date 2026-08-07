@@ -63,7 +63,18 @@ export interface CloudConfig {
    */
   rev?: number;
   gnssAntBias?: boolean;
-  imuMount?: ImuMount;
+  /**
+   * IMU mounting correction. Same replace-whole-namespace semantics as
+   * `recording` below: null = carried but nothing valid (in practice an empty
+   * object, the cloud's "revert to defaults" marker) → remove the local key;
+   * absent = never cloud-configured, leave local settings alone.
+   *
+   * It was the odd one out until settings_sync_hardening finding 2: an empty
+   * `imuMount` object parsed to "absent" rather than "clear", so
+   * `PATCH {"imuMount": null}` emptied the cloud and left the device running
+   * its old angles with nothing on either side saying so.
+   */
+  imuMount?: ImuMount | null;
   /**
    * null = the message carried a `recording` object with no valid fields
    * ("cloud manages recording, all defaults") — applied by removing the local
@@ -142,8 +153,12 @@ function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   if (typeof rev === "number" && Number.isFinite(rev) && rev > 0) out.rev = Math.floor(rev);
   const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
   if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
-  const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
-  if (imuMount) out.imuMount = imuMount;
+  const imuMount = (obj as { imuMount?: unknown }).imuMount;
+  if (imuMount && typeof imuMount === "object" && !Array.isArray(imuMount)) {
+    // An all-invalid/empty object → null (clear), exactly like the three
+    // namespaces below. Non-object values are still ignored entirely.
+    out.imuMount = parseImuMount(imuMount) ?? null;
+  }
   const uploadBucket = (obj as { uploadBucket?: unknown }).uploadBucket;
   if (typeof uploadBucket === "string" && uploadBucket.length > 0) {
     out.uploadBucket = uploadBucket;
@@ -210,8 +225,14 @@ export function applyCloudConfig(
   if (config.gnssAntBias !== undefined && config.gnssAntBias !== current.gnssAntBias) {
     next.gnssAntBias = config.gnssAntBias;
   }
-  if (config.imuMount !== undefined && !imuMountEqual(config.imuMount, current.imuMount)) {
-    next.imuMount = config.imuMount;
+  // Replace-whole-namespace, same shape as the three below: a cleared
+  // namespace (null) removes the local key instead of writing one.
+  let imuMountChange: "set" | "clear" | undefined;
+  if (config.imuMount !== undefined) {
+    const target = config.imuMount ?? undefined;
+    if (!imuMountEqual(target, current.imuMount)) {
+      imuMountChange = target ? "set" : "clear";
+    }
   }
   // Replace-whole-namespace semantics (see file header). Both sides are
   // normalized by parseRecordingSettings (fixed key order), so JSON equality
@@ -241,6 +262,7 @@ export function applyCloudConfig(
   }
   if (
     Object.keys(next).length === 0 &&
+    imuMountChange === undefined &&
     recordingChange === undefined &&
     lteRecoveryChange === undefined &&
     timeSyncChange === undefined
@@ -248,6 +270,8 @@ export function applyCloudConfig(
     return { changed: false };
   }
   const merged = { ...current, ...next };
+  if (imuMountChange === "set") merged.imuMount = config.imuMount as ImuMount;
+  else if (imuMountChange === "clear") delete merged.imuMount;
   if (recordingChange === "set") merged.recording = config.recording as RecordingSettings;
   else if (recordingChange === "clear") delete merged.recording;
   if (lteRecoveryChange === "set") merged.lteRecovery = config.lteRecovery as LteRecoverySettings;

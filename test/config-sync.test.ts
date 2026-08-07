@@ -169,6 +169,35 @@ describe("per-namespace status", () => {
     expect(status.timeSync.detail).toMatch(/changed locally/);
   });
 
+  // settings_sync_hardening finding 2. `{}` is the cloud's revert marker, not a
+  // value the device failed to use — reporting it as `rejected` would put a red
+  // badge on a revert that worked exactly as asked.
+  it("applied when the cloud's revert marker cleared the namespace", () => {
+    const desired = desiredFrom({ rev: 1, imuMount: {} });
+    const status = buildStatus(desired, {}, NO_MODEM, at);
+    expect(status.imuMount).toEqual({ state: "applied", at });
+  });
+
+  it("applied for a revert marker on every object namespace", () => {
+    const desired = desiredFrom({ rev: 1, recording: {}, lteRecovery: {}, timeSync: {} });
+    const status = buildStatus(desired, {}, NO_MODEM, at);
+    expect(status.recording).toEqual({ state: "applied", at });
+    expect(status.lteRecovery).toEqual({ state: "applied", at });
+    expect(status.timeSync).toEqual({ state: "applied", at });
+  });
+
+  it("adjusted when a revert marker arrived but the device still holds a value", () => {
+    const desired = desiredFrom({ rev: 1, imuMount: {} });
+    const status = buildStatus(
+      desired,
+      { imuMount: { enabled: true, rollDeg: 90, pitchDeg: 0, yawDeg: 90 } },
+      NO_MODEM,
+      at,
+    );
+    expect(status.imuMount.state).toBe("adjusted");
+    expect(status.imuMount.detail).toMatch(/still holding a value/);
+  });
+
   it("rejected when an object namespace parsed to nothing", () => {
     const desired = desiredFrom({ rev: 1, imuMount: { enabled: "yes" } });
     const status = buildStatus(desired, {}, NO_MODEM, at);

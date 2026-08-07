@@ -415,6 +415,13 @@ export function buildEffective(
 
 // --- status -----------------------------------------------------------------
 
+/** `{}` — the cloud's on-the-wire marker for "revert this namespace". */
+function isEmptyObject(v: unknown): boolean {
+  return (
+    typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).length === 0
+  );
+}
+
 /** Key-order-insensitive structural equality (JSON.stringify is not sound here). */
 export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -483,8 +490,27 @@ export function buildStatus(
     const raw = desired.raw[key];
     const parsed = parsedNamespace(desired.parsed, key);
 
+    if (parsed === null && isEmptyObject(raw)) {
+      // The cloud sent this namespace as an EMPTY object, which is its
+      // "revert to device defaults" marker (`PATCH {ns: null}` —
+      // settings_sync_hardening finding 2). The apply dropped the local key and
+      // the device is back on defaults: that is the revert SUCCEEDING. Calling
+      // it "rejected", as the all-invalid case below does, would put a red
+      // badge on a change that worked exactly as asked.
+      out[key] =
+        effective[key] === undefined
+          ? { state: "applied", at }
+          : {
+              state: "adjusted",
+              at,
+              detail: "asked to revert to defaults, but the device is still holding a value",
+            };
+      continue;
+    }
+
     if (parsed === undefined || parsed === null) {
-      // null = the namespace arrived as an object the tolerant parser emptied;
+      // null = the namespace arrived as a non-empty object the tolerant parser
+      // emptied (nothing in it was usable);
       // undefined = it arrived as the wrong type outright.
       out[key] = {
         state: "rejected",

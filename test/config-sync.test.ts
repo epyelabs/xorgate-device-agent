@@ -414,31 +414,36 @@ describe("ConfigSync", () => {
     // the cloud would keep that verdict until the hourly heartbeat even though
     // the bias landed half a minute later (bench, 2026-08-06).
     const sent: ConfigReport[] = [];
-    let biasApplied = false;
+    // The modem catches up BETWEEN the apply-time report and the settle report.
+    // Drive that off the READ COUNT, never off a wall-clock delay: the settle
+    // budget is spent by re-reports firing on their own timer, so "wait N ms,
+    // then flip the value" is really a bet on how many `settleMs` ticks fit
+    // into N ms under load. If all 3 settle reports are built before the flip,
+    // the last one still reads `adjusted` and the assertion fails. That bet
+    // passed locally every time and lost in CI three pushes running.
+    let modemReads = 0;
     const sync = new ConfigSync({
       deviceId: "dev-1",
       topic: "t",
       publish: (_t, payload) => sent.push(JSON.parse(payload) as ConfigReport),
       settings: () => ({ gnssAntBias: true }),
-      // The modem catches up between the first report and the settle report.
-      modem: async () => ({ value: biasApplied, fresh: true }),
+      modem: async () => ({ value: modemReads++ > 0, fresh: true }),
       debounceMs: 1,
       settleMs: 5,
     });
     const desired = desiredFrom({ rev: 4, gnssAntBias: true });
     sync.noteCloudConfig(4, desired.raw, desired.parsed, true);
     sync.request("cloud");
-    await delay(30);
-    expect(sent[0].status.gnssAntBias.state).toBe("adjusted");
-
-    biasApplied = true;
-    await delay(60);
-    expect(sent.length).toBeGreaterThan(1);
-    expect(sent[sent.length - 1].status.gnssAntBias).toEqual({
-      state: "applied",
-      at: sent[sent.length - 1].ts,
-    });
+    // Wait for the OUTCOME, not for a duration — a fixed sleep is the other
+    // half of the same flakiness (under load the first report alone took 58 ms).
+    for (let i = 0; i < 200 && sent.length < 2; i++) await delay(10);
     sync.stop();
+
+    // The apply-time report necessarily reads `adjusted`…
+    expect(sent[0].status.gnssAntBias.state).toBe("adjusted");
+    // …and the settle re-report that follows it reads `applied`.
+    expect(sent.length).toBeGreaterThanOrEqual(2);
+    expect(sent[1].status.gnssAntBias).toEqual({ state: "applied", at: sent[1].ts });
   });
 
   it("bounds the settle re-reports so a refused value cannot loop forever", async () => {

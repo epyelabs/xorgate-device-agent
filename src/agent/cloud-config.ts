@@ -39,7 +39,7 @@
  * effect live without a restart.
  */
 import {
-  loadSettings,
+  readSettingsFile,
   parseLteRecoverySettings,
   parseRecordingSettings,
   parseTimeSyncSettings,
@@ -189,7 +189,23 @@ export function applyCloudConfig(
   config: CloudConfig,
   path: string = settingsPath(),
 ): { changed: boolean } {
-  const current = loadSettings(path);
+  // Merging onto `{}` because the file could not be READ would write a
+  // settings.json containing only what this message carried — silently dropping
+  // `mode` and every namespace the cloud does not manage. Found live in phase 6
+  // of the settings-management plan: `sudo xorgate set …` leaves the file
+  // root-owned, the agent runs as the provisioning user, and the next retained
+  // redelivery flattened it.
+  //
+  // ONLY `unreadable` refuses. An ABSENT file has nothing to lose, and a
+  // CORRUPT one has already lost it — overwriting both is the self-heal that
+  // keeps a torn write from wedging config delivery forever.
+  const read = readSettingsFile(path);
+  if (!read.ok && read.reason === "unreadable") {
+    throw new Error(
+      `settings.json exists but cannot be read — refusing to overwrite it (check owner/permissions on ${path})`,
+    );
+  }
+  const current = read.ok ? read.settings : {};
   const next: AgentSettingsPatch = {};
   if (config.gnssAntBias !== undefined && config.gnssAntBias !== current.gnssAntBias) {
     next.gnssAntBias = config.gnssAntBias;

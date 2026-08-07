@@ -43,7 +43,13 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "../lib/atomicWrite.js";
 import { runtimeHome } from "../daemon/runtime.js";
-import { loadSettings, settingsPath, type AgentSettings } from "../daemon/settings.js";
+import {
+  loadSettings,
+  readSettingsFile,
+  settingsPath,
+  type AgentSettings,
+  type SettingsReadResult,
+} from "../daemon/settings.js";
 import { readModemTelemetry, LTE_TELEMETRY_FILE } from "../hardware/modem.js";
 import type { CloudConfig } from "./cloud-config.js";
 
@@ -599,6 +605,12 @@ export interface ConfigSyncOptions {
   /** QoS 1, retain false. Supplied by the worker, which owns the MQTT client. */
   publish: (topic: string, payload: string) => void;
   settings?: () => AgentSettings;
+  /**
+   * Settings reader that keeps the failure reason. Defaults to
+   * `readSettingsFile`; `settings` (which cannot express a failure) is still
+   * honoured for the many tests that only need a value.
+   */
+  readSettings?: () => SettingsReadResult;
   modem?: (now: number) => Promise<ModemBiasSample>;
   hints?: () => ReportHints;
   onEvent?: (level: "info" | "warn", msg: string) => void;
@@ -686,6 +698,8 @@ export class ConfigSync {
   private settleBudget = 0;
   private pendingOrigin: ReportOrigin | null = null;
   private stopped = false;
+  /** Latched so an unreadable settings.json warns once, not every 5 s. */
+  private unreadableSettings = false;
 
   constructor(opts: ConfigSyncOptions) {
     this.opts = opts;
@@ -709,8 +723,25 @@ export class ConfigSync {
     return this.opts.settingsFile ?? settingsPath();
   }
 
+  /**
+   * Read settings, keeping the failure REASON.
+   *
+   * Everything that consumes a setting is happy with `loadSettings`'s "{} when
+   * we could not read it". The watcher is not: `{}` from an unreadable file
+   * looks exactly like "the operator deleted every namespace", and the mirror
+   * Lambda would then erase the cloud's desired document (phase 6 found this
+   * live — `sudo xorgate set …` leaves settings.json root-owned and the agent
+   * runs as the provisioning user, so the very next poll wiped the cloud).
+   */
+  private readSettings(): SettingsReadResult {
+    if (this.opts.readSettings) return this.opts.readSettings();
+    if (this.opts.settings) return { ok: true, settings: this.opts.settings() };
+    return readSettingsFile(this.settingsFile);
+  }
+
   private loadSettings(): AgentSettings {
-    return (this.opts.settings ?? loadSettings)();
+    const res = this.readSettings();
+    return res.ok ? res.settings : {};
   }
 
   /** Merge into the sync state and persist. Never throws (see saveConfigSyncState). */
@@ -774,7 +805,12 @@ export class ConfigSync {
    */
   noteSettingsWritten(touched: readonly string[]): void {
     try {
-      const current = namespacesOf(this.loadSettings());
+      // Same rule as the watcher: an unreadable file must not be read as an
+      // empty one, or the next tick diffs against a baseline that says the
+      // operator deleted everything.
+      const read = this.readSettings();
+      if (!read.ok && read.reason !== "absent") return;
+      const current = namespacesOf(read.ok ? read.settings : {});
       const base = { ...(this.state.namespaces ?? current) };
       for (const key of touched) {
         if (!CONFIG_NAMESPACE_KEYS.includes(key)) continue;
@@ -820,7 +856,24 @@ export class ConfigSync {
     try {
       const hash = readSettingsHash(this.settingsFile);
       if (hash === this.state.settingsHash) return;
-      const current = namespacesOf(this.loadSettings());
+      // A file we cannot READ is not a file the operator emptied. Reporting the
+      // difference would tell the cloud every namespace was deleted, and the
+      // mirror would erase the desired document — the whole fleet's settings,
+      // lost to a chmod. Skip the tick entirely: no baseline advance, no report.
+      // The next successful read diffs correctly against the untouched baseline.
+      const read = this.readSettings();
+      if (!read.ok && read.reason !== "absent") {
+        if (!this.unreadableSettings) {
+          this.unreadableSettings = true;
+          this.opts.onEvent?.(
+            "warn",
+            `settings.json is ${read.reason} — local-change sync paused (check owner/permissions on ${this.settingsFile})`,
+          );
+        }
+        return;
+      }
+      this.unreadableSettings = false;
+      const current = namespacesOf(read.ok ? read.settings : {});
       if (this.state.namespaces === undefined) {
         // Never baselined (fresh device, or a sync file written by Phase 3).
         // Adopt the file silently — see ensureConfigSyncBaseline.

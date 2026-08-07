@@ -402,30 +402,79 @@ export function settingsPath(): string {
   return join(runtimeHome(), "settings.json");
 }
 
+/**
+ * Why a settings read produced nothing.
+ *
+ * `loadSettings` deliberately collapses all four cases into `{}` — it is a
+ * never-throwing reader that half the codebase calls, and every consumer of a
+ * SETTING is right to treat "no file" and "cannot read the file" alike (both
+ * mean: use the device defaults).
+ *
+ * Two callers are NOT reading a setting, though, and for them the collapse is a
+ * data-loss bug (found by phase 6 of the settings-management plan, live on the
+ * bench): the config-sync watcher, which reads the file to decide what the
+ * OPERATOR changed, and `applyCloudConfig`, which reads it to merge onto. For
+ * those, `{}` from an unreadable file is indistinguishable from "the operator
+ * deleted every namespace" — and the local-writer plane dutifully erased the
+ * cloud's whole desired document on the strength of it. They use
+ * `readSettingsFile` and refuse to act on `unreadable` / `invalid`.
+ *
+ * The real-world trigger is mundane: `sudo xorgate set …` writes a perfectly
+ * good settings.json but leaves it root-owned, and the agent runs as the
+ * provisioning user.
+ */
+export type SettingsReadFailure = "absent" | "unreadable" | "invalid";
+
+export type SettingsReadResult =
+  | { ok: true; settings: AgentSettings }
+  | { ok: false; reason: SettingsReadFailure };
+
+/**
+ * Read settings, distinguishing "there is nothing to read" from "there is
+ * something there and we could not read it". Never throws.
+ */
+export function readSettingsFile(path: string = settingsPath()): SettingsReadResult {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, reason: code === "ENOENT" ? "absent" : "unreadable" };
+  }
+  let obj: unknown;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return { ok: false, reason: "invalid" };
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return { ok: false, reason: "invalid" };
+  }
+  return { ok: true, settings: parseSettingsObject(obj as Record<string, unknown>) };
+}
+
 /** Read persisted settings, or {} when absent/unreadable/invalid. */
 export function loadSettings(path: string = settingsPath()): AgentSettings {
-  try {
-    const obj = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    if (obj && typeof obj === "object") {
-      const out: AgentSettings = {};
-      const mode = (obj as { mode?: unknown }).mode;
-      if (mode === "sim" || mode === "real") out.mode = mode;
-      const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
-      if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
-      const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
-      if (imuMount) out.imuMount = imuMount;
-      const recording = parseRecordingSettings((obj as { recording?: unknown }).recording);
-      if (recording) out.recording = recording;
-      const lteRecovery = parseLteRecoverySettings((obj as { lteRecovery?: unknown }).lteRecovery);
-      if (lteRecovery) out.lteRecovery = lteRecovery;
-      const timeSync = parseTimeSyncSettings((obj as { timeSync?: unknown }).timeSync);
-      if (timeSync) out.timeSync = timeSync;
-      return out;
-    }
-  } catch {
-    /* missing / corrupt — fall through to no overrides */
-  }
-  return {};
+  const res = readSettingsFile(path);
+  return res.ok ? res.settings : {};
+}
+
+/** The allowlist rewriter: every key this agent knows, and nothing else. */
+function parseSettingsObject(obj: Record<string, unknown>): AgentSettings {
+  const out: AgentSettings = {};
+  const mode = (obj as { mode?: unknown }).mode;
+  if (mode === "sim" || mode === "real") out.mode = mode;
+  const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
+  if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
+  const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
+  if (imuMount) out.imuMount = imuMount;
+  const recording = parseRecordingSettings((obj as { recording?: unknown }).recording);
+  if (recording) out.recording = recording;
+  const lteRecovery = parseLteRecoverySettings((obj as { lteRecovery?: unknown }).lteRecovery);
+  if (lteRecovery) out.lteRecovery = lteRecovery;
+  const timeSync = parseTimeSyncSettings((obj as { timeSync?: unknown }).timeSync);
+  if (timeSync) out.timeSync = timeSync;
+  return out;
 }
 
 /** Persist settings atomically (durable across power loss on the Pi). */

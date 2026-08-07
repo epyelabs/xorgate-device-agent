@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   buildConfigReport,
@@ -672,6 +672,75 @@ describe("the settings.json fingerprint watcher", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0].origin).toBe("boot");
     expect(sent[0].changed).toBeUndefined();
+  });
+
+  // The phase-6 incident, in a unit test: `sudo xorgate set …` writes a
+  // perfectly good settings.json but leaves it root-owned, the agent runs as
+  // the provisioning user, and `loadSettings()` answers `{}` — which used to
+  // read as "the operator deleted every namespace" and made the mirror Lambda
+  // erase the cloud's whole desired document.
+  it("never reports a local change when settings.json cannot be read", async () => {
+    saveSettings({
+      mode: "real",
+      gnssAntBias: true,
+      timeSync: { offlineSources: true },
+      imuMount: { enabled: true, rollDeg: 90, pitchDeg: 0, yawDeg: 90 },
+    });
+    ensureConfigSyncBaseline();
+    const baseline = loadConfigSyncState().namespaces;
+    const { sync, sent } = watcher({
+      readSettings: () => ({ ok: false, reason: "unreadable" }),
+    });
+    sync.startWatcher();
+    // Change the file so the fingerprint definitely moves.
+    writeFileSync(settingsPath(), '{"gnssAntBias": true, "mode": "real"}');
+    await delay(40);
+    sync.stop();
+
+    expect(sent).toHaveLength(0);
+    // The baseline must NOT advance either — the next readable poll has to diff
+    // against what the cloud actually believes.
+    expect(sync.syncState.namespaces).toEqual(baseline);
+    expect(sync.syncState.localPending).toBeFalsy();
+  });
+
+  it("says so once, not every tick, while settings.json stays unreadable", async () => {
+    saveSettings({ gnssAntBias: true });
+    ensureConfigSyncBaseline();
+    const events: string[] = [];
+    const { sync, sent } = watcher({
+      readSettings: () => ({ ok: false, reason: "invalid" }),
+      onEvent: (level, msg) => events.push(`${level}: ${msg}`),
+    });
+    sync.startWatcher();
+    writeFileSync(settingsPath(), "{ this is not json");
+    await delay(40); // several 5 ms ticks
+    sync.stop();
+    expect(sent).toHaveLength(0);
+    const warns = events.filter((e) => e.includes("local-change sync paused"));
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain("invalid");
+  });
+
+  it("still treats a genuinely ABSENT settings.json as an erase", async () => {
+    saveSettings({ gnssAntBias: true, timeSync: { offlineSources: true } });
+    ensureConfigSyncBaseline();
+    const { sync, sent } = watcher();
+    sync.startWatcher();
+    rmSync(settingsPath());
+    await delay(40);
+    sync.stop();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].changed).toEqual({ gnssAntBias: null, timeSync: null });
+  });
+
+  it("does not re-baseline off an unreadable file after the worker writes", () => {
+    saveSettings({ gnssAntBias: true, timeSync: { offlineSources: true } });
+    ensureConfigSyncBaseline();
+    const before = loadConfigSyncState().namespaces;
+    const { sync } = watcher({ readSettings: () => ({ ok: false, reason: "unreadable" }) });
+    sync.noteSettingsWritten(["gnssAntBias", "timeSync"]);
+    expect(sync.syncState.namespaces).toEqual(before);
   });
 });
 

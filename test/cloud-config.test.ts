@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { applyCloudConfig, parseCloudConfig } from "../src/agent/cloud-config.js";
 import { loadSettings, saveSettings, settingsPath } from "../src/daemon/settings.js";
 import { cleanup, tempHome } from "./helpers.js";
@@ -121,6 +121,30 @@ describe("applyCloudConfig", () => {
     writeFileSync(settingsPath(), "not json");
     expect(applyCloudConfig({ gnssAntBias: true })).toEqual({ changed: true });
     expect(loadSettings()).toEqual({ gnssAntBias: true });
+  });
+
+  // Phase 6 of the settings-management plan, found on the bench: a file we
+  // cannot READ still holds the operator's settings, and merging onto the `{}`
+  // that loadSettings answers with would write them away — `mode` included.
+  // Corrupt self-heals (above), unreadable must not.
+  it("refuses to overwrite a settings file it cannot read", () => {
+    saveSettings({ mode: "real", timeSync: { offlineSources: false } });
+    chmodSync(settingsPath(), 0o000);
+    try {
+      // Root ignores the mode bits, so only assert when the chmod really bites.
+      let readable = true;
+      try {
+        readFileSync(settingsPath());
+      } catch {
+        readable = false;
+      }
+      if (readable) return;
+      expect(() => applyCloudConfig({ gnssAntBias: true })).toThrow(/cannot be read/);
+    } finally {
+      chmodSync(settingsPath(), 0o600);
+    }
+    // …and the operator's settings are still there.
+    expect(loadSettings()).toEqual({ mode: "real", timeSync: { offlineSources: false } });
   });
 
   it("persists imuMount and no-ops on an identical re-delivery", () => {

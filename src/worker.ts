@@ -37,7 +37,12 @@ import { RecordingManager, type RecordingUploadOptions } from "./recording/manag
 import { LedManager } from "./agent/led-manager.js";
 import type { PowerSampleReading } from "./recording/boot-policy.js";
 import { resolveBridgedCameras } from "./recording/video-capture.js";
-import type { StateSnapshot, TelemetryPayload, TelemetryReading } from "./agent/telemetry.js";
+import type {
+  RecordingStatus,
+  StateSnapshot,
+  TelemetryPayload,
+  TelemetryReading,
+} from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
 import { ensureHome, workerPath } from "./daemon/runtime.js";
 import { removePidfile, writePidfile } from "./daemon/pidfile.js";
@@ -284,16 +289,43 @@ let timer: NodeJS.Timeout | null = null;
  * so this adds no I/O and no poller.
  */
 let ledStarting = true;
+
+/**
+ * `recording.status()` re-reads the persisted counters file on every call, and
+ * DiskManager budgets for that explicitly: *"Tiny file at ~1 Hz call rate —
+ * negligible"*. The publish loop below already spends that 1 Hz, so the LED
+ * reuses its value instead of doubling the rate; it only reads for itself when
+ * that value has gone stale, which happens exactly when the publish loop is not
+ * running (no cloud connection) and nothing else is reading the file at all.
+ *
+ * The LED can afford the staleness: every verdict it consumes is already
+ * hysteresis-debounced over seconds, so a 2 s-old snapshot changes nothing.
+ */
+let lastRecordingStatus: { at: number; value: RecordingStatus } | null = null;
+function noteRecordingStatus(value: RecordingStatus): void {
+  lastRecordingStatus = { at: Date.now(), value };
+}
+function recordingStatusForLed(): RecordingStatus {
+  const now = Date.now();
+  if (!lastRecordingStatus || now - lastRecordingStatus.at >= 2000) {
+    noteRecordingStatus(recording.status());
+  }
+  return lastRecordingStatus!.value;
+}
+
 const led = new LedManager({
   signals: () => ({
     connection: store.snapshot().connection,
-    recording: recording.status(),
+    recording: recordingStatusForLed(),
     lte: source.lteStatus ? { status: source.lteStatus() ?? undefined } : null,
     gnss: source.gnssView?.() ?? null,
     starting: ledStarting,
   }),
 });
-await led.start();
+// Deliberately NOT awaited: init() shells out to `which`/`gpioinfo`, and worker
+// startup must never wait on — or be blocked by — an indicator light. Ticks
+// before it resolves are no-ops (the driver reports unavailable).
+void led.start().catch(() => {});
 
 // Heartbeat: while not yet connected (or reconnecting/closed), force a state
 // flush so a healthy-but-still-connecting daemon never shows as "stale".
@@ -613,6 +645,10 @@ client.on("connect", () => {
       const activeCapture = new Set(
         video.streams.filter((s) => s.recording).map((s) => s.streamKey),
       );
+      // Published fresh, exactly as before; also handed to the LED so it never
+      // needs a second read of the counters file (see recordingStatusForLed).
+      const recordingStatus = recording.status();
+      noteRecordingStatus(recordingStatus);
       const payload: TelemetryPayload = {
         v: 1,
         deviceId: config.deviceId,
@@ -633,7 +669,7 @@ client.on("connect", () => {
         // Phase 2: recording/backlog status rides the live payload (cloud
         // schemas carry the matching optional block; D4 keys the live/batch
         // authority split off recording.enabled).
-        recording: recording.status(),
+        recording: recordingStatus,
       };
       store.setLatest(payload);
       client.publish(config.telemetryTopic, JSON.stringify(payload), { qos: 0 }, (err) => {

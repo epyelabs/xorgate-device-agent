@@ -149,16 +149,28 @@ export function resolveLedState(s: LedSignals): LedState {
   const block = s.recording?.liveBlock;
   const blockReason = typeof block?.reason === "string" ? block.reason : null;
 
-  // Rung 2 — power. `powerShed` is absent at full operation; any value means
-  // the shed ladder has stepped down, which is a power fault whether or not
-  // live streaming happened to be what got parked.
-  if (blockReason === "undervoltage" || typeof s.recording?.powerShed === "string") {
-    return state("undervoltage");
-  }
+  // Rungs 2 and 4 — power vs thermal.
+  //
+  // `liveBlock.reason` is the ADJUDICATED verdict and is consulted first, both
+  // of them, before `powerShed` is considered at all. That ordering is
+  // load-bearing: a thermal shed sets `powerShed` ("no-live") exactly like a
+  // power shed does, because both walk the same ladder. Treating any
+  // `powerShed` as a power fault therefore painted real thermal events red —
+  // observed on the bench, `liveBlock.reason: "thermal"` with
+  // `powerShed: "no-live"` lighting rung 2 — which defeats the whole reason the
+  // two are different colours (plan §5: "so no one has to time a blink to know
+  // which repair to make"). Sending someone to check the PSU of an overheating
+  // box is worse than saying nothing.
+  if (blockReason === "undervoltage") return state("undervoltage");
 
   // Rung 4 — thermal. Milder than power by design: shedding caps at rung 1 and
   // never stops recording, which is why it is cyan rather than red.
   if (blockReason === "thermal") return state("thermal");
+
+  // A shed with no verdict explaining it: nothing has claimed the cause, and
+  // power is both the likelier one and the more urgent to get wrong in the
+  // safe direction.
+  if (typeof s.recording?.powerShed === "string") return state("undervoltage");
 
   // Rung 5 — network.
   //

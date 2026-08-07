@@ -83,6 +83,32 @@ describe("each rung", () => {
     });
   });
 
+  it("4 — a THERMAL shed stays cyan even though it also sets powerShed", () => {
+    // REGRESSION (found on the bench, not in tests): a thermal shed walks the
+    // same ladder as a power shed, so it sets `powerShed: "no-live"` too. The
+    // first cut treated any powerShed as rung 2 and painted real thermal events
+    // red — sending someone to check the PSU of an overheating box.
+    const s = healthy({
+      recording: {
+        ...RECORDING,
+        powerShed: "no-live",
+        liveBlock: { reason: "thermal", detail: "cpu 60.1°C >= 50°C for 15s", since: 1 },
+      },
+    });
+    expect(resolveLedState(s)).toMatchObject({ colour: "cyan", reason: "thermal" });
+  });
+
+  it("2 — an UNDERVOLTAGE shed is red, even though it sets the same powerShed", () => {
+    const s = healthy({
+      recording: {
+        ...RECORDING,
+        powerShed: "no-live",
+        liveBlock: { reason: "undervoltage", detail: "rail 4.66V", since: 1 },
+      },
+    });
+    expect(resolveLedState(s)).toMatchObject({ colour: "red", reason: "undervoltage" });
+  });
+
   it("2 — a powerShed rung is a power fault even with no liveBlock", () => {
     const s = healthy({ recording: { ...RECORDING, powerShed: "no-live" } });
     expect(resolveLedState(s).reason).toBe("undervoltage");

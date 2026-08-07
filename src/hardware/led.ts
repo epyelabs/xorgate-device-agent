@@ -289,10 +289,17 @@ export class LedDriver {
     await this.apply(colour);
   }
 
-  /** Drive every channel low. Safe to call when inert or already dark. */
-  async blank(): Promise<void> {
+  /**
+   * Drive every channel low. Safe to call when inert or already dark.
+   *
+   * `quiet` suppresses the write-failure log. Use it on the shutdown path: that
+   * blank is best-effort and races `process.exit`, so a killed `pinctrl` child
+   * is the EXPECTED outcome, not a fault — logging it would put an alarming
+   * "pin write failed" line in the journal on every single restart.
+   */
+  async blank(opts: { quiet?: boolean } = {}): Promise<void> {
     this.stop();
-    await this.apply("off");
+    await this.apply("off", opts.quiet === true);
   }
 
   /** Cancel a running pattern. Leaves the LED wherever the pattern left it. */
@@ -330,7 +337,7 @@ export class LedDriver {
   }
 
   /** Write one colour to the three channels, blanking on any failure. */
-  private async apply(colour: LedColour): Promise<void> {
+  private async apply(colour: LedColour, quiet = false): Promise<void> {
     if (!this.ready) return;
     const want = LED_COLOURS[colour];
 
@@ -359,7 +366,7 @@ export class LedDriver {
     for (const pin of [this.map.pins.r, this.map.pins.g, this.map.pins.b]) {
       await this.writeChannel(pin, false);
     }
-    if (!this.loggedFailure) {
+    if (!quiet && !this.loggedFailure) {
       this.loggedFailure = true;
       this.log("pin write failed — LED blanked (further failures not logged)");
     }

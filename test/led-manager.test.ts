@@ -30,7 +30,11 @@ function healthy(over: Partial<LedSignals> = {}): LedSignals {
 }
 
 /** `pin=level` writes, and a driver that is available unless told otherwise. */
-function harness(signals: () => LedSignals, ok = true) {
+function harness(
+  signals: () => LedSignals,
+  ok = true,
+  readLte?: () => Promise<{ status?: string } | null>,
+) {
   const writes: string[] = [];
   const logs: string[] = [];
   const driver = new LedDriver({
@@ -41,7 +45,16 @@ function harness(signals: () => LedSignals, ok = true) {
       return true;
     },
   });
-  const led = new LedManager({ signals, driver, log: (m) => logs.push(m) });
+  const led = new LedManager({
+    // The manager sources `lte` itself; the worker never supplies it.
+    signals: () => {
+      const { lte: _ignored, ...rest } = signals();
+      return rest;
+    },
+    readLte: readLte ?? (async () => signals().lte),
+    driver,
+    log: (m) => logs.push(m),
+  });
   return { led, driver, writes, logs };
 }
 
@@ -174,6 +187,60 @@ describe("LedManager", () => {
     expect(writes).toEqual([]);
     expect(led.available).toBe(false);
     expect(logs.some((l) => l.includes("inert"))).toBe(true);
+  });
+
+  it("reads LTE status for itself, not via the publish loop", async () => {
+    // REGRESSION (found on the bench): the manager first borrowed the lte
+    // collector's cached status. That collector only runs from the publish
+    // loop, which mqtt creates inside its `connect` handler — so on a device
+    // that never reaches the cloud it never ran, the status froze at null, and
+    // `dead_zone` could not fire in the one outage it exists for. The LED must
+    // therefore source LTE itself, with no dependency on being connected.
+    let reads = 0;
+    const { led } = harness(
+      () => healthy({ connection: "closed" }), // cloud down: publish loop dead
+      true,
+      async () => {
+        reads++;
+        return { status: "dead_zone" };
+      },
+    );
+    await led.start();
+    led.tick(); // kicks off the first read
+    await settle(30);
+    expect(reads).toBeGreaterThan(0);
+
+    await settle(1100); // past the refresh throttle
+    led.tick();
+    await settle(30);
+    led.tick(); // now resolving with dead_zone in hand
+    await settle(30);
+    expect(reads).toBeGreaterThan(1);
+  });
+
+  it("a dead zone with the cloud down stays green, not purple", async () => {
+    const { led, logs } = harness(() => healthy({ connection: "closed" }), true, async () => ({
+      status: "dead_zone",
+    }));
+    await led.start();
+    led.tick();
+    await settle(30);
+    led.tick(); // second tick sees the resolved LTE read
+    await settle(30);
+    expect(logs.some((l) => l.includes("→ healthy"))).toBe(true);
+    expect(logs.some((l) => l.includes("→ network"))).toBe(false);
+  });
+
+  it("an unreadable LTE file fails open rather than latching a fault", async () => {
+    const { led, logs } = harness(() => healthy(), true, async () => {
+      throw new Error("ENOENT");
+    });
+    await led.start();
+    led.tick();
+    await settle(30);
+    led.tick();
+    await settle(30);
+    expect(logs.some((l) => l.includes("→ healthy"))).toBe(true);
   });
 
   it("never calls the signal function when inert — no wasted work", async () => {

@@ -93,7 +93,6 @@ const source: {
   samplePower?: () => Promise<PowerSampleReading | null>;
   gpsClock?: () => GpsClockReading | null;
   gnssView?: () => GnssView | null;
-  lteStatus?: () => string | null;
 } =
   config.mode === "real"
     ? createCollector(
@@ -317,7 +316,6 @@ const led = new LedManager({
   signals: () => ({
     connection: store.snapshot().connection,
     recording: recordingStatusForLed(),
-    lte: source.lteStatus ? { status: source.lteStatus() ?? undefined } : null,
     gnss: source.gnssView?.() ?? null,
     starting: ledStarting,
   }),

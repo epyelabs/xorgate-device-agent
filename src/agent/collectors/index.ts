@@ -114,22 +114,13 @@ export function createCollector(
    * on a device that can never satisfy it.
    */
   gnssView(): GnssView | null;
-  /**
-   * The LTE daemon's link status string for the status LED. Not publishable
-   * (cloud telemetry leaves are numbers-only), and read from the lte
-   * collector's own per-tick read, so this adds no I/O. null when the signal
-   * capability is off or the daemon file is unreadable — which the LED must
-   * treat as "unknown", never as "down".
-   */
-  lteStatus(): string | null;
 } {
   const collectors: Collector[] = [];
   const system = ioCapabilities.system ? createSystemCollector() : null;
   const gps = ioCapabilities.comm?.gps ? createGpsCollector() : null;
-  const lte = ioCapabilities.comm?.signal ? createLteCollector() : null;
   if (ioCapabilities.sensors?.imu) collectors.push(createImuCollector());
   if (gps) collectors.push(gps);
-  if (lte) collectors.push(lte);
+  if (ioCapabilities.comm?.signal) collectors.push(createLteCollector());
   if (system) collectors.push(system);
 
   // The media collector supervises the KVS WebRTC runtime; it produces the
@@ -191,9 +182,6 @@ export function createCollector(
     gnssView(): GnssView | null {
       if (!gps) return null;
       return { fix: gps.hasFix(), sky: gps.sky().state };
-    },
-    lteStatus(): string | null {
-      return lte?.lastStatus() ?? null;
     },
   };
 }

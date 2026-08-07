@@ -13,11 +13,20 @@
  * worker's existing 1 Hz loop with snapshots it already holds.
  */
 import { LedDriver } from "../hardware/led.js";
+import { readModemTelemetry } from "../hardware/modem.js";
 import { resolveLedState, rung, type LedSignals, type LedState } from "../lib/led-state.js";
 
+/** How stale the cached LTE status may get before another read is kicked off. */
+const LTE_REFRESH_MS = 1000;
+
 export interface LedManagerOptions {
-  /** Signals pulled on each tick. Must not do I/O — pass what the worker holds. */
-  signals: () => LedSignals;
+  /**
+   * Signals pulled on each tick. Must not do I/O — pass what the worker holds.
+   * `lte` is deliberately NOT part of this: see refreshLte().
+   */
+  signals: () => Omit<LedSignals, "lte">;
+  /** Injected in tests; defaults to the daemon's telemetry file. */
+  readLte?: () => Promise<{ status?: string } | null>;
   /** Injected in tests. */
   driver?: LedDriver;
   log?: (msg: string) => void;
@@ -25,16 +34,23 @@ export interface LedManagerOptions {
 
 export class LedManager {
   private readonly driver: LedDriver;
-  private readonly signals: () => LedSignals;
+  private readonly signals: () => Omit<LedSignals, "lte">;
+  private readonly readLte: () => Promise<{ status?: string } | null>;
   private readonly log: (msg: string) => void;
 
   private current: LedState | null = null;
   private overlayRunning = false;
   private stopped = false;
 
+  /** Last LTE daemon status we read, and when. null = unreadable, NOT down. */
+  private lte: { status?: string } | null = null;
+  private lteAt = 0;
+  private lteReading = false;
+
   constructor(opts: LedManagerOptions) {
     this.driver = opts.driver ?? new LedDriver();
     this.signals = opts.signals;
+    this.readLte = opts.readLte ?? (() => readModemTelemetry());
     this.log = opts.log ?? ((msg) => console.log(`[led] ${msg}`));
   }
 
@@ -53,6 +69,11 @@ export class LedManager {
       this.log(`inert: ${init.reason}`);
       return;
     }
+    // Prime the LTE read so the FIRST tick already has a status. Without this a
+    // device booting into an outage shows a spurious ~1 s purple before the
+    // first async read lands — and on a device in a declared dead zone, purple
+    // is exactly the wrong answer.
+    await this.refreshLte();
     // Something is lit from the moment we take over, so the gap between
     // ExecStartPre's white and the first tick is never mistaken for unpowered.
     this.render(rung("starting"));
@@ -64,9 +85,10 @@ export class LedManager {
     // The overlay owns the LED until its flashes finish; a state change during
     // it is picked up by the re-render that follows.
     if (this.overlayRunning) return;
+    void this.refreshLte();
     let next: LedState;
     try {
-      next = resolveLedState(this.signals());
+      next = resolveLedState({ ...this.signals(), lte: this.lte });
     } catch (err) {
       // Fail open (README principle 1): a signal-gathering bug must not light
       // red and must not take the worker down with it.
@@ -108,7 +130,43 @@ export class LedManager {
   stop(): void {
     this.stopped = true;
     this.driver.stop();
-    void this.driver.blank().catch(() => {});
+    // quiet: this races process.exit by design, so a killed pinctrl child is
+    // expected and must not log "pin write failed" on every restart.
+    void this.driver.blank({ quiet: true }).catch(() => {});
+  }
+
+  /**
+   * Kick off a throttled read of the LTE daemon's telemetry file.
+   *
+   * The LED reads this FOR ITSELF rather than borrowing the lte collector's
+   * value, because that collector only runs from the publish loop — and the
+   * publish loop is created inside mqtt's `connect` handler, so on a device
+   * that never reaches the cloud it never runs at all. Borrowing it would have
+   * frozen the status at null in exactly the outage the network rung exists
+   * for, and `dead_zone` (the rule that keeps a settled no-coverage device
+   * green) could never have fired. Verified on the bench: `latest` stayed null
+   * and the LED sat on purple through a forced dead zone.
+   *
+   * The cost is one extra read of a ~500-byte file on **tmpfs** (`/run`) per
+   * second — no disk, no subprocess. Fire-and-forget: this tick uses the
+   * previous read's value, at most ~1 s old, which is nothing next to the
+   * hysteresis already baked into every verdict the ladder consumes.
+   */
+  private refreshLte(): Promise<void> {
+    const now = Date.now();
+    if (this.lteReading || now - this.lteAt < LTE_REFRESH_MS) return Promise.resolve();
+    this.lteReading = true;
+    return this.readLte()
+      .then((t) => {
+        this.lte = t;
+      })
+      .catch(() => {
+        this.lte = null; // unreadable is "unknown", and unknown fails open
+      })
+      .finally(() => {
+        this.lteReading = false;
+        this.lteAt = Date.now();
+      });
   }
 
   private render(next: LedState): void {

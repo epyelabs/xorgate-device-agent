@@ -203,11 +203,22 @@ export function parseBusyPins(gpioinfoOutput: string): number[] {
   return busy;
 }
 
-/** Writes one line. Resolves `false` on any failure — never throws. */
-export type PinWriter = (pin: number, high: boolean) => Promise<boolean>;
+/**
+ * Drives one or more lines to the SAME level in a single call. Resolves `false`
+ * on any failure — never throws.
+ *
+ * Batched deliberately: every call is a process spawn, and `blink-fast` runs 8
+ * transitions a second forever. Writing per-channel made a two-channel colour
+ * (purple, cyan) cost 16 spawns/s — measured at ~3.7% of one core on the bench,
+ * and worst exactly when the device is already in trouble, since the fast
+ * blinks are the fault states. `pinctrl` takes a pin list, so a transition is
+ * now one spawn (two only when some channels rise while others fall).
+ */
+export type PinWriter = (pins: readonly number[], high: boolean) => Promise<boolean>;
 
-export const pinctrlWriter: PinWriter = async (pin, high) => {
-  const res = await run("pinctrl", ["set", String(pin), "op", high ? "dh" : "dl"], {
+export const pinctrlWriter: PinWriter = async (pins, high) => {
+  if (pins.length === 0) return true;
+  const res = await run("pinctrl", ["set", pins.join(","), "op", high ? "dh" : "dl"], {
     timeoutMs: 2000,
   });
   return !res.failed;
@@ -341,45 +352,46 @@ export class LedDriver {
     if (!this.ready) return;
     const want = LED_COLOURS[colour];
 
-    // Skip channels already at the wanted level. Every write is a `pinctrl`
-    // process spawn, and the healthy-device heartbeat toggles four times per
-    // 5.5 s cycle forever — writing all three each time would burn ~2.2
-    // spawns/s to move one pin. The cache is dropped on every stop() (i.e. on
-    // every new colour/pattern), so it only elides toggles WITHIN one running
-    // pattern; anything that changes the pins behind our back is corrected by
-    // the next state change rather than persisting.
+    // Two reductions, both about process spawns rather than GPIO cost:
+    //
+    //  1. Skip channels already at the wanted level. The cache is dropped on
+    //     every stop() (i.e. every new colour/pattern), so it only elides
+    //     toggles WITHIN one running pattern; anything that moves the pins
+    //     behind our back is corrected by the next state change.
+    //  2. Batch what remains by target level, so a transition is ONE spawn
+    //     instead of one per channel.
     const last = this.lastLevels;
-    const ok =
-      (await this.writeIfChanged(this.map.pins.r, want.r, last?.r)) &&
-      (await this.writeIfChanged(this.map.pins.g, want.g, last?.g)) &&
-      (await this.writeIfChanged(this.map.pins.b, want.b, last?.b));
+    const rise: number[] = [];
+    const fall: number[] = [];
+    for (const ch of ["r", "g", "b"] as const) {
+      if (last && last[ch] === want[ch]) continue;
+      (want[ch] ? rise : fall).push(this.map.pins[ch]);
+    }
+
+    const ok = (await this.writeGroup(rise, true)) && (await this.writeGroup(fall, false));
     if (ok) {
       this.lastLevels = { ...want };
       return;
     }
     this.lastLevels = null; // the pins are in an unknown state; trust nothing
 
-    // Fail safe: a half-written colour is a lie. Stop, dark, log once.
+    // Fail safe: a half-written colour is a lie. Stop, dark, log once. All
+    // three go low in one call, cache ignored — we no longer know their state.
     this.generation++;
     this.wake?.();
     this.wake = null;
-    for (const pin of [this.map.pins.r, this.map.pins.g, this.map.pins.b]) {
-      await this.writeChannel(pin, false);
-    }
+    await this.writeGroup([this.map.pins.r, this.map.pins.g, this.map.pins.b], false);
     if (!quiet && !this.loggedFailure) {
       this.loggedFailure = true;
       this.log("pin write failed — LED blanked (further failures not logged)");
     }
   }
 
-  private writeIfChanged(pin: number, lit: boolean, was: boolean | undefined): Promise<boolean> {
-    if (was === lit) return Promise.resolve(true);
-    return this.writeChannel(pin, lit);
-  }
-
-  private async writeChannel(pin: number, lit: boolean): Promise<boolean> {
+  /** Drive a set of channels to one lit/dark state. No pins = nothing to do. */
+  private async writeGroup(pins: readonly number[], lit: boolean): Promise<boolean> {
+    if (pins.length === 0) return true;
     try {
-      return await this.write(pin, this.map.activeHigh ? lit : !lit);
+      return await this.write(pins, this.map.activeHigh ? lit : !lit);
     } catch {
       return false;
     }

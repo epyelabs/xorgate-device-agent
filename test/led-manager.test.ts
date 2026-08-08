@@ -40,8 +40,8 @@ function harness(
   const driver = new LedDriver({
     log: () => {},
     probe: async () => (ok ? { ok: true } : { ok: false, reason: "not a Raspberry Pi" }),
-    write: async (pin, high) => {
-      writes.push(`${pin}=${high ? 1 : 0}`);
+    write: async (pins, high) => {
+      for (const p of pins) writes.push(`${p}=${high ? 1 : 0}`);
       return true;
     },
   });
@@ -55,7 +55,15 @@ function harness(
     driver,
     log: (m) => logs.push(m),
   });
-  return { led, driver, writes, logs };
+  const levels = (): Record<number, number> => {
+    const out: Record<number, number> = {};
+    for (const w of writes) {
+      const [p, v] = w.split("=");
+      out[Number(p)] = Number(v);
+    }
+    return out;
+  };
+  return { led, driver, writes, logs, levels };
 }
 
 /** Let queued microtasks + timers settle. */
@@ -63,10 +71,10 @@ const settle = (ms = 20): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 describe("LedManager", () => {
   it("shows the starting rung as soon as it takes over", async () => {
-    const { led, writes } = harness(() => healthy());
+    const { led, levels } = harness(() => healthy());
     await led.start();
     await settle();
-    expect(writes.slice(0, 3)).toEqual(["12=1", "21=1", "16=1"]); // white
+    expect(levels()).toEqual({ 12: 1, 21: 1, 16: 1 }); // white
   });
 
   it("re-renders only when the resolved state actually changes", async () => {
@@ -96,13 +104,13 @@ describe("LedManager", () => {
 
   it("drives the colour the ladder picked for the signals", async () => {
     let signals = healthy({ starting: false, gnss: { fix: false, sky: "open" } });
-    const { led, writes } = harness(() => signals);
+    const { led, writes, levels } = harness(() => signals);
     await led.start();
     await settle();
     writes.length = 0;
     led.tick();
     await settle();
-    expect(writes.slice(0, 3)).toEqual(["12=0", "21=0", "16=1"]); // blue
+    expect(levels()).toEqual({ 12: 0, 21: 0, 16: 1 }); // blue
 
     signals = healthy({
       recording: { ...RECORDING, liveBlock: { reason: "thermal", detail: "", since: 0 } },
@@ -110,11 +118,11 @@ describe("LedManager", () => {
     writes.length = 0;
     led.tick();
     await settle();
-    expect(writes.slice(0, 3)).toEqual(["12=0", "21=1", "16=1"]); // cyan
+    expect(levels()).toEqual({ 12: 0, 21: 1, 16: 1 }); // cyan
   });
 
   it("flashes white for an applied config, then returns to the real state", async () => {
-    const { led, writes, logs } = harness(() => healthy());
+    const { led, writes, logs, levels } = harness(() => healthy());
     await led.start();
     await settle();
     led.tick(); // settle on green heartbeat
@@ -123,13 +131,13 @@ describe("LedManager", () => {
     writes.length = 0;
     led.configApplied();
     await settle(40);
-    expect(writes.slice(0, 3)).toEqual(["12=1", "21=1", "16=1"]); // white flash
+    expect(levels()).toEqual({ 12: 1, 21: 1, 16: 1 }); // white flash
 
     // flash2 is ~500 ms; afterwards the heartbeat must be running again, NOT
     // left dark. Assert the green triple appears rather than that it is last —
     // the heartbeat is dark ~95% of the time, so the final write usually IS off.
     await settle(700);
-    expect(writes.join(",")).toContain("12=0,21=1,16=0"); // green pulsed again
+    expect(writes.filter((w) => w === "21=1").length).toBeGreaterThan(0); // green pulsed again
     expect(logs.some((l) => l.includes("→ healthy"))).toBe(true);
   });
 
@@ -162,13 +170,13 @@ describe("LedManager", () => {
   });
 
   it("blanks on stop and ignores everything afterwards", async () => {
-    const { led, writes } = harness(() => healthy());
+    const { led, writes, levels } = harness(() => healthy());
     await led.start();
     await settle();
     writes.length = 0;
     led.stop();
     await settle();
-    expect(writes.slice(-3)).toEqual(["12=0", "21=0", "16=0"]);
+    expect(levels()).toEqual({ 12: 0, 21: 0, 16: 0 });
 
     writes.length = 0;
     led.tick();

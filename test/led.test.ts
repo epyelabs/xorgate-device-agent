@@ -14,25 +14,43 @@ import {
   type LedPinMap,
 } from "../src/hardware/led.js";
 
-/** Records writes and always succeeds; `map` fixes pin → channel for assertions. */
+/**
+ * Records writes and always succeeds.
+ *
+ * Assertions are on resulting pin LEVELS and on the number of `pinctrl`
+ * invocations (`calls`) rather than on write order — the driver batches pins by
+ * target level, so order is an implementation detail but the call count is the
+ * thing that costs CPU and is worth pinning.
+ */
 function recorder(map: LedPinMap = STATUS_LED_MAP) {
   const writes: string[] = [];
+  const calls: string[] = [];
   const driver = new LedDriver({
     map,
     log: () => {},
     probe: async () => ({ ok: true }),
-    write: async (pin, high) => {
-      writes.push(`${pin}=${high ? 1 : 0}`);
+    write: async (pins, high) => {
+      calls.push(`${[...pins].join(",")}=${high ? 1 : 0}`);
+      for (const p of pins) writes.push(`${p}=${high ? 1 : 0}`);
       return true;
     },
   });
-  return { driver, writes };
+  /** Latest level written per pin, i.e. what the LED is actually showing. */
+  const levels = (): Record<number, number> => {
+    const out: Record<number, number> = {};
+    for (const w of writes) {
+      const [p, v] = w.split("=");
+      out[Number(p)] = Number(v);
+    }
+    return out;
+  };
+  return { driver, writes, calls, levels };
 }
 
-/** The three writes a colour should produce on the hardcoded Argus map. */
-function triple(colour: LedColour): string[] {
+/** Expected pin levels for a colour on the hardcoded Argus map. */
+function triple(colour: LedColour): Record<number, number> {
   const { r, g, b } = LED_COLOURS[colour];
-  return [`12=${+r}`, `21=${+g}`, `16=${+b}`];
+  return { 12: +r, 21: +g, 16: +b };
 }
 
 describe("colour → channels", () => {
@@ -53,18 +71,18 @@ describe("colour → channels", () => {
 
   it("writes each colour to the hardcoded Argus pins, active high", async () => {
     for (const colour of ["red", "green", "blue", "purple", "cyan", "white", "off"] as const) {
-      const { driver, writes } = recorder();
+      const { driver, levels } = recorder();
       await driver.init();
       await driver.set(colour);
-      expect(writes, colour).toEqual(triple(colour));
+      expect(levels(), colour).toEqual(triple(colour));
     }
   });
 
   it("inverts the channels when the map is active low", async () => {
-    const { driver, writes } = recorder({ ...STATUS_LED_MAP, activeHigh: false });
+    const { driver, levels } = recorder({ ...STATUS_LED_MAP, activeHigh: false });
     await driver.init();
     await driver.set("red");
-    expect(writes).toEqual(["12=0", "21=1", "16=1"]);
+    expect(levels()).toEqual({ 12: 0, 21: 1, 16: 1 });
   });
 });
 
@@ -106,24 +124,24 @@ describe("pattern → timeline", () => {
 
 describe("pattern playback", () => {
   it("ends a non-repeating pattern dark rather than latched on its last flash", async () => {
-    const { driver, writes } = recorder();
+    const { driver, levels } = recorder();
     await driver.init();
     await driver.play("white", "flash2");
-    expect(writes.slice(-3)).toEqual(triple("off"));
+    expect(levels()).toEqual(triple("off"));
   });
 
   it("leaves solid lit — it is only cancelled by stop()", async () => {
-    const { driver, writes } = recorder();
+    const { driver, levels } = recorder();
     await driver.init();
     const running = driver.play("red", "solid");
     await new Promise((r) => setTimeout(r, 10));
     driver.stop();
     await running;
-    expect(writes).toEqual(triple("red"));
+    expect(levels()).toEqual(triple("red"));
   });
 
   it("stops a repeating pattern and blanks on demand", async () => {
-    const { driver, writes } = recorder();
+    const { driver, writes, levels } = recorder();
     await driver.init();
     const running = driver.play("purple", "blink-fast");
     await new Promise((r) => setTimeout(r, 300));
@@ -131,13 +149,13 @@ describe("pattern playback", () => {
     await running;
     await driver.blank();
     expect(writes.length).toBeGreaterThan(3); // it actually toggled
-    expect(writes.slice(-3)).toEqual(triple("off"));
+    expect(levels()).toEqual(triple("off"));
   });
 });
 
 describe("write elision", () => {
   it("only writes channels that change within a running pattern", async () => {
-    const { driver, writes } = recorder();
+    const { driver, writes, calls } = recorder();
     await driver.init();
     const running = driver.play("green", "blink-slow");
     await new Promise((r) => setTimeout(r, 1300)); // ~2 more transitions
@@ -145,21 +163,47 @@ describe("write elision", () => {
     await running;
 
     // The first apply drives all three; after that only GPIO21 (green) moves.
-    expect(writes.slice(0, 3)).toEqual(triple("green"));
     const afterFirst = writes.slice(3);
     expect(afterFirst.length).toBeGreaterThan(0);
     expect(afterFirst.every((w) => w.startsWith("21="))).toBe(true);
+    // ...and only the very first apply ever touches red/blue; every later
+    // transition is a single-pin call.
+    expect(calls.filter((c) => c.includes("12") || c.includes("16"))).toHaveLength(1);
+    expect(calls.slice(2).every((c) => c === "21=1" || c === "21=0")).toBe(true);
+  });
+
+  it("costs ONE pinctrl call per transition, even for a two-channel colour", async () => {
+    // REGRESSION (seen in the field): purple blink-fast wrote each channel
+    // separately — 8 transitions/s x 2 channels = 16 process spawns a second,
+    // ~3.7% of one core, and worst exactly when the device is already in
+    // trouble since the fast blinks are the fault states.
+    const { driver, calls } = recorder();
+    await driver.init();
+    const running = driver.play("purple", "blink-fast");
+    await new Promise((r) => setTimeout(r, 700)); // ~5 transitions
+    driver.stop();
+    await running;
+
+    // The opening apply emits two calls (12,16 rise + 21 fall); everything
+    // after that is one call per transition.
+    const transitions = calls.slice(2);
+    expect(transitions.length).toBeGreaterThan(3);
+    // Purple toggles R and B together, so every transition is one batched call.
+    for (const c of transitions) {
+      expect(c === "12,16=1" || c === "12,16=0").toBe(true);
+    }
   });
 
   it("always writes all three on a new state, never trusting a stale cache", async () => {
     // A bench operator running `xorgate led purple` behind the agent's back
     // would otherwise leave red/blue latched through the next pattern.
-    const { driver, writes } = recorder();
+    const { driver, writes, levels } = recorder();
     await driver.init();
     await driver.set("green");
     writes.length = 0;
     await driver.set("green"); // same colour, but a NEW state
-    expect(writes).toEqual(triple("green"));
+    expect(writes.length).toBe(3); // all three re-driven
+    expect(levels()).toEqual(triple("green"));
   });
 
   it("writes all three on the fail-safe blank even if they look unchanged", async () => {
@@ -169,8 +213,8 @@ describe("write elision", () => {
       map: STATUS_LED_MAP,
       log: () => {},
       probe: async () => ({ ok: true }),
-      write: async (pin, high) => {
-        writes.push(`${pin}=${high ? 1 : 0}`);
+      write: async (pins, high) => {
+        for (const p of pins) writes.push(`${p}=${high ? 1 : 0}`);
         return !fail;
       },
     });
@@ -240,10 +284,10 @@ describe("failure posture", () => {
       map: STATUS_LED_MAP,
       log: (m) => logs.push(m),
       probe: async () => ({ ok: true }),
-      // The green channel is broken; red has already been driven high by then.
-      write: async (pin, high) => {
-        writes.push(`${pin}=${high ? 1 : 0}`);
-        return pin !== 21;
+      // Any batch touching the green channel fails.
+      write: async (pins, high) => {
+        for (const p of pins) writes.push(`${p}=${high ? 1 : 0}`);
+        return !pins.includes(21);
       },
     });
     await driver.init();
@@ -264,8 +308,8 @@ describe("failure posture", () => {
       map: STATUS_LED_MAP,
       log: () => {},
       probe: async () => ({ ok: true }),
-      write: async (pin, high) => {
-        writes.push(`${pin}=${high ? 1 : 0}`);
+      write: async (pins, high) => {
+        for (const p of pins) writes.push(`${p}=${high ? 1 : 0}`);
         return !fail;
       },
     });
@@ -277,7 +321,7 @@ describe("failure posture", () => {
     const after = writes.length;
     await new Promise((r) => setTimeout(r, 400));
     expect(writes.length).toBe(after); // nothing kept toggling
-    expect(writes.slice(-3)).toEqual(triple("off"));
+    expect(writes.slice(-3)).toEqual(["12=0", "21=0", "16=0"]);
   });
 
   it("survives a writer that throws", async () => {
@@ -301,8 +345,8 @@ describe("self-gating off-device", () => {
       map: STATUS_LED_MAP,
       log: () => {},
       probe: async () => ({ ok: false, reason: "not a Raspberry Pi" }),
-      write: async (pin) => {
-        writes.push(String(pin));
+      write: async (pins) => {
+        for (const p of pins) writes.push(String(p));
         return true;
       },
     });

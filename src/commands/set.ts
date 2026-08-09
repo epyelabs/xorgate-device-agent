@@ -55,6 +55,7 @@
  *   timeSync.maxStepsPerBoot <1-20>
  */
 import {
+  APN_RE,
   loadSettings,
   parseRecordingSettings,
   parseTimeSyncSettings,
@@ -67,6 +68,9 @@ import {
   type RecordingSettings,
   type TimeSyncSettings,
 } from "../daemon/settings.js";
+import { parseApnTelemetry } from "../agent/config-sync.js";
+import { readModemTelemetry } from "../hardware/modem.js";
+import type { ModemCellularTelemetry } from "../hardware/modem.js";
 import { pidPath, runtimeHome } from "../daemon/runtime.js";
 import { fileOwner, isRoot, usernameForUid } from "../lib/privilege.js";
 import { inspect, restart } from "../daemon/manager.js";
@@ -80,7 +84,7 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>)";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, apn <value|\"\"> [--no-wait], wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>)";
 
 /** Parse an on/off/true/false/1/0 CLI value; undefined when unrecognizable. */
 function parseBoolValue(v: string | undefined): boolean | undefined {
@@ -379,6 +383,9 @@ export async function setCommand(rest: string[]): Promise<void> {
     );
     process.exitCode = 1;
     return;
+  } else if (key === "apn") {
+    await setApnCommand(value, rest.includes("--no-wait"));
+    return;
   } else if (key === "gps-antenna") {
     if (value !== "active" && value !== "passive") {
       console.error(`gps-antenna must be 'active' or 'passive', got '${value ?? ""}'`);
@@ -422,7 +429,7 @@ export async function setCommand(rest: string[]): Promise<void> {
     return;
   } else {
     console.error(
-      `unknown setting '${key}' (supported: mode, gps-antenna, gps-fix-reset-policy, deadzone-profile, wifi, recording.*, timeSync.*)`,
+      `unknown setting '${key}' (supported: mode, gps-antenna, gps-fix-reset-policy, deadzone-profile, apn, wifi, recording.*, timeSync.*)`,
     );
     process.exitCode = 1;
     return;
@@ -452,6 +459,146 @@ export async function setCommand(rest: string[]): Promise<void> {
     console.error("  on systemd installs, run: sudo systemctl restart xorgate-agent");
     process.exitCode = 1;
   }
+}
+
+/** Poll cadence + overall patience for the APN outcome watch. */
+const APN_WATCH_POLL_MS = 3000;
+const APN_WATCH_MAX_MS = 8 * 60_000;
+/** How long a silent telemetry file means "this daemon predates the feature". */
+const APN_WATCH_OLD_DAEMON_MS = 90_000;
+
+const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function readApnBlock(): Promise<ModemCellularTelemetry | undefined> {
+  const tel = await readModemTelemetry();
+  return parseApnTelemetry(tel?.cellular);
+}
+
+/**
+ * `xorgate set apn <value|"">` — the LOCAL path, and the one that actually
+ * recovers a stranded device (Phase 2 §4c): on an LTE-only box a wrong APN
+ * means no data, so no cloud, so the corrective setting can never arrive over
+ * MQTT — a tech on site with SSH or console is the recovery story, and this is
+ * their command.
+ *
+ * Same conduit as every sibling: write settings.json, the sim7600-lte daemon
+ * polls it (~30 s) and applies with confirm-and-rollback; the agent's watcher
+ * then reports the local change upstream so it becomes the cloud's desired
+ * value instead of being reverted on reconnect.
+ *
+ * Unlike every other `set` key this one takes minutes to prove itself, so the
+ * command WATCHES the outcome by default: a silent "✓ saved" that quietly
+ * rolls back 90 s later is the worst possible ergonomics for someone standing
+ * in a parking lot. `--no-wait` skips the watch; Ctrl-C is always safe (the
+ * daemon's apply is autonomous).
+ *
+ * There is deliberately NO danger gate here: that guard exists to warn about
+ * losing REMOTE access, and someone at the console has none to lose.
+ */
+async function setApnCommand(value: string | undefined, noWait: boolean): Promise<void> {
+  if (value === undefined) {
+    console.error('usage: xorgate set apn <value>   (or "" to leave the modem\'s stored APN alone)');
+    process.exitCode = 1;
+    return;
+  }
+  if (!APN_RE.test(value)) {
+    console.error(
+      `apn must be at most 100 letters, digits, dots or hyphens, got '${value}'`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const before = await readApnBlock();
+
+  const next: AgentSettings = { ...loadSettings() };
+  next.cellular = { ...next.cellular, apn: value };
+  saveSettings(next);
+
+  if (value === "") {
+    console.log("✓ apn cleared (persisted to settings.json)");
+    console.log("  the modem's stored APN is left untouched — nothing will be written to it");
+    return;
+  }
+  console.log(`✓ apn = "${value}" (persisted to settings.json)`);
+
+  if (before?.apn_applied === value && before.state === "in-force") {
+    console.log("  already in force — the modem's data context holds this APN.");
+    return;
+  }
+  if (before?.state === "rejected" && before.apn_requested === value) {
+    console.error(
+      `✗ this exact value has already failed ${before.fails ?? "several"} times and is rejected — ` +
+        "the daemon will not retry it. Change the value to get another attempt.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (noWait) {
+    console.log(
+      "  the modem daemon applies it with confirm-and-rollback within a few minutes " +
+        "(journalctl -u sim7600-lte)",
+    );
+    return;
+  }
+
+  console.log(
+    "  waiting for the modem daemon to apply and confirm (cellular will drop briefly; " +
+      "Ctrl-C is safe — the apply continues on its own)...",
+  );
+  const started = Date.now();
+  const baseline = JSON.stringify(before ?? null);
+  let sawApplying = false;
+  while (Date.now() - started < APN_WATCH_MAX_MS) {
+    await sleepMs(APN_WATCH_POLL_MS);
+    const cur = await readApnBlock();
+    if (cur === undefined) {
+      if (Date.now() - started > APN_WATCH_OLD_DAEMON_MS) {
+        console.error(
+          "✗ the modem daemon is not reporting any APN machinery — it likely predates this " +
+            "feature and will NEVER apply the change. Update the agent (xorgate update).",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      continue;
+    }
+    // Only fresh news counts: a rolled-back/rejected verdict identical to the
+    // pre-save block is history, not the outcome of THIS save.
+    if (JSON.stringify(cur) === baseline) continue;
+    if (cur.state === "applying" && cur.apn_requested === value) {
+      if (!sawApplying) {
+        console.log("  applying — confirming with real traffic over the cellular link...");
+        sawApplying = true;
+      }
+      continue;
+    }
+    if (cur.state === "in-force" && cur.apn_applied === value) {
+      console.log(`✓ confirmed: "${value}" is in force (data verified end-to-end).`);
+      return;
+    }
+    if (cur.state === "rolled-back" && cur.apn_requested === value) {
+      console.error(
+        `✗ rolled back: "${value}" passed no traffic${cur.last_error ? ` (${cur.last_error})` : ""}. ` +
+          `The device restored "${cur.apn_applied ?? "the previous APN"}" and is recovering. ` +
+          `Attempt ${cur.fails ?? "?"}/${3}; the daemon retries the value until it is rejected.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    if (cur.state === "rejected" && cur.apn_requested === value) {
+      console.error(
+        `✗ rejected: "${value}" failed ${cur.fails ?? "too many"} times${cur.last_error ? ` (${cur.last_error})` : ""}. ` +
+          "Change the value to get another attempt.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+  }
+  console.log(
+    "  no verdict after 8 minutes — the apply may be deferred (device unregistered?). " +
+      "Watch journalctl -u sim7600-lte, or re-run `xorgate set apn` later.",
+  );
 }
 
 /**

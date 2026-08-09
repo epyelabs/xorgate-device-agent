@@ -1079,6 +1079,7 @@ describe("apply classes", () => {
       recording: "agent-poll",
       lteRecovery: "modem-poll",
       timeSync: "agent-poll",
+      cellular: "modem-poll",
     });
   });
 });

@@ -35,9 +35,22 @@ import { atomicWriteJson } from "../lib/atomicWrite.js";
 import { runtimeHome } from "../daemon/runtime.js";
 import { run, type RunResult } from "../lib/exec.js";
 
-export type DeviceCommandName = "reboot" | "power_off";
+/**
+ * `refresh` (manage_sim_card_info plan, Phase 2 §4d) is the one READ-ONLY
+ * command: re-probe what the device can (SIM identity, applied APN, antenna
+ * bias) and publish a fresh config report now. It reuses this module's TTL +
+ * ledger guards unchanged — they cost nothing and a QoS-1 redelivery storm
+ * re-probing the modem repeatedly is still worth suppressing — but it is
+ * executed in-process by the worker (touch a flag file + re-report), never via
+ * `executeCommand`'s sudo path.
+ */
+export type DeviceCommandName = "reboot" | "power_off" | "refresh";
 
-const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>(["reboot", "power_off"]);
+const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>([
+  "reboot",
+  "power_off",
+  "refresh",
+]);
 
 /**
  * Hard ceiling on how long a command stays valid, measured from the issuing
@@ -173,6 +186,17 @@ export function executeCommand(
   command: DeviceCommandName,
   runner: (cmd: string, args: string[]) => Promise<RunResult> = run,
 ): Promise<RunResult> {
+  if (command === "refresh") {
+    // Never reaches sudo: the worker handles refresh in-process. Guarded here
+    // so a future caller cannot accidentally route it into systemctl.
+    return Promise.resolve<RunResult>({
+      failed: true,
+      notFound: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "refresh is handled in-process, not via executeCommand",
+    });
+  }
   const verb = command === "reboot" ? "reboot" : "poweroff";
   return runner("sudo", ["-n", "systemctl", verb]);
 }

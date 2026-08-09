@@ -40,11 +40,13 @@
  */
 import {
   readSettingsFile,
+  parseCellularSettings,
   parseLteRecoverySettings,
   parseRecordingSettings,
   parseTimeSyncSettings,
   saveSettings,
   settingsPath,
+  type CellularSettings,
   type LteRecoverySettings,
   type RecordingSettings,
   type TimeSyncSettings,
@@ -95,6 +97,15 @@ export interface CloudConfig {
    * absent = never cloud-configured, leave local settings alone.
    */
   timeSync?: TimeSyncSettings | null;
+  /**
+   * Cellular data context / APN (manage_sim_card_info plan, Phase 2). Same
+   * replace-whole-namespace semantics: null = carried but nothing valid →
+   * remove the local key (daemon leaves modem NV alone); absent = never
+   * cloud-configured, leave local settings alone. NOTE parseCellularSettings
+   * DROPS an invalid apn rather than repairing it — a "fixed" APN is a
+   * different APN, and a wrong one strands a device.
+   */
+  cellular?: CellularSettings | null;
   /**
    * Segment-upload S3 bucket (Phase 6.2 backfill for devices fielded before
    * Phase 2 provisioning). Persisted into kvs.json — NOT settings.json — by
@@ -178,6 +189,10 @@ function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   if (timeSync && typeof timeSync === "object" && !Array.isArray(timeSync)) {
     out.timeSync = parseTimeSyncSettings(timeSync) ?? null;
   }
+  const cellular = (obj as { cellular?: unknown }).cellular;
+  if (cellular && typeof cellular === "object" && !Array.isArray(cellular)) {
+    out.cellular = parseCellularSettings(cellular) ?? null;
+  }
   return out;
 }
 
@@ -260,12 +275,22 @@ export function applyCloudConfig(
       timeSyncChange = target ? "set" : "clear";
     }
   }
+  // ... and for the cellular namespace. Clearing removes the local key, which
+  // the daemon reads as "leave the modem's stored APN alone" — never a write.
+  let cellularChange: "set" | "clear" | undefined;
+  if (config.cellular !== undefined) {
+    const target = config.cellular ?? undefined;
+    if (JSON.stringify(target) !== JSON.stringify(current.cellular)) {
+      cellularChange = target ? "set" : "clear";
+    }
+  }
   if (
     Object.keys(next).length === 0 &&
     imuMountChange === undefined &&
     recordingChange === undefined &&
     lteRecoveryChange === undefined &&
-    timeSyncChange === undefined
+    timeSyncChange === undefined &&
+    cellularChange === undefined
   ) {
     return { changed: false };
   }
@@ -278,6 +303,8 @@ export function applyCloudConfig(
   else if (lteRecoveryChange === "clear") delete merged.lteRecovery;
   if (timeSyncChange === "set") merged.timeSync = config.timeSync as TimeSyncSettings;
   else if (timeSyncChange === "clear") delete merged.timeSync;
+  if (cellularChange === "set") merged.cellular = config.cellular as CellularSettings;
+  else if (cellularChange === "clear") delete merged.cellular;
   saveSettings(merged, path);
   return { changed: true };
 }

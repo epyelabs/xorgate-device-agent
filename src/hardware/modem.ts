@@ -112,6 +112,32 @@ export interface ModemSimTelemetry {
   checked_at?: string | null;
 }
 
+/** APN apply-machinery state as the daemon reports it (Phase 2). */
+export type ApnState = "in-force" | "applying" | "rolled-back" | "rejected";
+
+/**
+ * APN apply machinery (daemon `write_telemetry` `cellular` object, Phase 2).
+ *
+ * ABSENT on a daemon predating Phase 2 — and that absence is LOAD-BEARING: it
+ * means the device has no confirm-and-rollback safety net, so a UI must refuse
+ * to write the `cellular` namespace to it. `apn_applied` is the modem's NV
+ * truth (AT+CGDCONT? context 1), which is what `effective.cellular.apn`
+ * mirrors — never the requested value.
+ */
+export interface ModemCellularTelemetry {
+  state?: ApnState;
+  /** The APN in the modem's data context. Absent while never read / NV empty. */
+  apn_applied?: string;
+  /** Last non-empty desired value seen. Absent when nothing was ever asked. */
+  apn_requested?: string;
+  /** Why the last apply rolled back / was rejected. Absent after a clean apply. */
+  last_error?: string;
+  /** Failed applies of apn_requested — capped, keyed on the value. */
+  fails?: number;
+  /** ISO ts of the last state transition. */
+  changed_at?: string | null;
+}
+
 /**
  * Which interface carries the default route (Phase 1). Cheap `ip route` reads,
  * no AT traffic. Phase 2 scales its confirm-before-apply friction off
@@ -163,6 +189,8 @@ export interface ModemTelemetry {
   recovery?: ModemRecoveryTelemetry;
   /** SIM identity (absent on daemons predating manage_sim_card_info Phase 1, or before the first probe). */
   sim?: ModemSimTelemetry | null;
+  /** APN apply machinery (absent on daemons predating Phase 2 = no rollback net). */
+  cellular?: ModemCellularTelemetry | null;
   /** Default-route uplink (absent on daemons predating manage_sim_card_info Phase 1). */
   uplink?: ModemUplinkTelemetry;
 }

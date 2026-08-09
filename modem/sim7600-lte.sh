@@ -161,7 +161,20 @@ MODEM_TEMP_INTERVAL="${SIM7600_MODEM_TEMP_INTERVAL:-30}"
 # physically fixed while the device is powered, so the IDENTITY fields behind it
 # (ICCID, MSISDN) are read once and cached; only presence is re-checked, and
 # only this slowly. See maybe_update_sim.
-SIM_CHECK_INTERVAL="${SIM7600_SIM_CHECK_INTERVAL:-60}"
+#
+# Why 10 minutes and not faster: the block's only consumer is the agent's config
+# REPORT, which reaches the cloud on connect, on a config change, and otherwise
+# on an HOURLY heartbeat (DEFAULT_HEARTBEAT_MS). Nothing reads it faster — the
+# monitor TUI does not display SIM state. A 60 s poll therefore produced ~60
+# samples an hour that nobody ever saw. This is still 6x finer than the
+# consumer, and the cases that actually matter do not wait for the timer: the
+# first probe fires immediately at start-up, and a modem reset invalidates the
+# cache and re-arms this throttle (gnss_recover_after_reset).
+#
+# Bench note: a SIM-pull test waits up to this long for the state to flip.
+# Override with SIM7600_SIM_CHECK_INTERVAL=30 in a systemd drop-in to speed it
+# up, and remove the drop-in afterwards.
+SIM_CHECK_INTERVAL="${SIM7600_SIM_CHECK_INTERVAL:-600}"
 
 # GPS / GNSS
 ENABLE_GPS="${SIM7600_ENABLE_GPS:-1}"   # set 0 to skip enabling GNSS

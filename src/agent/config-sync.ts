@@ -788,6 +788,8 @@ export interface ConfigSyncOptions {
    */
   settleMs?: number;
   settleReports?: number;
+  /** Boot-race re-check cadence (see armModemArrivalWatch). */
+  modemArrivalMs?: number;
 }
 
 const DEFAULT_DEBOUNCE_MS = 2000;
@@ -821,6 +823,15 @@ const DEFAULT_WATCH_MS = 5000;
 const DEFAULT_SETTLE_MS = 40_000;
 const DEFAULT_SETTLE_REPORTS = 3;
 
+/**
+ * Boot-race watch (armModemArrivalWatch). 30 s x 20 = a 10-minute window, which
+ * covers a cold modem boot including a `configure_gnss` CRESET, then gives up.
+ * Each tick is one tmpfs read of a file the lte collector already reads every
+ * second, so the cost is nil next to being an hour stale.
+ */
+const DEFAULT_MODEM_ARRIVAL_MS = 30_000;
+const MODEM_ARRIVAL_TRIES = 20;
+
 /** `cloud` outranks `boot` when both are pending in the same window. */
 const ORIGIN_RANK: Record<ReportOrigin, number> = { boot: 0, cloud: 1, local: 2 };
 
@@ -839,6 +850,10 @@ export class ConfigSync {
   private timer: NodeJS.Timeout | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
   private settleTimer: NodeJS.Timeout | null = null;
+  /** Boot-race watch: armed only until the modem daemon first speaks. */
+  private modemArrivalTimer: NodeJS.Timeout | null = null;
+  private modemArrivalTries = 0;
+  private modemSeen = false;
   private watcher: NodeJS.Timeout | null = null;
   /** Settle re-reports left for the current desired rev (see DEFAULT_SETTLE_*). */
   private settleBudget = 0;
@@ -1080,10 +1095,12 @@ export class ConfigSync {
     if (this.timer) clearTimeout(this.timer);
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.settleTimer) clearTimeout(this.settleTimer);
+    if (this.modemArrivalTimer) clearTimeout(this.modemArrivalTimer);
     if (this.watcher) clearInterval(this.watcher);
     this.timer = null;
     this.heartbeat = null;
     this.settleTimer = null;
+    this.modemArrivalTimer = null;
     this.watcher = null;
   }
 
@@ -1139,9 +1156,72 @@ export class ConfigSync {
       }
       this.persist(patch);
       this.scheduleSettleReport(report);
+      this.watchForModemArrival(report);
     } catch (err) {
       this.opts.onEvent?.("warn", `config report failed: ${(err as Error).message}`);
     }
+  }
+
+  /**
+   * The BOOT RACE, observed on the bench 2026-08-09 after a power cycle.
+   *
+   * The agent connects and reports long before the modem daemon has anything to
+   * say. Measured on a cold boot: device up at 17:25:03, agent report at
+   * 17:25:59, the daemon's first SIM probe at **17:27:13** — 74 s too late. The
+   * report therefore carried no `sim`, and the next scheduled report is the
+   * HOURLY heartbeat, so the cloud showed "this device has not reported its SIM
+   * yet" for an hour after every reboot while the device held the answer all
+   * along.
+   *
+   * `scheduleSettleReport` does not cover this: it watches `status`, and `sim`
+   * is reported-only so it never has one. The daemon's start-up cost is also
+   * unbounded in practice — `configure_gnss` can issue a CRESET, adding minutes
+   * — so a couple of 40 s retries would not be enough either.
+   *
+   * So: poll the telemetry file on a slow cadence and fire exactly one extra
+   * report the moment the modem has something to say. One-shot per process —
+   * once seen, this never runs again. Bounded by MODEM_ARRIVAL_TRIES so a device
+   * with no modem, or an agent paired with a daemon predating this plan, gives
+   * up instead of polling forever.
+   */
+  private armModemArrivalWatch(): void {
+    if (this.stopped || this.modemArrivalTimer || this.modemSeen) return;
+    if (this.modemArrivalTries >= MODEM_ARRIVAL_TRIES) return;
+    this.modemArrivalTimer = setTimeout(() => {
+      this.modemArrivalTimer = null;
+      void (async () => {
+        if (this.stopped || this.modemSeen) return;
+        this.modemArrivalTries += 1;
+        try {
+          const sample = await (this.opts.modem ?? readModemBias)(
+            (this.opts.now ?? Date.now)(),
+          );
+          if (sample.sim !== undefined || sample.uplink !== undefined) {
+            this.modemSeen = true;
+            this.opts.onEvent?.(
+              "info",
+              "modem telemetry arrived after the boot report — re-reporting",
+            );
+            this.request("boot");
+            return;
+          }
+        } catch {
+          /* a failed probe is a missed tick, never a thrown error */
+        }
+        this.armModemArrivalWatch();
+      })();
+    }, this.opts.modemArrivalMs ?? DEFAULT_MODEM_ARRIVAL_MS);
+    this.modemArrivalTimer.unref?.();
+  }
+
+  /** Latch once the modem has spoken; otherwise keep watching for it. */
+  private watchForModemArrival(report: ConfigReport): void {
+    const eff = report.effective;
+    if (eff.sim !== undefined || eff.uplink !== undefined) {
+      this.modemSeen = true;
+      return;
+    }
+    this.armModemArrivalWatch();
   }
 
   /**

@@ -168,6 +168,96 @@ describe("effective values", () => {
   });
 });
 
+describe("the boot race — modem telemetry arriving after the first report", () => {
+  /**
+   * Reproduces the bench failure of 2026-08-09. After a power cycle: device up
+   * 17:25:03, agent report 17:25:59, the daemon's first SIM probe 17:27:13 — so
+   * the report carried no `sim`, and the next scheduled one was the HOURLY
+   * heartbeat. The UI read "this device has not reported its SIM yet" for an
+   * hour while the device held the answer the whole time.
+   *
+   * `scheduleSettleReport` cannot cover it: that watches `status`, and `sim` is
+   * reported-only so it never has one.
+   */
+  function harness(modem: () => Promise<ModemBiasSample>): {
+    sync: ConfigSync;
+    sent: ConfigReport[];
+  } {
+    const sent: ConfigReport[] = [];
+    const sync = new ConfigSync({
+      deviceId: "dev-1",
+      topic: "t",
+      publish: (_t, p) => sent.push(JSON.parse(p) as ConfigReport),
+      settings: () => ({}),
+      modem,
+      debounceMs: 1,
+      modemArrivalMs: 10,
+    });
+    return { sync, sent };
+  }
+
+  it("re-reports on its own once the daemon finally speaks", async () => {
+    // The daemon is still booting for the first two reads, then publishes.
+    let reads = 0;
+    const { sync, sent } = harness(async () => {
+      reads += 1;
+      return reads <= 2
+        ? { value: null, fresh: false, detail: "modem telemetry unavailable" }
+        : { value: true, fresh: true, sim: { state: "ready", present: 1 } };
+    });
+
+    await sync.publishReport("boot");
+    expect(sent).toHaveLength(1);
+    expect(sent[0].effective).not.toHaveProperty("sim");
+
+    await delay(120);
+    sync.stop();
+
+    // Without the watch this stays at 1 until the hourly heartbeat.
+    expect(sent.length).toBeGreaterThan(1);
+    expect(sent.at(-1)!.effective).toHaveProperty("sim");
+  });
+
+  it("does not arm the watch at all when the modem already spoke", async () => {
+    let reads = 0;
+    const { sync, sent } = harness(async () => {
+      reads += 1;
+      return { value: true, fresh: true, sim: { state: "ready", present: 1 } };
+    });
+    await sync.publishReport("boot");
+    const readsAfterFirst = reads;
+    await delay(120);
+    sync.stop();
+    expect(sent).toHaveLength(1); // no extra report
+    expect(reads).toBe(readsAfterFirst); // and no polling
+  });
+
+  it("gives up instead of polling forever on a device with no modem", async () => {
+    // An old daemon, or a box with no modem at all: the watch must be bounded.
+    let reads = 0;
+    const { sync, sent } = harness(async () => {
+      reads += 1;
+      return { value: null, fresh: false, detail: "modem telemetry unavailable" };
+    });
+    await sync.publishReport("boot");
+    await delay(300);
+    sync.stop();
+    expect(sent).toHaveLength(1);
+    expect(reads).toBeLessThanOrEqual(21); // MODEM_ARRIVAL_TRIES + the report's own read
+  });
+
+  it("survives a probe that throws", async () => {
+    const { sync, sent } = harness(async () => {
+      throw new Error("telemetry exploded");
+    });
+    // The report itself swallows it; the watch must not throw into a timer.
+    await sync.publishReport("boot");
+    await delay(60);
+    sync.stop();
+    expect(sent.length).toBeGreaterThanOrEqual(0); // no unhandled rejection
+  });
+});
+
 describe("parseSimTelemetry", () => {
   it("accepts a full block from the daemon", () => {
     expect(

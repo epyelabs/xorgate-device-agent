@@ -396,7 +396,12 @@ gnss_health_state() {
 #     "carrier":      operator name, key omitted until known
 #     "act":          "2g"|"3g"|"lte"|"5g", key omitted when unknown
 #     "registration": "home"|"roaming"|"searching"|"denied"|"not-searching"|
-#                     "unknown" — from the same <stat> as the top-level `reg`
+#                     "unknown" — from the same <stat> as the top-level `reg`,
+#                     and therefore LAST-KNOWN, not live: LAST_REG is refreshed
+#                     by the signal-wait loop and by the health loop's failure
+#                     path, so on a healthy link it holds the pre-dial value.
+#                     Forced to "unknown" unless `state` is "ready", so a pulled
+#                     card can never report a stale "home".
 #     "checked_at":   ISO ts of the last probe that reached the modem
 #   }
 #   "uplink": {    Which interface carries the default route (Phase 1; Phase 2
@@ -473,7 +478,16 @@ write_telemetry() {
         [[ -n "$SIM_MSISDN" ]]  && sim_block+=", \"msisdn\": \"$SIM_MSISDN\""
         [[ -n "$SIM_CARRIER" ]] && sim_block+=", \"carrier\": \"$SIM_CARRIER\""
         [[ -n "$SIM_ACT" ]]     && sim_block+=", \"act\": \"$SIM_ACT\""
-        sim_block+=", \"registration\": \"$(sim_registration_label "${LAST_REG:-99}")\""
+        # Registration is only attributable to a card the modem can actually
+        # use. LAST_REG is refreshed by the signal-wait loop and by the health
+        # loop's FAILURE path, so on a healthy link it holds the value from
+        # before the dial — pull the SIM and it would still read 1 (home) for a
+        # cycle or two. Emitting "not-detected" next to "home" is incoherent, so
+        # anything but a ready card reports "unknown" rather than a stale claim.
+        # ("denied" is a READY card the network refused, so it survives this.)
+        local sim_reg="unknown"
+        [[ "$SIM_STATE" == "ready" ]] && sim_reg=$(sim_registration_label "${LAST_REG:-99}")
+        sim_block+=", \"registration\": \"$sim_reg\""
         sim_block+=", \"checked_at\": $(iso_or_null "$SIM_CHECKED_AT")}"
     fi
 
@@ -1644,6 +1658,18 @@ wait_for_modem_reboot() {
 # the engine/bias check throttles zeroed. Returns 1 only if the modem never
 # came back on USB — the caller decides what that means for its path.
 gnss_recover_after_reset() {
+    # A CRESET re-initialises the SIM interface, and this is the one moment a
+    # swapped card could go unnoticed: the identity cache otherwise invalidates
+    # only on a CPIN transition, and a 60 s poll can miss the reset's not-ready
+    # window entirely. Drop the cache and re-arm the throttle so the next loop
+    # tick re-probes (phase-1 §1 rule 1: re-probe identity after a modem reset
+    # OR a CPIN transition). Deliberately BEFORE the reboot wait and the
+    # ENABLE_GPS gate below — a reset makes the cache suspect whether or not
+    # the modem comes back cleanly, and whether or not GNSS is in use.
+    # SIM_STATE / SIM_CHECKED_AT are kept: the file's contract is last-knowledge
+    # plus a timestamp, so a reader can age it rather than see the block vanish.
+    SIM_ICCID=""; SIM_MSISDN=""; SIM_CARRIER=""; SIM_ACT=""; SIM_COPS_REG=""
+    SIM_CHECK_AT=-9999
     wait_for_modem_reboot || return 1
     log "Modem back after reset — running unified GNSS recovery."
     if [[ "$ENABLE_GPS" != "1" ]]; then

@@ -100,6 +100,13 @@ export interface ModemSimTelemetry {
   carrier?: string;
   /** Access-technology generation from AT+COPS? <AcT>. */
   act?: string;
+  /**
+   * LAST-KNOWN registration, not live: it comes from the same `<stat>` as the
+   * top-level `reg`, which the daemon refreshes in its signal-wait loop and on
+   * the health loop's FAILURE path — so on a healthy link it holds the value
+   * from before the dial. The daemon forces it to `unknown` whenever `state`
+   * is not `ready`, so a pulled card can never report a stale `home`.
+   */
   registration?: SimRegistration;
   /** ISO ts of the last probe that reached the modem. */
   checked_at?: string | null;

@@ -172,6 +172,66 @@ describe("sim_registration_label", () => {
   });
 });
 
+describe("identity cache invalidation after a modem reset", () => {
+  /**
+   * phase-1 §1 rule 1: re-probe identity after a modem reset OR a CPIN
+   * transition. A CRESET re-initialises the SIM interface, and it is the one
+   * moment a swapped card can slip past the CPIN-transition trigger — a 60 s
+   * poll can miss the reset's not-ready window entirely.
+   *
+   * `gnss_recover_after_reset` is the shared exit for every CRESET path, so the
+   * invalidation lives there. It must sit ABOVE both the reboot wait and the
+   * `ENABLE_GPS` early-return, or a GPS-disabled device would never re-probe.
+   */
+  function afterReset(pre: string, enableGps = "1"): Record<string, string> {
+    // Stub the reboot wait so nothing touches a serial port.
+    const out = sh(
+      `wait_for_modem_reboot() { return 1; }; ENABLE_GPS=${enableGps}; ${pre}; ` +
+        `gnss_recover_after_reset >/dev/null 2>&1; ` +
+        `echo "iccid=[$SIM_ICCID] msisdn=[$SIM_MSISDN] carrier=[$SIM_CARRIER] ` +
+        `act=[$SIM_ACT] copsreg=[$SIM_COPS_REG] state=[$SIM_STATE] checkat=[$SIM_CHECK_AT]"`,
+    );
+    return Object.fromEntries(
+      [...out.matchAll(/(\w+)=\[([^\]]*)\]/g)].map((m) => [m[1], m[2]]),
+    );
+  }
+
+  const PRIMED =
+    `SIM_STATE=ready SIM_ICCID=8912230000507537488 SIM_MSISDN=+14379073824 ` +
+    `SIM_CARRIER="Public Mobile" SIM_ACT=lte SIM_COPS_REG=1 SIM_CHECK_AT=500`;
+
+  it("drops the cached identity so the next tick re-reads it", () => {
+    const s = afterReset(PRIMED);
+    expect(s.iccid).toBe("");
+    expect(s.msisdn).toBe("");
+    expect(s.carrier).toBe("");
+    expect(s.act).toBe("");
+    expect(s.copsreg).toBe("");
+  });
+
+  it("re-arms the poll throttle so the re-probe is immediate, not 60 s later", () => {
+    expect(Number(afterReset(PRIMED).checkat)).toBeLessThan(0);
+  });
+
+  it("keeps the last-known state rather than blanking the block", () => {
+    // The telemetry file's contract is last-knowledge + a timestamp; making the
+    // whole `sim` block vanish for a tick would read as "no daemon".
+    expect(afterReset(PRIMED).state).toBe("ready");
+  });
+
+  it("invalidates even when GNSS is disabled on this device", () => {
+    // The routine returns early for ENABLE_GPS != 1 — the invalidation has to
+    // sit above that gate.
+    expect(afterReset(PRIMED, "0").iccid).toBe("");
+  });
+
+  it("invalidates even when the modem does not come back from the reset", () => {
+    // afterReset stubs wait_for_modem_reboot to fail; the cache is suspect
+    // either way, so the invalidation must precede the reboot wait.
+    expect(afterReset(PRIMED).iccid).toBe("");
+  });
+});
+
 describe("telemetry JSON", () => {
   /** Render one write_telemetry snapshot with the SIM globals forced. */
   function snapshot(assignments: string): Record<string, unknown> {
@@ -224,6 +284,27 @@ describe("telemetry JSON", () => {
     ).sim as Record<string, unknown>;
     expect(sim).toHaveProperty("iccid");
     expect(sim).not.toHaveProperty("msisdn");
+  });
+
+  it("never pairs a stale registration with a card that is not ready", () => {
+    // LAST_REG is not refreshed on a healthy link, so pulling the SIM leaves it
+    // at 1 (home) for a cycle or two. "not-detected" next to "home" is
+    // incoherent — anything but a ready card must report "unknown".
+    for (const state of ["not-detected", "locked", "error", "unknown"]) {
+      const sim = snapshot(`SIM_CHECKED_AT=$(date +%s) SIM_STATE=${state} LAST_REG=1`)
+        .sim as Record<string, unknown>;
+      expect(sim.registration, `state=${state}`).toBe("unknown");
+    }
+  });
+
+  it("still reports a real registration for a ready card, including denied", () => {
+    const home = snapshot(`SIM_CHECKED_AT=$(date +%s) SIM_STATE=ready LAST_REG=1`)
+      .sim as Record<string, unknown>;
+    expect(home.registration).toBe("home");
+    // `denied` is a READY card the network refused — it must survive the guard.
+    const denied = snapshot(`SIM_CHECKED_AT=$(date +%s) SIM_STATE=ready LAST_REG=3`)
+      .sim as Record<string, unknown>;
+    expect(denied.registration).toBe("denied");
   });
 
   it("reports present as null when the SIM state is unknown", () => {

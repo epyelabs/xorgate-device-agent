@@ -157,6 +157,12 @@ CSQ_RAPID_DELTA=3            # CSQ change threshold to trigger fast polling
 # rides its own fixed interval instead of the adaptive CSQ cadence.
 MODEM_TEMP_INTERVAL="${SIM7600_MODEM_TEMP_INTERVAL:-30}"
 
+# SIM presence poll (AT+CPIN?) — one command per interval, no more. The card is
+# physically fixed while the device is powered, so the IDENTITY fields behind it
+# (ICCID, MSISDN) are read once and cached; only presence is re-checked, and
+# only this slowly. See maybe_update_sim.
+SIM_CHECK_INTERVAL="${SIM7600_SIM_CHECK_INTERVAL:-60}"
+
 # GPS / GNSS
 ENABLE_GPS="${SIM7600_ENABLE_GPS:-1}"   # set 0 to skip enabling GNSS
 # Constellations on top of GPS (AT+CGNSSMODE bitmask): 1 GLONASS, 2 BeiDou,
@@ -376,6 +382,29 @@ gnss_health_state() {
 #     "last_lte_ok":    ISO ts of the last verified-healthy end-to-end link
 #                       (seeded at daemon start — the fix-gate outage clock)
 #   }
+#   "sim": {       SIM identity + registration (manage_sim_card_info Phase 1).
+#                  READ-ONLY. The whole block is ABSENT until the first probe
+#                  reaches the modem — and an absent block means "this daemon
+#                  has nothing to say", which readers must render as UNKNOWN,
+#                  never as "no SIM". A daemon predating this plan writes none.
+#     "present":      1 present (ready/locked), 0 the modem says no card is
+#                     inserted, null we could not tell (error/unknown state)
+#     "state":        "ready" | "locked" | "not-detected" | "error" | "unknown"
+#     "iccid":        card serial, key OMITTED until read
+#     "msisdn":       phone number, key OMITTED when the carrier never wrote
+#                     EF_MSISDN (common) — never emitted as ""
+#     "carrier":      operator name, key omitted until known
+#     "act":          "2g"|"3g"|"lte"|"5g", key omitted when unknown
+#     "registration": "home"|"roaming"|"searching"|"denied"|"not-searching"|
+#                     "unknown" — from the same <stat> as the top-level `reg`
+#     "checked_at":   ISO ts of the last probe that reached the modem
+#   }
+#   "uplink": {    Which interface carries the default route (Phase 1; Phase 2
+#                  scales its confirm-before-apply friction off modem_only).
+#     "primary":    interface name from the kernel's own route lookup, or null
+#     "modem_only": 1 when $IFACE is the ONLY default route — losing LTE loses
+#                   the device — else 0
+#   }
 # }
 write_telemetry() {
     local csq="$1"
@@ -430,6 +459,31 @@ write_telemetry() {
         modem_clock="{\"cclk\": \"$MODEM_CCLK\", \"read_at\": $MODEM_CCLK_READ_AT, \"reg\": ${MODEM_CCLK_REG:-99}}"
     fi
 
+    # SIM block — omitted entirely until a probe has actually reached the modem.
+    # Fail open: never synthesise "no SIM" out of a read that did not happen.
+    local sim_block="null"
+    if (( SIM_CHECKED_AT > 0 )); then
+        local sim_present="null"
+        case "$SIM_STATE" in
+            ready|locked) sim_present=1 ;;
+            not-detected) sim_present=0 ;;
+        esac
+        sim_block="{\"present\": $sim_present, \"state\": \"$SIM_STATE\""
+        [[ -n "$SIM_ICCID" ]]   && sim_block+=", \"iccid\": \"$SIM_ICCID\""
+        [[ -n "$SIM_MSISDN" ]]  && sim_block+=", \"msisdn\": \"$SIM_MSISDN\""
+        [[ -n "$SIM_CARRIER" ]] && sim_block+=", \"carrier\": \"$SIM_CARRIER\""
+        [[ -n "$SIM_ACT" ]]     && sim_block+=", \"act\": \"$SIM_ACT\""
+        sim_block+=", \"registration\": \"$(sim_registration_label "${LAST_REG:-99}")\""
+        sim_block+=", \"checked_at\": $(iso_or_null "$SIM_CHECKED_AT")}"
+    fi
+
+    local up_devs up_primary up_modem_only=0
+    up_devs=$(uplink_default_devs)
+    up_primary=$(uplink_primary)
+    [[ -n "$up_devs" && "$up_devs" == "$IFACE" ]] && up_modem_only=1
+    local uplink_primary_json="null"
+    [[ -n "$up_primary" ]] && uplink_primary_json="\"$up_primary\""
+
     # Write to temp file first, then atomically move into place
     # so readers never see a partial file
     local tmp="${TELEMETRY_FILE}.tmp"
@@ -467,6 +521,11 @@ write_telemetry() {
     "last_reset": $last_reset,
     "last_gate_skip": $last_gate_skip,
     "last_lte_ok": $(iso_or_null "$LAST_LTE_OK")
+  },
+  "sim": $sim_block,
+  "uplink": {
+    "primary": $uplink_primary_json,
+    "modem_only": $up_modem_only
   }
 }
 EOF
@@ -660,6 +719,181 @@ maybe_update_modem_clock() {
         MODEM_CCLK_READ_AT=$(date +%s)
         MODEM_CCLK_REG="${LAST_REG:-99}"
     fi
+}
+
+# --- SIM identity (manage_sim_card_info_in_settings, Phase 1) -----------------
+# READ-ONLY. Nothing here writes to the modem or touches how the device dials;
+# the worst outcome of a bug is a stale card in the cloud UI.
+#
+# Why it exists: on 2026-08-08 an intermittent SIM socket answered
+# "+CME ERROR: SIM not inserted" for ~24 h while the only thing visible was
+# "Good signal (CSQ=26) but NOT registered" — which points at coverage. AT+CSQ
+# measures raw RF and returns a number WITH NO SIM PRESENT, so it proved
+# nothing. A day of investigation for one AT command nobody was running.
+#
+# IMSI is deliberately not read (README §9): ICCID + carrier + number answer
+# every operational question, and IMSI is the SIM-swap identifier.
+SIM_STATE=""          # ready | locked | not-detected | error | unknown ("" = never probed)
+SIM_ICCID=""          # card serial (AT+CICCID) — fixed for the life of the card
+SIM_MSISDN=""         # phone number (AT+CNUM); often empty, see below
+SIM_CARRIER=""        # operator name (AT+COPS?)
+SIM_ACT=""            # access technology label derived from AT+COPS? <AcT>
+SIM_CHECKED_AT=0      # epoch of the last probe that reached the modem
+SIM_COPS_REG=""       # LAST_REG at the last successful AT+COPS? read
+SIM_CHECK_AT=-9999    # negative so the first maybe_update fires immediately
+
+# Pure: classify an AT+CPIN? response. Every form below was observed on the
+# bench (README §8) or is in the 27.007 CME table for a SIM fault.
+sim_state_from_cpin() {
+    local resp="$1"
+    if [[ "$resp" == *"+CPIN: READY"* ]]; then echo "ready"; return; fi
+    # 10 = SIM not inserted. THE case this whole phase exists for.
+    if [[ "$resp" == *"SIM not inserted"* ]] || [[ "$resp" =~ \+CME\ ERROR:\ 10([^0-9]|$) ]]; then
+        echo "not-detected"; return
+    fi
+    # 11/12 = SIM PIN / SIM PUK required. Unlocking is out of scope.
+    if [[ "$resp" == *"+CPIN: SIM PIN"* || "$resp" == *"+CPIN: SIM PUK"* ]] \
+       || [[ "$resp" == *"SIM PIN required"* || "$resp" == *"SIM PUK required"* ]] \
+       || [[ "$resp" =~ \+CME\ ERROR:\ 1[12]([^0-9]|$) ]]; then
+        echo "locked"; return
+    fi
+    # 13 SIM failure / 15 SIM wrong: a card is in the slot and the modem cannot
+    # use it. Distinct from "not inserted" — reporting it as absent would send
+    # someone to the wrong place, which is the mistake this plan is fixing.
+    if [[ "$resp" == *"SIM failure"* || "$resp" == *"SIM wrong"* ]] \
+       || [[ "$resp" =~ \+CME\ ERROR:\ 1[35]([^0-9]|$) ]]; then
+        echo "error"; return
+    fi
+    # Any other +CPIN state (PH-NET PIN, SIM PIN2, …) means a card IS present
+    # but is not usable — closer to locked than to anything else.
+    if [[ "$resp" == *"+CPIN:"* ]]; then echo "locked"; return; fi
+    # Bare ERROR, "+CME ERROR: unknown", a truncated read: say so.
+    echo "unknown"
+}
+
+# Pure: the card serial out of AT+CICCID (some firmware answers +CCID:).
+sim_iccid_from_ciccid() {
+    sed -n 's/.*+I\{0,1\}CCID:[[:space:]]*\([0-9]\{10,22\}\).*/\1/p' <<< "$1" | head -1
+}
+
+# Pure: the subscriber number out of AT+CNUM.
+#   +CNUM: "","+14379073824",145
+# EF_MSISDN is unwritten on many carriers, so EMPTY IS NORMAL — never a fault,
+# and the key is omitted rather than emitted blank (README §9, Q4).
+sim_msisdn_from_cnum() {
+    sed -n 's/.*+CNUM:[^,]*,[[:space:]]*"\{0,1\}\(+\{0,1\}[0-9]\{3,20\}\)"\{0,1\},.*/\1/p' <<< "$1" | head -1
+}
+
+# Pure: operator name out of AT+COPS? — +COPS: 0,0,"Public Mobile",7
+# Quotes/backslashes/control chars are stripped and the name is capped: it is
+# network-supplied free text interpolated straight into the telemetry JSON, and
+# an unbalanced quote there would take out every reader of this file.
+sim_carrier_from_cops() {
+    sed -n 's/.*+COPS:[[:space:]]*[0-9]\{1,\},[[:space:]]*[0-9]\{1,\},[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$1" \
+        | head -1 | tr -d '"\\' | tr -d '[:cntrl:]' | cut -c1-32
+}
+
+# Pure: the <AcT> digit out of the same response (4th field).
+sim_act_from_cops() {
+    sed -n 's/.*+COPS:[[:space:]]*[0-9]\{1,\},[[:space:]]*[0-9]\{1,\},[[:space:]]*"[^"]*",[[:space:]]*\([0-9]\{1,\}\).*/\1/p' <<< "$1" | head -1
+}
+
+# Pure: 27.007 <AcT> -> a generation label an operator can read.
+sim_act_label() {
+    case "$1" in
+        0|1|3|8)     echo "2g" ;;
+        2|4|5|6)     echo "3g" ;;
+        7|9)         echo "lte" ;;
+        10|11|12|13) echo "5g" ;;
+        *)           echo "" ;;
+    esac
+}
+
+# Pure: 3GPP registration <stat> -> label. "denied" earns its own value: the
+# network actively REJECTED this SIM (unpaid / deprovisioned account), which is
+# a completely different problem from "searching", and nothing today tells the
+# two apart.
+sim_registration_label() {
+    case "${1:-99}" in
+        0) echo "not-searching" ;;
+        1) echo "home" ;;
+        2) echo "searching" ;;
+        3) echo "denied" ;;
+        5) echo "roaming" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# Self-throttled probe — call next to get_csq in the poll loops. Costs one
+# AT+CPIN? per SIM_CHECK_INTERVAL; the identity reads happen ONCE per card.
+maybe_update_sim() {
+    (( SECONDS - SIM_CHECK_AT >= SIM_CHECK_INTERVAL )) || return 0
+    SIM_CHECK_AT=$SECONDS
+
+    local resp state
+    resp=$(at_query "AT+CPIN?" 4)
+    # A lost read is not a missing SIM. "Absence needs evidence": an empty
+    # response means the port went away or the command timed out, so keep the
+    # previous verdict and do not even re-stamp checked_at.
+    [[ -n "$resp" ]] || return 0
+    state=$(sim_state_from_cpin "$resp")
+
+    if [[ "$state" != "$SIM_STATE" ]]; then
+        [[ -n "$SIM_STATE" ]] && log "SIM state: $SIM_STATE -> $state"
+        SIM_STATE="$state"
+        # Identity belongs to the card that was in the slot. A state change may
+        # mean a different card (or none), so it is re-read from scratch.
+        SIM_ICCID=""; SIM_MSISDN=""; SIM_CARRIER=""; SIM_ACT=""; SIM_COPS_REG=""
+    fi
+    SIM_CHECKED_AT=$(date +%s)
+
+    [[ "$SIM_STATE" == "ready" ]] || return 0
+
+    # Identity is fixed for the life of the card — read once, then never again.
+    # A 60 s ICCID poll would be pure AT-port traffic for a value that cannot
+    # change while the device is powered.
+    if [[ -z "$SIM_ICCID" ]]; then
+        SIM_ICCID=$(sim_iccid_from_ciccid "$(at_query "AT+CICCID" 4)")
+        SIM_MSISDN=$(sim_msisdn_from_cnum "$(at_query "AT+CNUM" 4)")
+        [[ -n "$SIM_ICCID" ]] && log "SIM ready: ICCID $SIM_ICCID${SIM_MSISDN:+, number $SIM_MSISDN}"
+    fi
+
+    # The operator CAN change (roaming, a re-attach on another network), so this
+    # one is re-read whenever registration has moved since the last good read —
+    # not on every tick, and never while unregistered would answer "+COPS: 0".
+    if [[ -z "$SIM_CARRIER" || "$SIM_COPS_REG" != "${LAST_REG:-99}" ]]; then
+        local cops carrier
+        cops=$(at_query "AT+COPS?" 4)
+        carrier=$(sim_carrier_from_cops "$cops")
+        if [[ -n "$carrier" ]]; then
+            SIM_CARRIER="$carrier"
+            SIM_ACT=$(sim_act_label "$(sim_act_from_cops "$cops")")
+            SIM_COPS_REG="${LAST_REG:-99}"
+        fi
+    fi
+}
+
+# --- Uplink (which interface actually carries the default route) --------------
+# Cheap netlink reads, no AT traffic. `primary` comes from the KERNEL'S OWN
+# lookup, not from "lowest metric wins": verified on the bench 2026-08-09, where
+# usb0 held a metric-0 default route and beat wlan0's metric 50, the opposite of
+# what the route table read at a glance.
+#
+# `modem_only` is 1 only when the modem interface is the ONLY default route —
+# i.e. losing LTE loses the device. A bench box on WiFi reads 0.
+uplink_primary() {
+    local dev
+    dev=$(ip -4 route get "$PING_HOST" 2>/dev/null \
+          | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    if [[ -z "$dev" ]]; then
+        dev=$(uplink_default_devs | head -1)
+    fi
+    echo "$dev"
+}
+
+uplink_default_devs() {
+    ip -4 route show default 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u
 }
 
 # --- GPS / GNSS --------------------------------------------------------------
@@ -1752,6 +1986,7 @@ wait_for_stable_signal() {
         csq=$(get_csq)
         maybe_update_modem_temp
         maybe_update_modem_clock
+        maybe_update_sim
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
 
@@ -1845,6 +2080,7 @@ monitor_connection() {
         csq=$(get_csq)
         maybe_update_modem_temp
         maybe_update_modem_clock
+        maybe_update_sim
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
         prev_csq="$csq"
@@ -1948,4 +2184,9 @@ main() {
     done
 }
 
-main "$@"
+# Executed (systemd's ExecStart, or by hand) -> run the daemon. SOURCED -> only
+# define the functions, so the pure AT-response parsers can be unit-tested
+# without opening the serial port or starting a connection manager.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

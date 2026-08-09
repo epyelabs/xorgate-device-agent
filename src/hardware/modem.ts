@@ -64,6 +64,59 @@ export interface ModemRecoveryTelemetry {
   last_lte_ok?: string | null;
 }
 
+/** What the modem says about the card in the slot (manage_sim_card_info, Phase 1). */
+export type SimState = "ready" | "locked" | "not-detected" | "error" | "unknown";
+
+/** 3GPP registration <stat>, as a label the daemon has already resolved. */
+export type SimRegistration =
+  | "home"
+  | "roaming"
+  | "searching"
+  /** The network REJECTED this SIM — a deprovisioned or unpaid account. */
+  | "denied"
+  | "not-searching"
+  | "unknown";
+
+/**
+ * SIM identity + registration (daemon `write_telemetry` `sim` object).
+ *
+ * READ-ONLY, and the whole block is ABSENT until the daemon's first probe
+ * reaches the modem — a daemon predating this plan writes none at all. An
+ * absent block means "nothing is known", which every reader must render as
+ * UNKNOWN and never as "no SIM": those are the two states the 2026-08-08
+ * outage proved cost a day to tell apart.
+ *
+ * IMSI is deliberately absent: ICCID + carrier + number answer the operational
+ * questions, and IMSI is the identifier used for SIM-swap attacks.
+ */
+export interface ModemSimTelemetry {
+  /** 1 present, 0 the modem says no card is inserted, null we cannot tell. */
+  present?: 0 | 1 | null;
+  state?: SimState;
+  /** Card serial (AT+CICCID). Absent until read. */
+  iccid?: string;
+  /** Subscriber number (AT+CNUM). ABSENT is normal — many carriers never write EF_MSISDN. */
+  msisdn?: string;
+  carrier?: string;
+  /** Access-technology generation from AT+COPS? <AcT>. */
+  act?: string;
+  registration?: SimRegistration;
+  /** ISO ts of the last probe that reached the modem. */
+  checked_at?: string | null;
+}
+
+/**
+ * Which interface carries the default route (Phase 1). Cheap `ip route` reads,
+ * no AT traffic. Phase 2 scales its confirm-before-apply friction off
+ * `modem_only`, and on its own it answers "is this box on wifi or cellular?".
+ */
+export interface ModemUplinkTelemetry {
+  /** Interface from the kernel's own route lookup, or null when there is none. */
+  primary?: string | null;
+  /** 1 when the modem interface is the ONLY default route — losing LTE loses the device. */
+  modem_only?: 0 | 1;
+}
+
 export interface ModemTelemetry {
   timestamp: string;
   /** AT+CSQ value 0–31, or 99 when unknown. Doubles as ASU. */
@@ -101,6 +154,10 @@ export interface ModemTelemetry {
   gnss?: ModemGnssTelemetry;
   /** Recovery observability (absent on daemons predating the lte_gnss_recovery plan). */
   recovery?: ModemRecoveryTelemetry;
+  /** SIM identity (absent on daemons predating manage_sim_card_info Phase 1, or before the first probe). */
+  sim?: ModemSimTelemetry | null;
+  /** Default-route uplink (absent on daemons predating manage_sim_card_info Phase 1). */
+  uplink?: ModemUplinkTelemetry;
 }
 
 /**

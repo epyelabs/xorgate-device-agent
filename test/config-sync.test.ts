@@ -12,6 +12,8 @@ import {
   ensureConfigSyncBaseline,
   loadConfigSyncState,
   namespacesOf,
+  parseSimTelemetry,
+  parseUplinkTelemetry,
   readModemBias,
   readSettingsHash,
   saveConfigSyncState,
@@ -132,6 +134,129 @@ describe("effective values", () => {
       timeSync: { offlineSources: true },
     };
     expect(buildEffective(settings, NO_MODEM)).toEqual(settings);
+  });
+
+  // --- reported-only sim / uplink (manage_sim_card_info, Phase 1) ------------
+
+  it("carries the modem's sim and uplink blocks as reported-only keys", () => {
+    const sim = { present: 1 as const, state: "ready" as const, iccid: "8912230000507537488" };
+    const uplink = { primary: "wlan0", modem_only: 0 as const };
+    const effective = buildEffective({}, { value: null, fresh: false, sim, uplink });
+    expect(effective.sim).toEqual(sim);
+    expect(effective.uplink).toEqual(uplink);
+  });
+
+  it("omits sim entirely when the daemon reported none", () => {
+    // An old daemon writes no `sim` block. Absent must mean UNKNOWN — inventing
+    // `present: 0` here would report "no SIM" for what is really "no daemon".
+    expect(buildEffective({}, NO_MODEM)).not.toHaveProperty("sim");
+    expect(buildEffective({}, NO_MODEM)).not.toHaveProperty("uplink");
+  });
+
+  it("gives sim no status entry, ever", () => {
+    // `sim` is reported-only like `agent.mode`: it is not in the namespace list,
+    // so buildStatus cannot produce a verdict for it. A `status.sim` would mean
+    // someone modelled an unsettable value as a setting.
+    const sim = { present: 1 as const, state: "ready" as const };
+    const desired = desiredFrom({ rev: 1, gnssAntBias: true, sim: { present: 0 } });
+    const effective = buildEffective({ gnssAntBias: true }, { value: true, fresh: true, sim });
+    const status = buildStatus(desired, effective, FRESH, 1_700_000_000_000);
+    expect(status).not.toHaveProperty("sim");
+    expect(status).not.toHaveProperty("uplink");
+    expect(CONFIG_APPLY_CLASSES).not.toHaveProperty("sim");
+    expect(CONFIG_APPLY_CLASSES).not.toHaveProperty("uplink");
+  });
+});
+
+describe("parseSimTelemetry", () => {
+  it("accepts a full block from the daemon", () => {
+    expect(
+      parseSimTelemetry({
+        present: 1,
+        state: "ready",
+        iccid: "8912230000507537488",
+        msisdn: "+14379073824",
+        carrier: "Public Mobile",
+        act: "lte",
+        registration: "home",
+        checked_at: "2026-08-09T00:22:44Z",
+      }),
+    ).toEqual({
+      present: 1,
+      state: "ready",
+      iccid: "8912230000507537488",
+      msisdn: "+14379073824",
+      carrier: "Public Mobile",
+      act: "lte",
+      registration: "home",
+      checked_at: "2026-08-09T00:22:44Z",
+    });
+  });
+
+  it("carries an absent SIM through as a first-class fact", () => {
+    // This is the 2026-08-08 case reaching the cloud. It must survive the parse.
+    expect(parseSimTelemetry({ present: 0, state: "not-detected", registration: "unknown" })).toEqual(
+      { present: 0, state: "not-detected", registration: "unknown" },
+    );
+  });
+
+  it("fails open on anything malformed", () => {
+    expect(parseSimTelemetry(undefined)).toBeUndefined();
+    expect(parseSimTelemetry(null)).toBeUndefined();
+    expect(parseSimTelemetry("ready")).toBeUndefined();
+    expect(parseSimTelemetry([])).toBeUndefined();
+    expect(parseSimTelemetry({})).toBeUndefined();
+    // A state this build does not know is not a state we will render.
+    expect(parseSimTelemetry({ present: 0, state: "wat" })).toBeUndefined();
+  });
+
+  it("reports present as null when the daemon could not tell", () => {
+    expect(parseSimTelemetry({ state: "unknown" })?.present).toBeNull();
+    expect(parseSimTelemetry({ present: "1", state: "ready" })?.present).toBeNull();
+  });
+
+  it("drops identifiers that are not shaped like identifiers", () => {
+    const sim = parseSimTelemetry({
+      state: "ready",
+      iccid: "not-an-iccid",
+      msisdn: "call me",
+      registration: "somewhere",
+    });
+    expect(sim).not.toHaveProperty("iccid");
+    expect(sim).not.toHaveProperty("msisdn");
+    expect(sim).not.toHaveProperty("registration");
+  });
+
+  it("caps and cleans network-supplied text", () => {
+    const sim = parseSimTelemetry({ state: "ready", carrier: `${"A".repeat(200)}` });
+    expect(sim?.carrier).toHaveLength(64);
+  });
+});
+
+describe("parseUplinkTelemetry", () => {
+  it("reads the primary interface and the modem-only flag", () => {
+    expect(parseUplinkTelemetry({ primary: "usb0", modem_only: 1 })).toEqual({
+      primary: "usb0",
+      modem_only: 1,
+    });
+    expect(parseUplinkTelemetry({ primary: "wlan0", modem_only: 0 })).toEqual({
+      primary: "wlan0",
+      modem_only: 0,
+    });
+  });
+
+  it("reports no primary rather than guessing when there is no default route", () => {
+    expect(parseUplinkTelemetry({ primary: null, modem_only: 0 })).toEqual({
+      primary: null,
+      modem_only: 0,
+    });
+  });
+
+  it("fails open on anything malformed", () => {
+    expect(parseUplinkTelemetry(undefined)).toBeUndefined();
+    expect(parseUplinkTelemetry(null)).toBeUndefined();
+    expect(parseUplinkTelemetry({})).toBeUndefined();
+    expect(parseUplinkTelemetry("usb0")).toBeUndefined();
   });
 });
 
@@ -331,6 +456,60 @@ describe("readModemBias", () => {
     const sample = await readModemBias(now, file());
     expect(sample.value).toBeNull();
     expect(sample.fresh).toBe(false);
+  });
+
+  it("carries sim and uplink off the same snapshot", async () => {
+    writeFileSync(
+      file(),
+      JSON.stringify({
+        timestamp: "2026-08-06T11:59:40Z",
+        gnss_ant_bias: 1,
+        sim: { present: 1, state: "ready", iccid: "8912230000507537488" },
+        uplink: { primary: "wlan0", modem_only: 0 },
+      }),
+    );
+    const sample = await readModemBias(now, file());
+    expect(sample.sim).toEqual({ present: 1, state: "ready", iccid: "8912230000507537488" });
+    expect(sample.uplink).toEqual({ primary: "wlan0", modem_only: 0 });
+  });
+
+  it("still carries sim when only the BIAS is unknown", async () => {
+    // "the modem has not applied a bias yet" makes the sample unfresh, but the
+    // snapshot itself is current and says plenty about the SIM.
+    writeFileSync(
+      file(),
+      JSON.stringify({
+        timestamp: "2026-08-06T11:59:40Z",
+        gnss_ant_bias: null,
+        sim: { present: 0, state: "not-detected" },
+      }),
+    );
+    const sample = await readModemBias(now, file());
+    expect(sample.fresh).toBe(false);
+    expect(sample.sim).toEqual({ present: 0, state: "not-detected" });
+  });
+
+  it("drops sim and uplink when the snapshot is stale", async () => {
+    // A dead daemon's last word about the SIM is not evidence about the SIM
+    // now — better to say nothing than to show a card that is no longer there.
+    writeFileSync(
+      file(),
+      JSON.stringify({
+        timestamp: "2026-08-06T11:00:00Z",
+        gnss_ant_bias: 1,
+        sim: { present: 1, state: "ready" },
+        uplink: { primary: "wlan0", modem_only: 0 },
+      }),
+    );
+    const sample = await readModemBias(now, file());
+    expect(sample.sim).toBeUndefined();
+    expect(sample.uplink).toBeUndefined();
+  });
+
+  it("reports no sim at all when the telemetry file is missing", async () => {
+    const sample = await readModemBias(now, join(home, "missing.json"));
+    expect(sample.sim).toBeUndefined();
+    expect(sample.uplink).toBeUndefined();
   });
 });
 

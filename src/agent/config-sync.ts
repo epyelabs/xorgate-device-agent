@@ -50,7 +50,14 @@ import {
   type AgentSettings,
   type SettingsReadResult,
 } from "../daemon/settings.js";
-import { readModemTelemetry, LTE_TELEMETRY_FILE } from "../hardware/modem.js";
+import {
+  readModemTelemetry,
+  LTE_TELEMETRY_FILE,
+  type ModemSimTelemetry,
+  type ModemUplinkTelemetry,
+  type SimRegistration,
+  type SimState,
+} from "../hardware/modem.js";
 import type { CloudConfig } from "./cloud-config.js";
 
 /**
@@ -333,6 +340,98 @@ export interface ModemBiasSample {
   fresh: boolean;
   /** Human-readable cause when `fresh` is false. */
   detail?: string;
+  /**
+   * Reported-only modem facts riding the SAME snapshot (manage_sim_card_info,
+   * Phase 1). They are carried here rather than fetched separately so there is
+   * one read and one freshness judgment; both are absent unless the snapshot
+   * was fresh AND the daemon actually published them.
+   *
+   * `fresh` above is NOT the gate for these: it also goes false for "the modem
+   * has not applied a bias yet", which says nothing about the SIM.
+   */
+  sim?: ModemSimTelemetry;
+  uplink?: ModemUplinkTelemetry;
+}
+
+/** Cap on a device-authored string before it enters `reportedConfig`. */
+const MAX_REPORTED_STRING = 64;
+
+/** A non-empty, length-capped string, or undefined. Control chars are dropped. */
+function reportedString(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  let clean = "";
+  for (const ch of v) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code >= 0x20 && code !== 0x7f) clean += ch;
+  }
+  clean = clean.trim().slice(0, MAX_REPORTED_STRING);
+  return clean.length > 0 ? clean : undefined;
+}
+
+const SIM_STATES: readonly SimState[] = [
+  "ready",
+  "locked",
+  "not-detected",
+  "error",
+  "unknown",
+];
+const SIM_REGISTRATIONS: readonly SimRegistration[] = [
+  "home",
+  "roaming",
+  "searching",
+  "denied",
+  "not-searching",
+  "unknown",
+];
+
+/**
+ * Sanitize the daemon's `sim` block for the wire. Returns undefined for
+ * anything that is not a usable block — the fail-open posture Phase 1 requires:
+ * an unreadable, missing or malformed block must OMIT `sim` entirely, never
+ * synthesise `present: 0`, which would report "no SIM" for what is actually
+ * "no daemon".
+ *
+ * A block with no recognizable `state` is dropped for the same reason.
+ */
+export function parseSimTelemetry(raw: unknown): ModemSimTelemetry | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const src = raw as Record<string, unknown>;
+  const state = SIM_STATES.includes(src.state as SimState)
+    ? (src.state as SimState)
+    : undefined;
+  if (state === undefined) return undefined;
+  const out: ModemSimTelemetry = { state };
+  out.present = src.present === 1 || src.present === true
+    ? 1
+    : src.present === 0 || src.present === false
+      ? 0
+      : null;
+  // Digits only: an ICCID or a phone number is the one place a rogue value
+  // would be rendered verbatim to an operator as an identifier.
+  const iccid = reportedString(src.iccid);
+  if (iccid !== undefined && /^[0-9]{10,22}$/.test(iccid)) out.iccid = iccid;
+  const msisdn = reportedString(src.msisdn);
+  if (msisdn !== undefined && /^\+?[0-9]{3,20}$/.test(msisdn)) out.msisdn = msisdn;
+  const carrier = reportedString(src.carrier);
+  if (carrier !== undefined) out.carrier = carrier;
+  const act = reportedString(src.act);
+  if (act !== undefined) out.act = act;
+  if (SIM_REGISTRATIONS.includes(src.registration as SimRegistration)) {
+    out.registration = src.registration as SimRegistration;
+  }
+  const checkedAt = reportedString(src.checked_at);
+  if (checkedAt !== undefined) out.checked_at = checkedAt;
+  return out;
+}
+
+/** Sanitize the daemon's `uplink` block. Undefined when nothing is usable. */
+export function parseUplinkTelemetry(raw: unknown): ModemUplinkTelemetry | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const src = raw as Record<string, unknown>;
+  const primary = reportedString(src.primary);
+  const modemOnly = src.modem_only === 1 || src.modem_only === true ? 1 : 0;
+  if (primary === undefined && src.modem_only === undefined) return undefined;
+  return { primary: primary ?? null, modem_only: modemOnly };
 }
 
 /**
@@ -355,12 +454,19 @@ export async function readModemBias(
   const value = raw === 1 || raw === true ? true : raw === 0 || raw === false ? false : null;
   const stampedMs = Date.parse(`${String(telemetry.timestamp ?? "")}`);
   if (!Number.isFinite(stampedMs) || now - stampedMs > MODEM_TELEMETRY_STALE_MS) {
+    // A stale snapshot takes the reported-only blocks down with it: a dead
+    // daemon's last word about the SIM is not evidence about the SIM NOW, and
+    // "unknown" is the honest render for it.
     return { value, fresh: false, detail: "modem telemetry is stale" };
   }
+  const sim = parseSimTelemetry(telemetry.sim);
+  const uplink = parseUplinkTelemetry(telemetry.uplink);
   if (value === null) {
-    return { value, fresh: false, detail: "modem has not applied a bias state yet" };
+    // Unfresh for the BIAS only — the snapshot itself is current, so the
+    // reported-only blocks still ride along.
+    return { value, fresh: false, detail: "modem has not applied a bias state yet", sim, uplink };
   }
-  return { value, fresh: true };
+  return { value, fresh: true, sim, uplink };
 }
 
 /**
@@ -395,6 +501,18 @@ export interface ReportHints {
  * namespace list, which does not contain it). Flipping a fielded device to sim
  * remotely would silently replace real data with synthetic data, so there is
  * deliberately no cloud-writable path.
+ *
+ * `sim` and `uplink` (manage_sim_card_info, Phase 1) follow `agent.mode`
+ * exactly, for the same reason arrived at from the other direction: you cannot
+ * SET an ICCID, so there is no desired value to compare against and a `status`
+ * badge could only ever read "in force". They are NOT config namespaces —
+ * nothing about them belongs in `CONFIG_APPLY_CLASSES`, in the generated
+ * contract, or in the database.
+ *
+ * FAIL OPEN: unreadable, stale, missing or malformed telemetry omits them
+ * entirely. Synthesising `present: 0` out of a failed READ would report "no
+ * SIM" for what is actually "no daemon" — the exact confusion this phase
+ * exists to end.
  */
 export function buildEffective(
   settings: AgentSettings,
@@ -410,6 +528,8 @@ export function buildEffective(
   if (settings.lteRecovery !== undefined) out.lteRecovery = settings.lteRecovery;
   if (settings.timeSync !== undefined) out.timeSync = settings.timeSync;
   if (mode !== undefined) out.agent = { mode };
+  if (modem.sim !== undefined) out.sim = modem.sim;
+  if (modem.uplink !== undefined) out.uplink = modem.uplink;
   return out;
 }
 

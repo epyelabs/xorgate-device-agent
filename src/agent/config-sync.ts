@@ -53,11 +53,14 @@ import {
 import {
   readModemTelemetry,
   LTE_TELEMETRY_FILE,
+  type ApnState,
+  type ModemCellularTelemetry,
   type ModemSimTelemetry,
   type ModemUplinkTelemetry,
   type SimRegistration,
   type SimState,
 } from "../hardware/modem.js";
+import type { CellularSettings } from "../daemon/settings.js";
 import type { CloudConfig } from "./cloud-config.js";
 
 /**
@@ -130,6 +133,7 @@ export const CONFIG_APPLY_CLASSES: Readonly<Record<string, ApplyClass>> = {
   recording: "agent-poll",
   lteRecovery: "modem-poll",
   timeSync: "agent-poll",
+  cellular: "modem-poll",
 };
 
 /** Namespace keys in publish order (matches the cloud registry's order). */
@@ -351,6 +355,12 @@ export interface ModemBiasSample {
    */
   sim?: ModemSimTelemetry;
   uplink?: ModemUplinkTelemetry;
+  /**
+   * The daemon's APN apply machinery (Phase 2), riding the same snapshot.
+   * ABSENT = the daemon predates the rollback net (or the snapshot is stale) —
+   * which the cloud must read as "do not write `cellular` to this device".
+   */
+  apn?: ModemCellularTelemetry;
 }
 
 /** Cap on a device-authored string before it enters `reportedConfig`. */
@@ -424,6 +434,43 @@ export function parseSimTelemetry(raw: unknown): ModemSimTelemetry | undefined {
   return out;
 }
 
+const APN_STATES: readonly ApnState[] = ["in-force", "applying", "rolled-back", "rejected"];
+
+/**
+ * An APN-shaped field: full value or nothing. Deliberately NOT `reportedString`
+ * (which caps at 64 chars): a truncated APN would still pass the charset test
+ * and report a value the modem does not hold — for this field, a repaired
+ * string is a different string.
+ */
+const apnField = (v: unknown): string | undefined =>
+  typeof v === "string" && /^[A-Za-z0-9.-]{1,100}$/.test(v) ? v : undefined;
+
+/**
+ * Sanitize the daemon's `cellular` (APN machinery) block for the wire. Same
+ * fail-open posture as the SIM block: anything unusable OMITS the block, and an
+ * absent block downstream means "no rollback net on this device" — the safe
+ * reading, since it makes the cloud refuse to write the namespace.
+ */
+export function parseApnTelemetry(raw: unknown): ModemCellularTelemetry | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const src = raw as Record<string, unknown>;
+  const state = APN_STATES.includes(src.state as ApnState) ? (src.state as ApnState) : undefined;
+  if (state === undefined) return undefined;
+  const out: ModemCellularTelemetry = { state };
+  const applied = apnField(src.apn_applied);
+  if (applied !== undefined) out.apn_applied = applied;
+  const requested = apnField(src.apn_requested);
+  if (requested !== undefined) out.apn_requested = requested;
+  const lastError = reportedString(src.last_error);
+  if (lastError !== undefined) out.last_error = lastError;
+  if (typeof src.fails === "number" && Number.isFinite(src.fails) && src.fails >= 0) {
+    out.fails = Math.min(99, Math.floor(src.fails));
+  }
+  const changedAt = reportedString(src.changed_at);
+  if (changedAt !== undefined) out.changed_at = changedAt;
+  return out;
+}
+
 /** Sanitize the daemon's `uplink` block. Undefined when nothing is usable. */
 export function parseUplinkTelemetry(raw: unknown): ModemUplinkTelemetry | undefined {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
@@ -461,12 +508,20 @@ export async function readModemBias(
   }
   const sim = parseSimTelemetry(telemetry.sim);
   const uplink = parseUplinkTelemetry(telemetry.uplink);
+  const apn = parseApnTelemetry(telemetry.cellular);
   if (value === null) {
     // Unfresh for the BIAS only — the snapshot itself is current, so the
     // reported-only blocks still ride along.
-    return { value, fresh: false, detail: "modem has not applied a bias state yet", sim, uplink };
+    return {
+      value,
+      fresh: false,
+      detail: "modem has not applied a bias state yet",
+      sim,
+      uplink,
+      apn,
+    };
   }
-  return { value, fresh: true, sim, uplink };
+  return { value, fresh: true, sim, uplink, apn };
 }
 
 /**
@@ -527,10 +582,45 @@ export function buildEffective(
   if (settings.recording !== undefined) out.recording = settings.recording;
   if (settings.lteRecovery !== undefined) out.lteRecovery = settings.lteRecovery;
   if (settings.timeSync !== undefined) out.timeSync = settings.timeSync;
+  // `cellular` follows the namespace convention (absent = defaults = "don't
+  // touch"), with `apn` overridden by the modem's APPLIED value — mirroring
+  // gnssAntBias, because a report that echoes the requested APN cannot tell
+  // the cloud whether it worked. Emitted ONLY when settings.json holds the
+  // namespace: every fielded device has an NV APN and no `cellular` key, and
+  // reporting the NV value as a held namespace would badge the whole fleet as
+  // "device differs from defaults".
+  const cellular = effectiveCellular(settings.cellular, modem.apn);
+  if (cellular !== undefined) out.cellular = cellular;
   if (mode !== undefined) out.agent = { mode };
   if (modem.sim !== undefined) out.sim = modem.sim;
   if (modem.uplink !== undefined) out.uplink = modem.uplink;
+  // The APN machinery itself is reported-only, like `sim` — it is what the UI
+  // reads for "what APN is this device actually on" (configured or not), and
+  // its ABSENCE is how the cloud spots a device with no rollback net.
+  if (modem.apn !== undefined) out.apn = modem.apn;
   return out;
+}
+
+/**
+ * The `cellular` namespace as in force. Three cases:
+ *  - namespace absent           -> undefined (device defaults, "don't touch")
+ *  - apn empty                  -> echoed as-is: "don't touch" is trivially in
+ *                                  force, no modem confirmation needed
+ *  - apn non-empty              -> the modem's APPLIED APN substituted in; when
+ *                                  the daemon has never reported one, the whole
+ *                                  key is omitted ("not holding this yet") so
+ *                                  the verdict cannot claim an apply that never
+ *                                  happened
+ */
+function effectiveCellular(
+  settings: CellularSettings | undefined,
+  apn: ModemCellularTelemetry | undefined,
+): Record<string, unknown> | undefined {
+  if (settings === undefined) return undefined;
+  const desired = settings.apn ?? "";
+  if (desired === "") return { ...settings };
+  if (apn?.apn_applied === undefined) return undefined;
+  return { ...settings, apn: apn.apn_applied };
 }
 
 // --- status -----------------------------------------------------------------
@@ -652,6 +742,15 @@ export function buildStatus(
       continue;
     }
 
+    if (key === "cellular") {
+      // The APN's verdict comes from the modem daemon's own apply machinery,
+      // not from a value comparison: "applying", "rolled back" and "gave up"
+      // are states a generic inForce-vs-desired diff cannot express, and the
+      // whole point of this phase is that the cloud can tell them apart.
+      out[key] = cellularStatus(parsed as CellularSettings, modem.apn, at);
+      continue;
+    }
+
     const inForce = effective[key];
     if (!deepEqual(inForce, parsed)) {
       out[key] = { state: "adjusted", at, detail: divergenceDetail(key, modem, inForce) };
@@ -662,6 +761,69 @@ export function buildStatus(
     out[key] = detail ? { state: "applied", at, detail } : { state: "applied", at };
   }
   return out;
+}
+
+/**
+ * The `cellular` namespace's verdict, read off the modem daemon's own apply
+ * machinery. A rollback or a rejection must be VISIBLE — a green tick over a
+ * device that quietly reverted is the worst outcome this feature could have.
+ */
+function cellularStatus(
+  desired: CellularSettings,
+  apn: ModemCellularTelemetry | undefined,
+  at: number,
+): NamespaceStatus {
+  const wanted = desired.apn ?? "";
+  if (wanted === "") {
+    // "Don't touch the modem" needs no confirmation — the daemon writing
+    // nothing IS the request being honoured.
+    return { state: "applied", at };
+  }
+  if (apn === undefined) {
+    return {
+      state: "adjusted",
+      at,
+      detail:
+        "saved, but this device's modem daemon has not reported its APN machinery — " +
+        "it may predate the rollback-capable agent and will never apply this",
+    };
+  }
+  if (apn.state === "rejected" && apn.apn_requested === wanted) {
+    return {
+      state: "rejected",
+      at,
+      reason:
+        `the device gave up on "${wanted}" after ${apn.fails ?? "repeated"} failed applies` +
+        `${apn.last_error ? ` (${apn.last_error})` : ""} — change the value to try again`,
+    };
+  }
+  if (apn.state === "applying" && apn.apn_requested === wanted) {
+    return {
+      state: "adjusted",
+      at,
+      detail:
+        "applying — the modem daemon is confirming the new APN with real traffic " +
+        "over the cellular link (allow a few minutes)",
+    };
+  }
+  if (apn.apn_applied === wanted) {
+    return { state: "applied", at };
+  }
+  if (apn.state === "rolled-back" && apn.apn_requested === wanted) {
+    return {
+      state: "adjusted",
+      at,
+      detail:
+        `the device applied "${wanted}", could not pass data, and rolled back to ` +
+        `"${apn.apn_applied ?? "the previous APN"}"` +
+        `${apn.last_error ? ` (${apn.last_error})` : ""}`,
+    };
+  }
+  return {
+    state: "adjusted",
+    at,
+    detail: "saved; the modem daemon has not applied it yet (it re-checks about every 30 s)",
+  };
 }
 
 /** Why what we hold differs from what the cloud asked for. */
@@ -790,6 +952,8 @@ export interface ConfigSyncOptions {
   settleReports?: number;
   /** Boot-race re-check cadence (see armModemArrivalWatch). */
   modemArrivalMs?: number;
+  /** APN-machinery watch cadence (see startApnWatch). */
+  apnWatchMs?: number;
 }
 
 const DEFAULT_DEBOUNCE_MS = 2000;
@@ -832,6 +996,15 @@ const DEFAULT_SETTLE_REPORTS = 3;
 const DEFAULT_MODEM_ARRIVAL_MS = 30_000;
 const MODEM_ARRIVAL_TRIES = 20;
 
+/**
+ * APN-machinery watch (startApnWatch). An APN apply confirms or rolls back on
+ * the daemon's own timetable — up to the confirm window (~5 min), far past the
+ * settle re-reports — and the outcome MUST reach the cloud promptly: a device
+ * that rolled back while the UI shows "applying" forever is this feature
+ * failing at its own job. One tmpfs read per tick, report only on change.
+ */
+const DEFAULT_APN_WATCH_MS = 30_000;
+
 /** `cloud` outranks `boot` when both are pending in the same window. */
 const ORIGIN_RANK: Record<ReportOrigin, number> = { boot: 0, cloud: 1, local: 2 };
 
@@ -854,6 +1027,9 @@ export class ConfigSync {
   private modemArrivalTimer: NodeJS.Timeout | null = null;
   private modemArrivalTries = 0;
   private modemSeen = false;
+  /** APN-machinery watch (standing): fingerprint of the last REPORTED block. */
+  private apnWatchTimer: NodeJS.Timeout | null = null;
+  private lastReportedApn: string | undefined;
   private watcher: NodeJS.Timeout | null = null;
   /** Settle re-reports left for the current desired rev (see DEFAULT_SETTLE_*). */
   private settleBudget = 0;
@@ -1096,12 +1272,46 @@ export class ConfigSync {
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.settleTimer) clearTimeout(this.settleTimer);
     if (this.modemArrivalTimer) clearTimeout(this.modemArrivalTimer);
+    if (this.apnWatchTimer) clearInterval(this.apnWatchTimer);
     if (this.watcher) clearInterval(this.watcher);
     this.timer = null;
     this.heartbeat = null;
     this.settleTimer = null;
     this.modemArrivalTimer = null;
+    this.apnWatchTimer = null;
     this.watcher = null;
+  }
+
+  /**
+   * Watch the modem's APN apply machinery and re-report when it moves (Phase
+   * 2). The settle re-reports cover the first ~2 min after a save; an apply's
+   * confirm-or-rollback can land later than that (the confirm window is ~5
+   * min, a deferred apply is unbounded), and without this the outcome would
+   * wait for the HOURLY heartbeat while the UI showed "applying". Standing
+   * watch, one telemetry read per tick, and a report is requested only when
+   * the block differs from the last one actually reported.
+   */
+  startApnWatch(): void {
+    if (this.apnWatchTimer || this.stopped) return;
+    this.apnWatchTimer = setInterval(() => {
+      void this.checkApnChange();
+    }, this.opts.apnWatchMs ?? DEFAULT_APN_WATCH_MS);
+    this.apnWatchTimer.unref?.();
+  }
+
+  /** One APN-watch tick. Public for tests; never throws. */
+  async checkApnChange(): Promise<void> {
+    if (this.stopped) return;
+    try {
+      const sample = await (this.opts.modem ?? readModemBias)((this.opts.now ?? Date.now)());
+      const fp = sample.apn === undefined ? undefined : JSON.stringify(sample.apn);
+      if (fp === this.lastReportedApn) return;
+      if (this.timer) return; // a report is already queued and will carry it
+      this.opts.onEvent?.("info", "modem APN state changed — re-reporting");
+      this.request("boot");
+    } catch {
+      /* a failed probe is a missed tick, never a thrown error */
+    }
   }
 
   /**
@@ -1155,6 +1365,8 @@ export class ConfigSync {
         patch.localPending = false;
       }
       this.persist(patch);
+      const apnBlock = report.effective.apn;
+      this.lastReportedApn = apnBlock === undefined ? undefined : JSON.stringify(apnBlock);
       this.scheduleSettleReport(report);
       this.watchForModemArrival(report);
     } catch (err) {

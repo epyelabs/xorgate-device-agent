@@ -44,7 +44,9 @@ import type {
   TelemetryReading,
 } from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
-import { ensureHome, workerPath } from "./daemon/runtime.js";
+import { ensureHome, runtimeHome, workerPath } from "./daemon/runtime.js";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { removePidfile, writePidfile } from "./daemon/pidfile.js";
 
 const WRITTEN_BY = "xorgate-device-agent@0.2.0";
@@ -394,6 +396,11 @@ const configSync = new ConfigSync({
 // the baseline that makes it detectable.
 configSync.startWatcher();
 
+// APN-machinery watch (Phase 2): an apply's confirm/rollback lands on the
+// daemon's own timetable, minutes after the save — this is what carries the
+// outcome to the cloud instead of the hourly heartbeat.
+configSync.startApnWatch();
+
 // Cloud config messages (retained; re-delivered on every connect). Persist into
 // settings.json — the sim7600-lte daemon polls the file and applies gnssAntBias
 // live.
@@ -469,6 +476,12 @@ function handleConfigMessage(payload: Buffer): void {
 
 /** How long to wait for the ack's PUBACK before going down anyway. */
 const ACK_FLUSH_TIMEOUT_MS = 3000;
+
+/** Device-side floor between honoured refresh commands (Phase 2 §4d). */
+const REFRESH_MIN_INTERVAL_MS = 30_000;
+/** How long after the flag before the re-probed values are re-reported. */
+const REFRESH_REPROBE_REPORT_MS = 45_000;
+let lastRefreshAt = 0;
 
 /**
  * Publish a command ack and resolve once the broker has PUBACKed it — or once
@@ -556,6 +569,33 @@ async function handleCommandMessage(payload: Buffer): Promise<void> {
   console.log(`[agent] ${cmd.command} command accepted (${cmd.requestId})`);
   store.event("info", `${cmd.command} command accepted`, now);
   store.flush(now, true);
+
+  // `refresh` (Phase 2 §4d) is read-only and handled in-process — it never
+  // reaches the sudo path. Rate-limited device-side: a hammered UI button must
+  // not turn into unbounded AT traffic (the daemon re-probes on every flag).
+  if (cmd.command === "refresh") {
+    if (now - lastRefreshAt < REFRESH_MIN_INTERVAL_MS) {
+      await publishCommandAck({ ...cmd, status: "rejected", reason: "rate-limited" });
+      return;
+    }
+    lastRefreshAt = now;
+    await publishCommandAck({ ...cmd, status: "accepted" });
+    try {
+      // The daemon (root) polls for this flag in both its loops and re-arms
+      // its SIM/APN/bias probe throttles, then deletes it. The agent owns the
+      // directory, so no privilege is needed to ask.
+      writeFileSync(join(runtimeHome(), "refresh-modem.flag"), String(now));
+    } catch (err) {
+      console.warn(`[agent] refresh flag write failed: ${(err as Error).message}`);
+    }
+    // Two reports: NOW (closes the report-staleness half — most of the ~70 min
+    // worst case is the hourly heartbeat, not the probe) and again after the
+    // daemon has had time to honour the flag, so the re-probed values land.
+    configSync.request("boot");
+    setTimeout(() => configSync.request("boot"), REFRESH_REPROBE_REPORT_MS).unref();
+    return;
+  }
+
   await publishCommandAck({ ...cmd, status: "accepted" });
 
   const res = await executeCommand(cmd.command);

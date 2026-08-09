@@ -176,6 +176,33 @@ MODEM_TEMP_INTERVAL="${SIM7600_MODEM_TEMP_INTERVAL:-30}"
 # up, and remove the drop-in afterwards.
 SIM_CHECK_INTERVAL="${SIM7600_SIM_CHECK_INTERVAL:-600}"
 
+# APN apply-and-confirm (manage_sim_card_info plan, Phase 2). A wrong APN on an
+# LTE-only device is a PERMANENT strand: the data context fails, the device
+# leaves the network, and the correction can only travel over the link the
+# mistake just broke. So a change is never just written: it is applied, proven
+# with real traffic bound to $IFACE inside APN_CONFIRM_WINDOW, and otherwise
+# the previous APN (read from the modem, never from settings.json) is restored
+# automatically. See apn_maintain / apn_apply.
+#
+# ABSENT MEANS DON'T TOUCH: no `cellular` namespace in settings.json (or an
+# empty apn) issues no AT+CGDCONT write at all — every fielded device has a
+# working APN in modem NV and must keep it.
+APN_CHECK_INTERVAL="${SIM7600_APN_CHECK_INTERVAL:-30}"     # settings re-read cadence (s)
+APN_CONFIRM_WINDOW="${SIM7600_APN_CONFIRM_WINDOW:-300}"    # prove-it window before rollback (s)
+APN_MAX_FAILS="${SIM7600_APN_MAX_FAILS:-3}"                # failed applies of the SAME value -> rejected
+# Persisted apply/rollback state. Deliberately NOT under /run (dies with a
+# reboot): a power cut mid-apply must not lose the way back to the old APN.
+APN_STATE_FILE="${SIM7600_APN_STATE_FILE:-/var/lib/xorgate/apn-apply.json}"
+# TCP fallback targets (port 443) for the confirm step — some carriers/APNs
+# drop ICMP, so a failed ping alone is not proof of a dead bearer.
+APN_TCP_HOSTS="${SIM7600_APN_TCP_HOSTS:-1.1.1.1 8.8.8.8}"
+
+# On-demand refresh (Phase 2 §4d): the agent touches this file when the cloud
+# asks for a state refresh; we re-arm the SIM/APN/bias probe throttles so the
+# next loop tick re-reads everything, instead of waiting out the intervals.
+# The agent owns the directory; this daemon (root) reads and deletes the flag.
+REFRESH_FLAG_FILE="${SIM7600_REFRESH_FLAG_FILE:-/var/lib/xorgate/refresh-modem.flag}"
+
 # GPS / GNSS
 ENABLE_GPS="${SIM7600_ENABLE_GPS:-1}"   # set 0 to skip enabling GNSS
 # Constellations on top of GPS (AT+CGNSSMODE bitmask): 1 GLONASS, 2 BeiDou,
@@ -423,6 +450,19 @@ gnss_health_state() {
 #     "modem_only": 1 when $IFACE is the ONLY default route — losing LTE loses
 #                   the device — else 0
 #   }
+#   "cellular": {  APN apply machinery (Phase 2). ABSENT on a daemon predating
+#                  it — which readers MUST treat as "no rollback safety net on
+#                  this device" and refuse to write the cellular namespace.
+#     "state":         "in-force" | "applying" | "rolled-back" | "rejected"
+#     "apn_applied":   the APN in the modem's data context (AT+CGDCONT? ctx 1,
+#                      NV truth), key omitted while never read / NV holds none
+#     "apn_requested": last non-empty desired value seen, key omitted when none
+#     "last_error":    why the last apply rolled back / was rejected; omitted
+#                      when the last transition was clean
+#     "fails":         failed applies of apn_requested (cap APN_MAX_FAILS,
+#                      keyed on the VALUE — a new value resets it)
+#     "changed_at":    ISO ts of the last state transition, or null
+#   }
 # }
 write_telemetry() {
     local csq="$1"
@@ -504,6 +544,19 @@ write_telemetry() {
         sim_block+=", \"checked_at\": $(iso_or_null "$SIM_CHECKED_AT")}"
     fi
 
+    # APN machinery block (Phase 2) — omitted until the applied APN has been
+    # read or a request seen; its ABSENCE is how readers spot a pre-Phase-2
+    # daemon with no rollback support.
+    local cellular_block="null"
+    if [[ -n "$APN_STATE" ]]; then
+        cellular_block="{\"state\": \"$APN_STATE\""
+        [[ -n "$APN_APPLIED" ]]    && cellular_block+=", \"apn_applied\": \"$APN_APPLIED\""
+        [[ -n "$APN_REQUESTED" ]]  && cellular_block+=", \"apn_requested\": \"$APN_REQUESTED\""
+        [[ -n "$APN_LAST_ERROR" ]] && cellular_block+=", \"last_error\": \"$APN_LAST_ERROR\""
+        cellular_block+=", \"fails\": ${APN_FAILS:-0}"
+        cellular_block+=", \"changed_at\": $(iso_or_null "$APN_CHANGED_AT")}"
+    fi
+
     local up_devs up_primary up_modem_only=0
     up_devs=$(uplink_default_devs)
     up_primary=$(uplink_primary)
@@ -550,6 +603,7 @@ write_telemetry() {
     "last_lte_ok": $(iso_or_null "$LAST_LTE_OK")
   },
   "sim": $sim_block,
+  "cellular": $cellular_block,
   "uplink": {
     "primary": $uplink_primary_json,
     "modem_only": $up_modem_only
@@ -921,6 +975,409 @@ uplink_primary() {
 uplink_default_devs() {
     ip -4 route show default 2>/dev/null \
         | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u
+}
+
+# --- APN apply-and-confirm (manage_sim_card_info_in_settings, Phase 2) --------
+# The one WRITABLE modem setting this daemon owns, and the one that can strand
+# a fielded device (README §5). Design rules, all load-bearing:
+#
+#   1. ABSENT MEANS DON'T TOUCH. No `cellular` namespace / empty apn -> no
+#      AT+CGDCONT write, ever. Every fielded device has a working APN in NV.
+#   2. Compare against the APPLIED value (AT+CGDCONT?, the modem's own NV),
+#      never the last requested one — a daemon restart must not re-apply an
+#      APN already in force, and settings.json is not the truth about the modem.
+#   3. Apply-and-confirm: a change must prove REAL traffic over $IFACE inside
+#      APN_CONFIRM_WINDOW (ping, then a TCP fallback for ICMP-dropping
+#      carriers) or the previous APN is written back and re-dialed.
+#   4. The way back is persisted to APN_STATE_FILE BEFORE the modem is touched,
+#      and the file lives outside /run — a crash or power cut mid-apply rolls
+#      back on the next daemon start (apn_startup_recover).
+#   5. The retry cap keys on the VALUE: APN_MAX_FAILS failed applies of the
+#      same string -> "rejected", no further attempts until the value changes.
+#      A tech trying three different APNs gets three real attempts.
+#   6. NOTHING here restarts this service, and the value is charset-checked in
+#      THIS script before interpolation (settings.json is not trusted): a quote
+#      or CR/LF could terminate the AT command and inject a second one.
+APN_APPLIED=""        # what AT+CGDCONT? ctx 1 last read — modem NV truth
+APN_REQUESTED=""      # last non-empty desired value seen (persisted across restarts)
+APN_STATE=""          # "" (nothing known) | in-force | applying | rolled-back | rejected
+APN_LAST_ERROR=""     # static strings only — interpolated into telemetry JSON
+APN_CHANGED_AT=0      # epoch of the last state transition
+APN_CHECK_AT=-9999    # negative so the first maintain tick fires immediately
+APN_FAILS=0           # failed applies of APN_REQUESTED (the CURRENT value)
+
+# Pure: context 1's APN out of an AT+CGDCONT? response.
+#   +CGDCONT: 1,"IP","sp.mb.com","0.0.0.0",0,0
+apn_from_cgdcont() {
+    sed -n 's/.*+CGDCONT: 1,"[^"]*","\([^"]*\)".*/\1/p' <<< "$1" | head -1
+}
+
+# Pure: the ONLY charset this script will ever interpolate into an AT command.
+apn_valid() {
+    [[ "$1" =~ ^[A-Za-z0-9.-]{1,100}$ ]]
+}
+
+# Desired APN from settings.json: prints "absent", "empty", "invalid", or
+# "ok <apn>". python3, not jq (jq is not guaranteed on the device); any read
+# failure resolves to "absent" — the answer that touches nothing.
+apn_desired() {
+    python3 - "$SETTINGS_FILE" 2>/dev/null <<'PYEOF' || echo "absent"
+import json, re, sys
+try:
+    with open(sys.argv[1]) as f:
+        cell = json.load(f).get("cellular")
+    apn = cell.get("apn") if isinstance(cell, dict) else None
+    if apn is None:
+        print("absent")
+    elif not isinstance(apn, str):
+        print("invalid")
+    elif apn == "":
+        print("empty")
+    elif re.fullmatch(r"[A-Za-z0-9.-]{1,100}", apn):
+        print("ok " + apn)
+    else:
+        print("invalid")
+except Exception:
+    print("absent")
+PYEOF
+}
+
+# Persist the apply/rollback state (atomic: tmp + mv). phase is "applying"
+# while the modem may hold a change that has not been confirmed — recovery
+# rolls back unconditionally whenever it finds that phase.
+apn_state_save() {
+    local phase="$1" requested="$2" previous="$3" fails="$4"
+    mkdir -p "$(dirname "$APN_STATE_FILE")" 2>/dev/null || true
+    local tmp="${APN_STATE_FILE}.tmp"
+    printf '{"phase": "%s", "requested": "%s", "previous": "%s", "fails": %d}\n' \
+        "$phase" "$requested" "$previous" "$fails" > "$tmp" 2>/dev/null || return 1
+    mv "$tmp" "$APN_STATE_FILE" 2>/dev/null || return 1
+}
+
+# Read the persisted state: prints "phase requested previous fails" with "-"
+# for empty fields (values are charset-limited, so space-splitting is safe).
+# Any unreadable/garbled file reads as nothing-in-flight.
+apn_state_read() {
+    python3 - "$APN_STATE_FILE" 2>/dev/null <<'PYEOF' || echo "- - - 0"
+import json, re, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    ok = re.compile(r"[A-Za-z0-9.-]{0,100}$")
+    phase = d.get("phase") if d.get("phase") in ("applying", "done") else ""
+    req = d.get("requested"); prev = d.get("previous"); fails = d.get("fails")
+    if not (isinstance(req, str) and ok.fullmatch(req)): req = ""
+    if not (isinstance(prev, str) and ok.fullmatch(prev)): prev = ""
+    if not isinstance(fails, int) or fails < 0 or fails > 99: fails = 0
+    print("%s %s %s %d" % (phase or "-", req or "-", prev or "-", fails))
+except Exception:
+    print("- - - 0")
+PYEOF
+}
+
+# Read the APPLIED APN off the modem into APN_APPLIED. Ctx 1 can legitimately
+# hold no APN, so an "OK" with no +CGDCONT line is still a confirmed (empty)
+# read; only a lost response leaves the cache alone. Returns 0 on a confirmed
+# read.
+apn_read_applied() {
+    local raw
+    raw=$(at_query "AT+CGDCONT?" 6)
+    if grep -q "+CGDCONT:\|OK" <<< "$raw"; then
+        # NV-sourced text still goes through the charset filter before it can
+        # reach telemetry JSON or a future AT interpolation.
+        APN_APPLIED=$(apn_from_cgdcont "$raw" | tr -cd 'A-Za-z0-9.-' | cut -c1-100)
+        [[ -z "$APN_STATE" ]] && APN_STATE="in-force"
+        return 0
+    fi
+    return 1
+}
+
+# One AT+CGDCONT write, verdict observed (at_query, never fire-and-forget).
+# EVERY write is logged at the port boundary: this is the single place a
+# CGDCONT set can be issued, so "no such log line" IS the evidence that a
+# device was never touched — the DoD's absence proof, not an inference.
+apn_write_cgdcont() {
+    local apn="$1"
+    apn_valid "$apn" || return 1
+    log "AT port: writing AT+CGDCONT=1,\"IP\",\"$apn\""
+    grep -q "OK" <<< "$(at_query "AT+CGDCONT=1,\"IP\",\"$apn\"" 6)"
+}
+
+# Drop the data bearer so the NEXT activation attaches with the APN just
+# written. Load-bearing, and every line of it bench-verified (2026-08-09):
+#   - AT+CGDCONT only takes effect on the next activation, and AT+NETCLOSE
+#     does NOT deactivate the context — without a bounce a bogus APN
+#     "confirmed end-to-end" over the still-attached old bearer, the exact
+#     false success the confirm step exists to prevent.
+#   - AT+CGACT=0,1 alone CANNOT do it either: on this firmware it returns
+#     ERROR with context 1 left active — including after a clean NETCLOSE —
+#     because ctx 1 is the initial default EPS bearer. It is tried first
+#     anyway (harmless, and the right tool on firmwares where it works), but
+#     the reliable mechanism is a PS detach/re-attach, the same tool recovery
+#     L1 already uses. Verified: after CGATT 0/1 the network genuinely
+#     re-evaluates ctx 1's APN (a bogus one is left unactivated with no
+#     address, which is what makes the confirm fail honestly).
+# bring_up_interface re-activates via its wan_ip_up check (AT+CGACT=1,1).
+apn_pdp_bounce() {
+    at_query "AT+CGACT=0,1" 10 >/dev/null
+    at_query "AT+CGATT=0" 15 >/dev/null
+    sleep 2
+    at_query "AT+CGATT=1" 20 >/dev/null
+    sleep 2
+}
+
+# End-to-end confirm bound to $IFACE. ICMP first (wan_ping_ok is already
+# interface-bound and dual-target); some carriers drop ICMP, so a bounded TCP
+# connect (SO_BINDTODEVICE — this daemon runs as root) gets the second opinion
+# before anything is rolled back. Prints which check passed; rc 1 = both failed.
+apn_confirm_traffic() {
+    if wan_ping_ok 2; then echo "ping"; return 0; fi
+    local host
+    for host in $APN_TCP_HOSTS; do
+        if python3 - "$IFACE" "$host" 2>/dev/null <<'PYEOF'
+import socket, sys
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, 25, (sys.argv[1] + "\0").encode())  # SO_BINDTODEVICE
+    s.settimeout(8)
+    s.connect((sys.argv[2], 443))
+    s.close()
+except Exception:
+    sys.exit(1)
+PYEOF
+        then echo "tcp"; return 0; fi
+    done
+    return 1
+}
+
+# Finish anything a previous boot (or a failed rollback write) left half done.
+# Called at daemon start and after every modem reset, in both cases BEFORE any
+# dialing. Unconditional: phase "applying" means the modem may hold an APN that
+# was never confirmed, and the only safe exit is back to `previous`.
+apn_startup_recover() {
+    local phase req prev fails
+    read -r phase req prev fails <<< "$(apn_state_read)"
+    [[ "$req" == "-" ]] && req=""
+    [[ "$prev" == "-" ]] && prev=""
+    APN_FAILS="$fails"
+    [[ -n "$req" ]] && APN_REQUESTED="$req"
+    if [[ "$phase" != "applying" ]]; then
+        return 0
+    fi
+    APN_FAILS=$(( APN_FAILS + 1 ))
+    warn "APN apply of \"${req:-?}\" was interrupted (restart/reset mid-apply) — restoring previous APN \"${prev}\" unconditionally (failure $APN_FAILS/$APN_MAX_FAILS for this value)."
+    if [[ -n "$prev" ]] && ! apn_valid "$prev"; then
+        err "persisted previous APN failed validation — refusing to write it; modem NV left as-is."
+        apn_state_save "done" "$req" "" "$APN_FAILS"
+        return 1
+    fi
+    if [[ -z "$prev" || "$APN_APPLIED" == "$prev" ]] || { { apn_write_cgdcont "$prev" || apn_write_cgdcont "$prev"; } && apn_pdp_bounce; }; then
+        [[ -n "$prev" ]] && APN_APPLIED="$prev"
+        APN_STATE="rolled-back"
+        APN_LAST_ERROR="apply interrupted by a restart; previous APN restored"
+        APN_CHANGED_AT=$(date +%s)
+        apn_state_save "done" "$req" "$prev" "$APN_FAILS"
+        if (( APN_FAILS >= APN_MAX_FAILS )); then
+            APN_STATE="rejected"
+            err "APN \"$req\" has now failed $APN_FAILS times — rejected until the value changes."
+        fi
+        return 0
+    fi
+    # Both rollback writes lost: leave phase=applying so the NEXT recovery
+    # (reset exit, daemon restart) retries — the way back is never discarded.
+    err "rollback CGDCONT write failed twice — leaving recovery armed for the next modem contact."
+    APN_STATE="rolled-back"
+    APN_LAST_ERROR="rollback write failed; retrying on next modem contact"
+    APN_CHANGED_AT=$(date +%s)
+    apn_state_save applying "$req" "$prev" "$APN_FAILS"
+    return 1
+}
+
+# The apply itself: commit-confirm with automatic rollback (network gear's
+# `commit confirm`, borrowed deliberately). Synchronous — this daemon is
+# single-threaded and owns the AT port, so nothing else can interleave.
+# Telemetry keeps being written inside the confirm wait so readers (boot
+# policy, the agent's report plane) never see a stale file during the window.
+apn_apply() {
+    local new="$1"
+    local previous="$APN_APPLIED"
+    warn "APN change: applying \"$new\" (previous \"$previous\"; confirm window ${APN_CONFIRM_WINDOW}s; attempt $(( APN_FAILS + 1 ))/$APN_MAX_FAILS for this value)."
+    APN_STATE="applying"
+    APN_REQUESTED="$new"
+    APN_LAST_ERROR=""
+    APN_CHANGED_AT=$(date +%s)
+    # Rule 4: persist the way back BEFORE the modem is touched.
+    apn_state_save applying "$new" "$previous" "$APN_FAILS"
+    write_telemetry "$(get_csq)" "connecting" "$APN_CHECK_INTERVAL"
+
+    teardown_interface
+    if ! apn_write_cgdcont "$new"; then
+        # The modem refused the write outright — NV unchanged, redial as before.
+        APN_FAILS=$(( APN_FAILS + 1 ))
+        APN_STATE="rolled-back"
+        APN_LAST_ERROR="modem rejected the CGDCONT write"
+        APN_CHANGED_AT=$(date +%s)
+        apn_state_save "done" "$new" "$previous" "$APN_FAILS"
+        (( APN_FAILS >= APN_MAX_FAILS )) && APN_STATE="rejected"
+        warn "AT+CGDCONT write for \"$new\" was rejected by the modem (failure $APN_FAILS/$APN_MAX_FAILS)."
+        bring_up_interface || true
+        return 1
+    fi
+
+    # The new APN only binds on the next PDP activation — force one.
+    apn_pdp_bounce
+
+    # Re-dial and confirm until the window closes. bring_up_interface verifies
+    # end-to-end ICMP itself; when only ICMP is blocked the bearer still comes
+    # up, and the TCP fallback catches that before rollback fires.
+    local deadline=$(( SECONDS + APN_CONFIRM_WINDOW )) via=""
+    while true; do
+        if bring_up_interface; then
+            via="ping"
+            break
+        fi
+        if via=$(apn_confirm_traffic); then
+            break
+        fi
+        via=""
+        (( SECONDS >= deadline )) && break
+        write_telemetry "$(get_csq)" "connecting" "$APN_CHECK_INTERVAL"
+        sleep 5
+    done
+
+    if [[ -n "$via" ]]; then
+        APN_APPLIED="$new"
+        APN_STATE="in-force"
+        APN_LAST_ERROR=""
+        APN_FAILS=0
+        APN_CHANGED_AT=$(date +%s)
+        apn_state_save "done" "$new" "$previous" 0
+        log "APN \"$new\" confirmed end-to-end (via $via) — in force."
+        return 0
+    fi
+
+    # Confirm failed: restore the previous APN and prove the way back worked.
+    APN_FAILS=$(( APN_FAILS + 1 ))
+    warn "APN \"$new\" passed no traffic within ${APN_CONFIRM_WINDOW}s (ping AND tcp failed) — rolling back to \"$previous\" (failure $APN_FAILS/$APN_MAX_FAILS for this value)."
+    teardown_interface
+    if [[ -z "$previous" ]] || apn_write_cgdcont "$previous" || apn_write_cgdcont "$previous"; then
+        [[ -n "$previous" ]] && apn_pdp_bounce
+        APN_APPLIED="$previous"
+        APN_STATE="rolled-back"
+        APN_LAST_ERROR="no data session within ${APN_CONFIRM_WINDOW}s (ping and tcp both failed)"
+        APN_CHANGED_AT=$(date +%s)
+        apn_state_save "done" "$new" "$previous" "$APN_FAILS"
+    else
+        # The way back is NOT given up: phase stays "applying" so the startup /
+        # post-reset recovery retries the restore on the next modem contact.
+        err "rollback CGDCONT write failed twice — recovery stays armed."
+        APN_STATE="rolled-back"
+        APN_LAST_ERROR="rollback write failed; retrying on next modem contact"
+        APN_CHANGED_AT=$(date +%s)
+        apn_state_save applying "$new" "$previous" "$APN_FAILS"
+    fi
+    if (( APN_FAILS >= APN_MAX_FAILS )); then
+        APN_STATE="rejected"
+        err "APN \"$new\" has failed $APN_FAILS times — rejected; the value must change before another attempt."
+    fi
+    bring_up_interface || true
+    return 1
+}
+
+# Self-throttled maintain tick — the ONLY entry point the loops call. Ordered
+# so every no-op exits before any AT traffic; the DoD "a device with no
+# cellular namespace never sees a CGDCONT write" hangs on these early returns.
+apn_maintain() {
+    (( SECONDS - APN_CHECK_AT >= APN_CHECK_INTERVAL )) || return 0
+    APN_CHECK_AT=$SECONDS
+
+    local verdict desired
+    verdict=$(apn_desired)
+    case "$verdict" in
+        absent|empty)
+            # Rule 1. Also clears a stale verdict for a WITHDRAWN request, so a
+            # rolled-back badge does not outlive the operator removing the ask.
+            if [[ -n "$APN_REQUESTED" && "$APN_REQUESTED" != "$APN_APPLIED" ]]; then
+                log "APN request \"$APN_REQUESTED\" withdrawn (settings: $verdict) — modem keeps \"$APN_APPLIED\"."
+                APN_REQUESTED=""
+                [[ -n "$APN_STATE" ]] && APN_STATE="in-force"
+                APN_LAST_ERROR=""
+                APN_FAILS=0
+                APN_CHANGED_AT=$(date +%s)
+                apn_state_save "done" "" "$APN_APPLIED" 0
+            fi
+            return 0 ;;
+        invalid)
+            # Rule 6: never let a bad value NEAR the AT port. The agent's own
+            # allowlist should make this unreachable; belt and braces.
+            if [[ "$APN_STATE" != "rejected" || "$APN_LAST_ERROR" != "invalid APN in settings.json" ]]; then
+                warn "cellular.apn in settings.json is invalid (bad characters or too long) — refusing to touch the modem."
+                APN_STATE="rejected"
+                APN_LAST_ERROR="invalid APN in settings.json"
+                APN_CHANGED_AT=$(date +%s)
+            fi
+            return 0 ;;
+        ok\ *)
+            desired="${verdict#ok }" ;;
+        *)
+            return 0 ;;
+    esac
+    apn_valid "$desired" || return 0   # unreachable after "ok"; defence in depth
+
+    # Rule 2: compare against the modem's APPLIED value.
+    if [[ "$desired" == "$APN_APPLIED" ]]; then
+        if [[ "$APN_STATE" != "in-force" || "$APN_REQUESTED" != "$desired" ]]; then
+            APN_REQUESTED="$desired"
+            APN_STATE="in-force"
+            APN_LAST_ERROR=""
+            APN_FAILS=0
+            APN_CHANGED_AT=$(date +%s)
+            apn_state_save "done" "$desired" "$APN_APPLIED" 0
+        fi
+        return 0
+    fi
+
+    # Rule 5: the cap keys on the value. A NEW value earns a fresh budget.
+    if [[ "$desired" != "$APN_REQUESTED" ]]; then
+        APN_FAILS=0
+    elif (( APN_FAILS >= APN_MAX_FAILS )); then
+        if [[ "$APN_STATE" != "rejected" ]]; then
+            APN_STATE="rejected"
+            APN_CHANGED_AT=$(date +%s)
+        fi
+        return 0
+    fi
+
+    # Never burn an attempt on coverage: unregistered means the confirm can
+    # only fail for reasons that say nothing about the APN. Stays pending.
+    if ! is_registered; then
+        log "APN change to \"$desired\" deferred — not registered (stat=$LAST_REG)."
+        return 0
+    fi
+
+    # The rollback target must be current before anything is written.
+    apn_read_applied || { warn "APN change deferred — could not read the applied APN off the modem."; return 0; }
+    if [[ "$desired" == "$APN_APPLIED" ]]; then
+        return 0   # the fresh read says it is already in force
+    fi
+
+    apn_apply "$desired" || true
+}
+
+# On-demand refresh (Phase 2 §4d): one flag-file stat per loop tick. The agent
+# touches the file when the cloud asks; we re-arm every probe throttle so the
+# next tick re-reads SIM identity, applied APN and antenna bias immediately.
+maybe_refresh_flag() {
+    [[ -f "$REFRESH_FLAG_FILE" ]] || return 0
+    rm -f "$REFRESH_FLAG_FILE" 2>/dev/null || true
+    log "State refresh requested — re-arming SIM/APN/bias probes."
+    SIM_CHECK_AT=-9999
+    # A re-probe must also re-read the card identity: a refresh is exactly the
+    # "I just swapped the SIM, show me" path.
+    SIM_ICCID=""; SIM_MSISDN=""; SIM_CARRIER=""; SIM_ACT=""; SIM_COPS_REG=""
+    APN_CHECK_AT=-9999
+    apn_read_applied || true
+    LAST_BIAS_CHECK=0
 }
 
 # --- GPS / GNSS --------------------------------------------------------------
@@ -1685,6 +2142,15 @@ gnss_recover_after_reset() {
     SIM_CHECK_AT=-9999
     wait_for_modem_reboot || return 1
     log "Modem back after reset — running unified GNSS recovery."
+    # APN (Phase 2): the modem is back — refresh the applied-APN cache off NV
+    # (a reset must not leave us trusting our own memory) and retry any
+    # rollback that is still armed (a failed rollback write leaves the state
+    # file in phase=applying precisely so this path finishes the job). ABOVE
+    # the ENABLE_GPS early-return, deliberately: the way back to a working APN
+    # must not depend on GPS being enabled — Phase 1 shipped a bug on exactly
+    # this line, and the rollback state has the same requirement.
+    apn_read_applied || true
+    apn_startup_recover || true
     if [[ "$ENABLE_GPS" != "1" ]]; then
         log "GNSS recovery skipped (SIM7600_ENABLE_GPS=$ENABLE_GPS)."
         return 0
@@ -2023,9 +2489,16 @@ wait_for_stable_signal() {
     while true; do
         local csq dbm
         csq=$(get_csq)
+        maybe_refresh_flag
         maybe_update_modem_temp
         maybe_update_modem_clock
         maybe_update_sim
+        # A pending APN change is picked up here too: a device that cannot
+        # register on the CURRENT APN's network still re-reads settings, so a
+        # local `xorgate set apn` (or a cloud change over a second link) is not
+        # trapped behind a connection that will never come up. apn_maintain
+        # itself defers the actual apply until registered.
+        apn_maintain
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
 
@@ -2117,9 +2590,15 @@ monitor_connection() {
 
         local csq dbm interval
         csq=$(get_csq)
+        maybe_refresh_flag
         maybe_update_modem_temp
         maybe_update_modem_clock
         maybe_update_sim
+        # APN maintain runs on the healthy loop too — an in-force link is
+        # exactly where a deliberate APN change arrives from the cloud. The
+        # apply is synchronous (commit-confirm-rollback) and the monitor simply
+        # resumes pinging whatever link state it left behind.
+        apn_maintain
         dbm=$(csq_to_dbm "$csq")
         interval=$(adaptive_interval "$csq" "$prev_csq")
         prev_csq="$csq"
@@ -2171,6 +2650,13 @@ main() {
 
     wait_for_serial || exit 1
     wait_for_modem_ready || exit 1
+
+    # APN (Phase 2): read what the modem actually holds (context 1 NV) and
+    # finish any apply a previous boot left half-done — BEFORE anything dials.
+    # The applied value is the rollback anchor and the comparison target for
+    # apn_maintain; settings.json is never trusted to know it.
+    apn_read_applied || warn "could not read the applied APN at startup — will retry before any change."
+    apn_startup_recover || true
 
     # Configure + start GNSS once the AT interface is up so NMEA flows on the
     # GPS port. May AT+CRESET once on first boot (or config drift) to apply

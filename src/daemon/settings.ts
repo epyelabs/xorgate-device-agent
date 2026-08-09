@@ -195,6 +195,39 @@ export function parseTimeSyncSettings(v: unknown): TimeSyncSettings | undefined 
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * Cellular data-context settings (manage_sim_card_info plan, Phase 2) — the
+ * `cellular` namespace in settings.json, read LIVE by the sim7600-lte daemon
+ * (~30 s poll; never a restart). ABSENT namespace or EMPTY apn = leave the
+ * modem's stored APN untouched — the safe default for every fielded device.
+ * A non-empty APN is applied by the daemon with confirm-and-rollback.
+ */
+export interface CellularSettings {
+  /** APN for PDP context 1. "" or absent = don't touch modem NV. */
+  apn?: string;
+}
+
+/**
+ * The one charset this stack will ever interpolate into an AT command. Shared
+ * by the cloud schema, this parser and the daemon's own re-check: the value
+ * crosses a trust boundary at each hop, and each hop validates it again.
+ */
+export const APN_RE = /^[A-Za-z0-9.-]{0,100}$/;
+
+/**
+ * Validate an untrusted `cellular` value. STRICTER than the sibling parsers'
+ * forgiving posture, deliberately: a clamped rateHz degrades gracefully, but a
+ * "repaired" APN is a different APN — and a wrong APN can strand a device. An
+ * invalid apn is DROPPED (never truncated or stripped into something else),
+ * which resolves to "don't touch the modem", the only safe fallback.
+ */
+export function parseCellularSettings(v: unknown): CellularSettings | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const apn = (v as { apn?: unknown }).apn;
+  if (typeof apn !== "string" || !APN_RE.test(apn)) return undefined;
+  return { apn };
+}
+
 export interface AgentSettings {
   mode?: RunMode;
   /*
@@ -236,6 +269,13 @@ export interface AgentSettings {
    * (stepping on, 10 s threshold).
    */
   timeSync?: TimeSyncSettings;
+  /**
+   * Cellular data context (see CellularSettings). Set from the web device
+   * settings page or `xorgate set apn`; read LIVE by the sim7600-lte daemon,
+   * which applies a change with confirm-and-rollback. Absent = the modem's
+   * stored APN is left alone.
+   */
+  cellular?: CellularSettings;
 }
 
 /** Clamp `rateHz` to what the collectors can produce (IMU caps at 20 Hz). */
@@ -474,6 +514,8 @@ function parseSettingsObject(obj: Record<string, unknown>): AgentSettings {
   if (lteRecovery) out.lteRecovery = lteRecovery;
   const timeSync = parseTimeSyncSettings((obj as { timeSync?: unknown }).timeSync);
   if (timeSync) out.timeSync = timeSync;
+  const cellular = parseCellularSettings((obj as { cellular?: unknown }).cellular);
+  if (cellular) out.cellular = cellular;
   return out;
 }
 

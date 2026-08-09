@@ -522,6 +522,85 @@ just supervised in-process with restart-on-crash. A device with multiple cameras
 Status shows in the monitor's **Media** pane (per-channel state) and in the
 telemetry payload's `media.kvs` / `media.streams`.
 
+## RGB status LED (`MODE=real`, Argus carrier)
+
+The carrier's user-facing RGB LED is the **only indicator visible from outside
+the enclosure**, so it is driven as a status light: someone looking at the box
+can tell whether it is working, waiting, or broken. Printable operator card:
+[`plans/done/rgb_led_events/LEGEND.md`](../../plans/done/rgb_led_events/LEGEND.md).
+
+**Strict priority — first match wins.** The single definition is `LED_LADDER` in
+[`src/lib/led-state.ts`](src/lib/led-state.ts); `xorgate led test` walks that
+same array, so the table below and the code cannot drift.
+
+| Pri | Colour | Pattern | Means | Resolved from |
+| --- | ------ | ------- | ----- | ------------- |
+| 0 | white | solid | Starting up (no real state yet) | `starting` |
+| 1 | red | solid | **Agent not running** | systemd `ExecStopPost`, not the resolver |
+| 2 | red | blink-fast (~4 Hz) | Power fault — undervoltage / shedding | `liveBlock.reason === "undervoltage"`, else a bare `powerShed` |
+| 4 | cyan | blink-slow (~1 Hz) | Running hot — thermal shed, still recording | `liveBlock.reason === "thermal"` |
+| 5 | purple | blink-fast | Network trouble — LTE/cloud down, recovering | `lte.status` + `connection` |
+| 6 | blue | blink-slow | Waiting for a GPS fix | `gnss.fix`, or `liveBlock.reason === "gps-gate"` |
+| 7 | green | heartbeat (double-pulse / 5.5 s) | Healthy | everything else |
+| — | white | flash2 | Settings applied / command accepted | worker event, pre-empts all |
+
+**There is no rung 3.** "Data loss" was designed and deferred: `droppedSegments`
+is a *lifetime* counter, so consuming it would latch a permanent false alarm.
+It returns when `DiskManager` publishes a debounced "evicting now" verdict.
+
+**The LED is a renderer, not a policy engine.** `resolveLedState()` is pure — no
+I/O, no clocks — and only *ranks* verdicts other modules already publish. It
+never re-derives one; a second evaluation is how the reason and the reality come
+apart. Unknowns fail open: a null LTE feed, a missing GNSS receiver or an
+unrecognised `liveBlock.reason` all resolve toward *healthy*, never to red.
+
+Two rules that look like bugs but are not:
+
+- **A declared LTE `dead_zone` is green, not purple.** Purple means "trying and
+  failing"; settled no-coverage is not a fault, and `boot-policy.ts` already
+  treats `dead_zone` as resolved. It also suppresses the cloud-link clause —
+  otherwise "dead zone is green" could never hold, since the cloud is
+  necessarily down there.
+- **A thermal shed is cyan even though it sets `powerShed` exactly like a power
+  shed does.** Both walk the same ladder, so `liveBlock.reason` is consulted
+  first. Keying off `powerShed` alone paints overheating boxes red and sends
+  someone to check the power supply.
+
+**No yellow/amber.** Measured on real hardware: the red die is weak on this
+package, so r+g reads as "yellowish, leaning green" and cannot be identified on
+its own. Everything amber would have carried is purple.
+
+```
+src/hardware/led.ts       # driver: pinctrl, colour+pattern → pins (r=12 g=21 b=16, active high)
+src/lib/led-state.ts      # LED_LADDER + pure resolveLedState(signals)
+src/agent/led-manager.ts  # ticks off the worker's 1 Hz loop; owns the flash overlay
+src/commands/led.ts       # xorgate led <colour> [pattern] | off | test | boot | exit-state
+```
+
+Bench use — `test` is the one to run with someone watching the device:
+
+```sh
+xorgate led test                 # walk every rung, printing each label
+xorgate led purple blink-fast    # hold one state (Ctrl-C leaves it dark)
+xorgate led off
+```
+
+Pins are **hardcoded** for Argus CM5 Rev1 in `STATUS_LED_MAP`; a device-model
+driven map is a later plan and only that constant's *source* changes. The driver
+self-gates: off a Pi, without `pinctrl`, or with a pin already held by another
+driver, it goes inert and everything else stays healthy. `pinctrl` needs no root
+— do not add `sudo`. See also the Audio warning below: an audio overlay can
+steal GPIO16/21 out from under it.
+
+The unit drives the two states the agent cannot report about itself:
+
+```
+ExecStartPre=-/usr/local/bin/xorgate led boot        # white while coming up
+ExecStopPost=-/usr/local/bin/xorgate led exit-state  # $SERVICE_RESULT: clean stop → dark, crash → solid red
+```
+
+Both are `-` prefixed so a failing LED can never stop the agent.
+
 ## Audio (I2S mic) — present on the board, not used
 
 The Argus carrier has an input-only I2S MEMS microphone (GPIO18/19/20), but

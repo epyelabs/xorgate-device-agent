@@ -63,6 +63,15 @@ const SYSTEM_ASSETS: Array<[src: string, dest: string, mode: number]> = [
 ];
 
 const CLOCK_SUDOERS_DEST = "/etc/sudoers.d/021_xorgate-clock";
+const UPDATE_SUDOERS_DEST = "/etc/sudoers.d/022_xorgate-update";
+
+// The oneshot unit that runs THIS command as root when the cloud asks for an
+// update (device_update_management, Phase 3). Installed here as well as by the
+// install script so an already-fielded device picks it up on its next (manual,
+// last-ever-manual) update — that is the chicken-and-egg crossing: a device can
+// only be updated remotely once it runs a build that ships the unit.
+const UPDATER_UNIT_SRC = "systemd/xorgate-updater.service";
+const UPDATER_UNIT_DEST = "/etc/systemd/system/xorgate-updater.service";
 
 const log = (s: string): void => console.log(`[xorgate] ${s}`);
 const fail = (s: string): never => {
@@ -113,6 +122,43 @@ async function installClockSudoers(): Promise<void> {
     }
     copyFileSync(tmp, CLOCK_SUDOERS_DEST);
     chmodSync(CLOCK_SUDOERS_DEST, 0o440);
+  } finally {
+    rmSync(join(tmp, ".."), { recursive: true, force: true });
+  }
+}
+
+/**
+ * Install the sudoers drop-in that lets the (non-root) agent start the updater
+ * unit — and only that, with those exact arguments.
+ *
+ * Exact-args is the whole security model here: the grant names one unit and one
+ * verb, so the agent (or anything that compromises it) cannot turn it into
+ * "start any unit as root". It is also why remote updates are latest-only —
+ * a `--tag`/`--from` argument would force a wildcard grant, i.e. installing an
+ * arbitrary URL as root.
+ *
+ * Same posture as installClockSudoers(): visudo-validated before it lands (a
+ * malformed sudoers file locks out sudo machine-wide), and a refusal is logged
+ * rather than fatal — the device keeps working, remote update just doesn't.
+ */
+async function installUpdateSudoers(): Promise<void> {
+  const user = serviceUser();
+  if (!user || user === "root") return; // root agent needs no sudo grant
+  const body =
+    `# Installed by xorgate. Allows the agent (running as ${user}) to start the\n` +
+    `# one-shot self-update unit on a cloud-issued 'update' command, and nothing\n` +
+    `# else. See device-agent src/agent/commands.ts + systemd/xorgate-updater.service.\n` +
+    `${user} ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block xorgate-updater.service\n`;
+  const tmp = join(mkdtempSync(join(tmpdir(), "xg-sudoers-")), "022_xorgate-update");
+  try {
+    writeFileSync(tmp, body, { mode: 0o440 });
+    const check = await run("visudo", ["-cf", tmp]);
+    if (check.failed || check.notFound) {
+      log("warning: update sudoers drop-in failed visudo validation; remote updates will not work");
+      return;
+    }
+    copyFileSync(tmp, UPDATE_SUDOERS_DEST);
+    chmodSync(UPDATE_SUDOERS_DEST, 0o440);
   } finally {
     rmSync(join(tmp, ".."), { recursive: true, force: true });
   }
@@ -245,6 +291,17 @@ export async function updateCommand(argv: string[]): Promise<void> {
       chmodSync(dest, mode);
     }
     await installClockSudoers();
+
+    // 5d. The remote-update rail (Phase 3): the oneshot unit that runs this
+    //     very command as root, plus its exact-args sudoers grant. Guarded on
+    //     the source existing so rolling BACK to a build without the unit does
+    //     not fail the install.
+    const updaterUnit = join(INSTALL_PREFIX, UPDATER_UNIT_SRC);
+    if (existsSync(updaterUnit)) {
+      copyFileSync(updaterUnit, UPDATER_UNIT_DEST);
+      chmodSync(UPDATER_UNIT_DEST, 0o644);
+      await installUpdateSudoers();
+    }
   } catch (err) {
     // Roll back to the previous build so we never leave a broken install.
     rmSync(INSTALL_PREFIX, { recursive: true, force: true });

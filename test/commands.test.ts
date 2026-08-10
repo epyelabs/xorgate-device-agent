@@ -38,6 +38,8 @@ describe("parseCommand", () => {
       expiresAt: T0 + 60_000,
     });
     expect(parseCommand(msg({ command: "power_off" }))?.command).toBe("power_off");
+    expect(parseCommand(msg({ command: "refresh" }))?.command).toBe("refresh");
+    expect(parseCommand(msg({ command: "update" }))?.command).toBe("update");
   });
 
   it("rejects malformed payloads and wrong versions", () => {
@@ -149,6 +151,24 @@ describe("executeCommand", () => {
     expect(calls).toEqual([
       ["sudo", ["-n", "systemctl", "reboot"]],
       ["sudo", ["-n", "systemctl", "poweroff"]],
+    ]);
+  });
+
+  it("starts the updater unit with the EXACT argv the sudoers grant allows", async () => {
+    // /etc/sudoers.d/022_xorgate-update grants exactly
+    //   <user> ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block xorgate-updater.service
+    // — an exact-args match. Any drift here (a reordered flag, a --tag, a
+    // different unit name) is refused by sudo at runtime, so pin it.
+    // `--no-block` is not decoration either: without it the blocking start
+    // would wait for a oneshot that finishes by restarting this very agent.
+    const calls: Array<[string, string[]]> = [];
+    const runner = async (cmd: string, args: string[]): Promise<RunResult> => {
+      calls.push([cmd, args]);
+      return okResult;
+    };
+    await executeCommand("update", runner);
+    expect(calls).toEqual([
+      ["sudo", ["-n", "systemctl", "start", "--no-block", "xorgate-updater.service"]],
     ]);
   });
 

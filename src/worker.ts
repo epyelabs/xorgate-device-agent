@@ -600,7 +600,20 @@ async function handleCommandMessage(payload: Buffer): Promise<void> {
   await publishCommandAck({ ...cmd, status: "accepted" });
 
   const res = await executeCommand(cmd.command);
-  if (!res.failed) return; // going down; systemd's SIGTERM drives shutdown()
+  if (!res.failed) {
+    // reboot/power_off: going down, systemd's SIGTERM drives shutdown().
+    // update: the oneshot updater was STARTED (--no-block returns at once); it
+    // runs outside our cgroup and restarts this unit when it is done, which is
+    // how the cloud learns the outcome — a fresh boot report carrying the new
+    // build. Nothing more to do here but leave a trail for journalctl.
+    if (cmd.command === "update") {
+      const t = Date.now();
+      console.log("[agent] updater started; this process will be replaced when it finishes");
+      store.event("info", "agent self-update started", t);
+      store.flush(t, true);
+    }
+    return;
+  }
   const t = Date.now();
   const reason = res.notFound
     ? "sudo not found"

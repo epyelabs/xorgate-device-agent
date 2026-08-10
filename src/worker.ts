@@ -48,8 +48,9 @@ import { ensureHome, runtimeHome, workerPath } from "./daemon/runtime.js";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { removePidfile, writePidfile } from "./daemon/pidfile.js";
+import { loadBuildInfo } from "./lib/build-info.js";
 
-const WRITTEN_BY = "xorgate-device-agent@0.2.0";
+const WRITTEN_BY = `xorgate-device-agent@${loadBuildInfo().packageVersion}`;
 
 const config = loadConfig();
 ensureHome();

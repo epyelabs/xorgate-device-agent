@@ -6,6 +6,7 @@ import { accessSync, constants } from "node:fs";
 import { inspect, type DaemonStatus } from "../daemon/manager.js";
 import { logPath, runtimeHome } from "../daemon/runtime.js";
 import { ageLabel, formatBytes, uptimeLabel } from "../lib/format.js";
+import { formatBuildInfo } from "../lib/build-info.js";
 
 const useColor = process.stdout.isTTY && process.env.NO_COLOR === undefined;
 const c = (code: string, s: string): string => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -69,6 +70,10 @@ function print(st: DaemonStatus, now: number): void {
       record.offline ? gray("   offline") : ""
     }`,
   );
+
+  // The installed build, read from this tree's baked manifest — the same string
+  // the agent reports to the cloud, so a field report and the web UI agree.
+  console.log(`  build      ${formatBuildInfo()}`);
 
   if (state) {
     console.log(`  endpoint   ${state.endpoint}`);

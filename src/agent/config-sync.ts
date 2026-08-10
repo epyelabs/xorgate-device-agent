@@ -42,6 +42,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "../lib/atomicWrite.js";
+import { loadBuildInfo } from "../lib/build-info.js";
 import { runtimeHome } from "../daemon/runtime.js";
 import {
   loadSettings,
@@ -591,7 +592,12 @@ export function buildEffective(
   // "device differs from defaults".
   const cellular = effectiveCellular(settings.cellular, modem.apn);
   if (cellular !== undefined) out.cellular = cellular;
-  if (mode !== undefined) out.agent = { mode };
+  // `build` rides alongside `mode` for the same reason and with the same rules:
+  // reported-only, not a config namespace, so it never appears in the desired
+  // document, never gets a `status` entry, and the local-edit fold-back cannot
+  // write it into `devices.config`. The cloud mirrors it into `agent_version`
+  // and the web UI polls it to confirm a remote update landed.
+  if (mode !== undefined) out.agent = { mode, build: loadBuildInfo() };
   if (modem.sim !== undefined) out.sim = modem.sim;
   if (modem.uplink !== undefined) out.uplink = modem.uplink;
   // The APN machinery itself is reported-only, like `sim` — it is what the UI

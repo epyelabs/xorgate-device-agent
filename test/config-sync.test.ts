@@ -1059,7 +1059,7 @@ describe("reported-only agent state", () => {
       desired: desiredFrom({ rev: 3, gnssAntBias: true }),
       mode: "real",
     });
-    expect(report.effective.agent).toEqual({ mode: "real" });
+    expect((report.effective.agent as Record<string, unknown>).mode).toBe("real");
     expect(report.status.agent).toBeUndefined();
     // The desired document has no `agent` namespace at all, so nothing here can
     // ever be compared against one.
@@ -1068,6 +1068,21 @@ describe("reported-only agent state", () => {
 
   it("omits it entirely when the caller does not supply a mode", () => {
     expect(buildEffective({}, NO_MODEM)).toEqual({});
+  });
+
+  it("carries the running build alongside the mode", () => {
+    const agent = buildEffective({}, NO_MODEM, "real").agent as {
+      mode: string;
+      build: Record<string, unknown>;
+    };
+    expect(agent.mode).toBe("real");
+    // Under vitest there is no dist/build-info.json, so this is the honest
+    // "hand-deployed tree" fallback — never a stale sha.
+    expect(typeof agent.build.version).toBe("string");
+    expect((agent.build.version as string).length).toBeGreaterThan(0);
+    expect(agent.build).toHaveProperty("channel");
+    expect(agent.build).toHaveProperty("builtAt");
+    expect(agent.build).toHaveProperty("packageVersion");
   });
 });
 

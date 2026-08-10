@@ -11,6 +11,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "stamp": "node scripts/stamp-build-info.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/cli.tsx",
     "start": "tsx src/cli.tsx start",

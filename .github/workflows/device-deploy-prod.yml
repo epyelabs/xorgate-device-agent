@@ -69,6 +69,13 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           TARBALL="xorgate-agent-${VERSION}.tar.gz"
+          # Bake the build's identity INTO the artifact (see the dev workflow) —
+          # on prod the version is the release tag rather than a short sha.
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          cat > dist/build-info.json <<EOF
+          { "version": "$VERSION", "channel": "prod", "builtAt": "$BUILT_AT", "packageVersion": "$PKG_VERSION" }
+          EOF
           # `python/` ships the BNO085 IMU helper the real-mode collector spawns;
           # `modem/` ships the SIM7600 connection-manager (daemon + systemd + udev)
           # the install script provisions for LTE uplink + GPS;
@@ -83,7 +90,10 @@ jobs:
           tar -tzf "$TARBALL" | grep -q "^systemd/xorgate-agent.service$" || { echo "missing systemd unit"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^python/bno085_read.py$" || { echo "missing python/bno085_read.py"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^modem/sim7600-lte.sh$" || { echo "missing modem/sim7600-lte.sh"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^dist/build-info.json$" || { echo "missing dist/build-info.json"; exit 1; }
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "builtAt=$BUILT_AT" >> "$GITHUB_OUTPUT"
+          echo "packageVersion=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -111,6 +121,9 @@ jobs:
         env:
           BUCKET: ${{ steps.bucket.outputs.name }}
           TARBALL: ${{ steps.pack.outputs.tarball }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          BUILT_AT: ${{ steps.pack.outputs.builtAt }}
+          PKG_VERSION: ${{ steps.pack.outputs.packageVersion }}
         run: |
           aws s3 cp "$TARBALL" "s3://$BUCKET/$TARBALL" \
             --cache-control "public,max-age=31536000,immutable" \
@@ -118,6 +131,15 @@ jobs:
           aws s3 cp "$TARBALL" "s3://$BUCKET/xorgate-agent-latest.tar.gz" \
             --cache-control "no-cache" \
             --content-type "application/gzip"
+          # Describes what the `latest` alias now points at — same step as the
+          # alias upload so the two cannot drift.
+          cat > latest.json <<EOF
+          { "version": "$VERSION", "channel": "prod", "builtAt": "$BUILT_AT",
+            "packageVersion": "$PKG_VERSION", "tarball": "$TARBALL" }
+          EOF
+          aws s3 cp latest.json "s3://$BUCKET/latest.json" \
+            --cache-control "no-cache" \
+            --content-type "application/json"
 
       - name: Summary
         if: always()
@@ -132,4 +154,5 @@ jobs:
             echo "- Bucket: \`$BUCKET\`"
             echo "  - \`s3://$BUCKET/xorgate-agent-$VERSION.tar.gz\` (immutable)"
             echo "  - \`s3://$BUCKET/xorgate-agent-latest.tar.gz\` (alias)"
+            echo "- Manifest: \`s3://$BUCKET/latest.json\`"
           } >> "$GITHUB_STEP_SUMMARY"

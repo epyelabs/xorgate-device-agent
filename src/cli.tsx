@@ -18,8 +18,11 @@ import { setCommand } from "./commands/set.js";
 import { pipelineCommand } from "./commands/pipeline.js";
 import { recordingCommand } from "./commands/recording.js";
 import { ledCommand } from "./commands/led.js";
+import { formatBuildInfo } from "./lib/build-info.js";
 
-const VERSION = "0.2.0";
+// `0.2.0 (a1b2c3d, dev)` for the banner; `-v` prints the same string so a field
+// report names the exact build, not just the release line.
+const VERSION = formatBuildInfo();
 /** Flags that take a value — skipped when locating the subcommand token. */
 const VALUE_FLAGS = new Set([
   "--device-id",
@@ -57,7 +60,7 @@ function splitCommand(av: string[]): { cmd: string | undefined; rest: string[] }
 
 async function main(): Promise<void> {
   if (argv.includes("-v") || argv.includes("--version")) {
-    console.log(VERSION);
+    console.log(`xorgate ${VERSION}`);
     return;
   }
   switch (cmd) {

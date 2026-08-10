@@ -5,7 +5,7 @@
  * `xorgate/devices/{deviceId}/command/response`, then executes.
  *
  * Payload shape:
- *   { "v": 1, "requestId": <uuid>, "command": "reboot"|"power_off",
+ *   { "v": 1, "requestId": <uuid>, "command": "reboot"|"power_off"|"refresh"|"update",
  *     "ts": <epoch ms issued>, "expiresAt": <epoch ms> }
  *
  * This is deliberately NOT the config plane (see plans/two-way-sync-config).
@@ -43,13 +43,22 @@ import { run, type RunResult } from "../lib/exec.js";
  * re-probing the modem repeatedly is still worth suppressing — but it is
  * executed in-process by the worker (touch a flag file + re-report), never via
  * `executeCommand`'s sudo path.
+ *
+ * `update` (device_update_management plan, Phase 3) starts the oneshot
+ * `xorgate-updater.service` and returns immediately; the updater then replaces
+ * this build and restarts the agent, so the "did it work" signal is the new
+ * build in the next config report, not the ack. Repeated presses are safe
+ * WITHOUT extra locking: distinct requestIds slip past the ledger (which only
+ * dedups broker redelivery), but `systemctl start` on an already-activating
+ * oneshot coalesces into the running job, so N commands cause one updater run.
  */
-export type DeviceCommandName = "reboot" | "power_off" | "refresh";
+export type DeviceCommandName = "reboot" | "power_off" | "refresh" | "update";
 
 const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>([
   "reboot",
   "power_off",
   "refresh",
+  "update",
 ]);
 
 /**
@@ -196,6 +205,17 @@ export function executeCommand(
       stdout: "",
       stderr: "refresh is handled in-process, not via executeCommand",
     });
+  }
+  if (command === "update") {
+    // These argv words must match /etc/sudoers.d/022_xorgate-update
+    // BYTE-FOR-BYTE — the grant is exact-args, so a reordered or extra flag is
+    // simply refused (which is the point: no wildcard = no arbitrary root).
+    //
+    // `--no-block` is load-bearing. A blocking `systemctl start` on a oneshot
+    // waits for the unit to FINISH, and the updater finishes by restarting this
+    // very agent — so we would be hanging inside exec while systemd kills us,
+    // and the ack/return path would never run.
+    return runner("sudo", ["-n", "systemctl", "start", "--no-block", "xorgate-updater.service"]);
   }
   const verb = command === "reboot" ? "reboot" : "poweroff";
   return runner("sudo", ["-n", "systemctl", verb]);

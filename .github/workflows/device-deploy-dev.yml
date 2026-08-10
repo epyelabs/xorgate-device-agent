@@ -72,6 +72,15 @@ jobs:
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           TARBALL="xorgate-agent-${SHORT_SHA}.tar.gz"
+          # Bake the build's identity INTO the artifact: until now the sha lived
+          # only in the S3 key and was discarded on extract, so an installed
+          # device could not say which build it was running. dist/ is rewritten
+          # by `npm run build`, so this manifest can never outlive its build.
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          cat > dist/build-info.json <<EOF
+          { "version": "$SHORT_SHA", "channel": "dev", "builtAt": "$BUILT_AT", "packageVersion": "$PKG_VERSION" }
+          EOF
           # `python/` ships the BNO085 IMU helper the real-mode collector spawns;
           # `modem/` ships the SIM7600 connection-manager (daemon + systemd + udev)
           # the install script provisions for LTE uplink + GPS;
@@ -87,8 +96,11 @@ jobs:
           tar -tzf "$TARBALL" | grep -q "^systemd/xorgate-agent.service$" || { echo "missing systemd unit"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^python/bno085_read.py$" || { echo "missing python/bno085_read.py"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^modem/sim7600-lte.sh$" || { echo "missing modem/sim7600-lte.sh"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^dist/build-info.json$" || { echo "missing dist/build-info.json"; exit 1; }
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
           echo "version=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "builtAt=$BUILT_AT" >> "$GITHUB_OUTPUT"
+          echo "packageVersion=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -116,6 +128,9 @@ jobs:
         env:
           BUCKET: ${{ steps.bucket.outputs.name }}
           TARBALL: ${{ steps.pack.outputs.tarball }}
+          VERSION: ${{ steps.pack.outputs.version }}
+          BUILT_AT: ${{ steps.pack.outputs.builtAt }}
+          PKG_VERSION: ${{ steps.pack.outputs.packageVersion }}
         run: |
           # Versioned tarball: immutable, cache forever.
           aws s3 cp "$TARBALL" "s3://$BUCKET/$TARBALL" \
@@ -125,6 +140,17 @@ jobs:
           aws s3 cp "$TARBALL" "s3://$BUCKET/xorgate-agent-latest.tar.gz" \
             --cache-control "no-cache" \
             --content-type "application/gzip"
+          # latest.json describes exactly what the `latest` alias now points at —
+          # written in THIS step so the manifest and the alias cannot drift.
+          # `GET /device-dist/latest` serves it; the web UI diffs it against the
+          # build a device reports.
+          cat > latest.json <<EOF
+          { "version": "$VERSION", "channel": "dev", "builtAt": "$BUILT_AT",
+            "packageVersion": "$PKG_VERSION", "tarball": "$TARBALL" }
+          EOF
+          aws s3 cp latest.json "s3://$BUCKET/latest.json" \
+            --cache-control "no-cache" \
+            --content-type "application/json"
 
       - name: Summary
         if: always()
@@ -140,4 +166,5 @@ jobs:
             echo "- Tarballs:"
             echo "  - \`s3://$BUCKET/xorgate-agent-$VERSION.tar.gz\` (immutable)"
             echo "  - \`s3://$BUCKET/xorgate-agent-latest.tar.gz\` (alias)"
+            echo "- Manifest: \`s3://$BUCKET/latest.json\`"
           } >> "$GITHUB_STEP_SUMMARY"

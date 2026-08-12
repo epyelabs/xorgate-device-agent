@@ -48,6 +48,12 @@
 # --- Configuration -----------------------------------------------------------
 SERIAL="${SIM7600_SERIAL:-/dev/ttyUSB2}"
 IFACE="${SIM7600_IFACE:-usb0}"
+# USB composition the whole stack assumes: 9011 = RNDIS ($IFACE + 5 tty ports).
+# A factory-fresh SIM7600 ships at 9001 (QMI/RMNET — the kernel binds
+# qmi_wwan/wwan0 and usb0 can NEVER appear), so every dial loops on
+# "Interface usb0 never appeared". Stored in modem NV; corrected once at
+# startup by ensure_usb_composition.
+USB_PID_WANT="${SIM7600_USB_PID:-9011}"
 PING_HOST="${SIM7600_PING_HOST:-8.8.8.8}"
 # Second opinion for the end-to-end WAN verdict: "down" requires BOTH hosts to
 # fail, so a one-target anomaly (anycast outage, route filter) can't walk the
@@ -2099,6 +2105,47 @@ wait_for_modem_ready() {
     log "Modem is responsive."
 }
 
+# Pure: the stored USB PID out of an AT+CUSBPIDSWITCH? response.
+#   +CUSBPIDSWITCH: 9001
+# Prints the PID digits, or nothing when the response has no such line (the
+# caller treats that as "unknown — touch nothing").
+usb_pid_from_cusbpidswitch() {
+    sed -n 's/.*+CUSBPIDSWITCH: *\([0-9A-Fa-f]\{4,5\}\).*/\1/p' <<< "$1" | head -1
+}
+
+# One-time NV correction for a factory-fresh module (hardware-verified
+# 2026-08-12: a never-onboarded SIM7600G at PID 9001 registers and applies its
+# APN fine, but usb0 cannot exist, so bring_up_interface fails forever). The
+# switch re-enumerates the modem, so it must run BEFORE anything else is
+# applied to the AT port; on an already-correct module this costs one AT
+# round-trip. Failure is not fatal to the daemon — the dial loop keeps
+# retrying and logging, same as any other unusable-link state.
+ensure_usb_composition() {
+    local resp pid
+    resp=$(at_query "AT+CUSBPIDSWITCH?" 5)
+    pid=$(usb_pid_from_cusbpidswitch "$resp")
+    if [[ -z "$pid" ]]; then
+        warn "USB composition unreadable (AT+CUSBPIDSWITCH? gave no parsable answer) — leaving it alone."
+        return 0
+    fi
+    if [[ "$pid" == "$USB_PID_WANT" ]]; then
+        return 0
+    fi
+    warn "USB composition is PID $pid, not $USB_PID_WANT (RNDIS) — $IFACE can never enumerate. Switching (persists in modem NV; module re-enumerates now)..."
+    at_query "AT+CUSBPIDSWITCH=$USB_PID_WANT,1,1" 10 >/dev/null
+    if ! wait_for_modem_reboot; then
+        err "Modem never re-enumerated after the USB PID switch."
+        return 1
+    fi
+    resp=$(at_query "AT+CUSBPIDSWITCH?" 5)
+    pid=$(usb_pid_from_cusbpidswitch "$resp")
+    if [[ "$pid" != "$USB_PID_WANT" ]]; then
+        err "USB PID still reads '${pid:-unknown}' after the switch — dials will keep failing."
+        return 1
+    fi
+    log "USB composition switched to PID $USB_PID_WANT (RNDIS)."
+}
+
 # After AT+CRESET the modem takes a few seconds to actually drop off USB.
 # Checking for the serial port too early sees the OLD node still present and
 # then races the disappearance — so first wait for the port to GO AWAY (up to
@@ -2650,6 +2697,11 @@ main() {
 
     wait_for_serial || exit 1
     wait_for_modem_ready || exit 1
+
+    # USB composition FIRST: a PID switch re-enumerates the module, which
+    # would clobber anything applied to the AT port before it.
+    ensure_usb_composition \
+        || warn "USB composition fix failed; dials cannot succeed until the PID is $USB_PID_WANT."
 
     # APN (Phase 2): read what the modem actually holds (context 1 NV) and
     # finish any apply a previous boot left half-done — BEFORE anything dials.

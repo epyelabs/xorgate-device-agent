@@ -2437,6 +2437,27 @@ teardown_interface() {
     at_cmd "AT+NETCLOSE" 2
 }
 
+# IPv6 hard-off for the modem interface, re-asserted on every connect cycle
+# (a re-enumerated netdev is born with the kernel default, i.e. v6 back on).
+# WHY: the LTE path is IPv4-by-design (PDP type "IP", v4 health probes,
+# IPv4-only KVS), but some carriers push a global IPv6 RA through the RNDIS
+# tether anyway (Lucky/Bell does; Public Mobile does not). The host then
+# holds its ONLY global v6 address + default route on $IFACE, RFC 6724 sorts
+# AAAA first for every dual-stack client, and the agent's MQTT dials a
+# half-dead v6 path: TCP connects, TLS stalls, connack-timeout loop
+# (hardware-verified 2026-08-12 after a Lucky Mobile SIM swap). Setting
+# disable_ipv6 also flushes any already-learned RA address/route, so this
+# heals late as well as prevents. Per-interface on purpose: wlan0/eth0 IPv6
+# stays untouched (MQTT has ridden wlan0's IPv6 through an LTE outage).
+ipv6_off_iface() {
+    # /proc write, not `sysctl`: no PATH dependence (the fake-hwclock cron
+    # taught that lesson), and the node's existence doubles as the iface check.
+    local node="/proc/sys/net/ipv6/conf/${IFACE}/disable_ipv6"
+    [[ -e "$node" ]] || return 0
+    echo 1 > "$node" 2>/dev/null \
+        || warn "could not disable IPv6 on $IFACE — a carrier v6 RA may black-hole dual-stack clients (MQTT connack timeouts)."
+}
+
 # End-to-end WAN probe ($1 = pings per target, default 2). Success on either
 # target; "down" therefore means BOTH failed. A single host's outage must not
 # read as a dead WAN and walk the recovery ladder — this hardens the gauge
@@ -2474,7 +2495,10 @@ bring_up_interface() {
         sleep 2
     done
 
-    # Own the interface exclusively: no leftover dhclient, no stale addresses.
+    # Own the interface exclusively: no leftover dhclient, no stale addresses,
+    # and no carrier IPv6 (see ipv6_off_iface — the netdev may be freshly
+    # re-enumerated here, which resets disable_ipv6 to the kernel default).
+    ipv6_off_iface
     pkill -f "dhclient.*$IFACE" 2>/dev/null || true
     ip addr flush dev "$IFACE" 2>/dev/null || true
     ip link set "$IFACE" up 2>/dev/null || true
@@ -2702,6 +2726,12 @@ main() {
     # would clobber anything applied to the AT port before it.
     ensure_usb_composition \
         || warn "USB composition fix failed; dials cannot succeed until the PID is $USB_PID_WANT."
+
+    # Kill carrier IPv6 on the modem netdev before the first dial: an RA can
+    # land the moment the interface enumerates, and the boot window between
+    # enumeration and the first bring_up_interface is long enough for MQTT to
+    # wedge on the resulting v6 default route. Re-asserted per connect cycle.
+    ipv6_off_iface
 
     # APN (Phase 2): read what the modem actually holds (context 1 NV) and
     # finish any apply a previous boot left half-done — BEFORE anything dials.

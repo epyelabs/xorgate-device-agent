@@ -95,6 +95,31 @@ describe("parseCloudConfig", () => {
     expect(parseCloudConfig(JSON.stringify({ v: 1, uploadBucket: 42 }))).toEqual({});
   });
 
+  it("parses a tenant scope, and takes it only when BOTH halves are present", () => {
+    const ORG = "1d2b4514-7408-4234-af5f-83b9451575ea";
+    const WS = "c2e2a967-6dbe-464c-b45d-c6ef6087875b";
+    expect(
+      parseCloudConfig(
+        JSON.stringify({ v: 1, scope: { organizationId: ORG, workspaceId: WS } }),
+      ),
+    ).toEqual({ scope: { organizationId: ORG, workspaceId: WS } });
+
+    // A half-populated scope would build a topic with an empty segment, which
+    // the broker refuses — so the device would silently stop reporting. Dropping
+    // the field keeps it on the unscoped topic, which is still ingested.
+    for (const bad of [
+      { organizationId: ORG },
+      { workspaceId: WS },
+      { organizationId: ORG, workspaceId: "" },
+      { organizationId: 42, workspaceId: WS },
+      "nope",
+      [ORG, WS],
+      null,
+    ]) {
+      expect(parseCloudConfig(JSON.stringify({ v: 1, scope: bad }))).toEqual({});
+    }
+  });
+
   it("maps an empty/all-invalid recording object to null (cloud-managed defaults)", () => {
     expect(parseCloudConfig(JSON.stringify({ v: 1, recording: {} }))).toEqual({
       recording: null,

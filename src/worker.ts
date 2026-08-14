@@ -405,6 +405,27 @@ configSync.startApnWatch();
 // Cloud config messages (retained; re-delivered on every connect). Persist into
 // settings.json — the sim7600-lte daemon polls the file and applies gnssAntBias
 // live.
+/**
+ * The telemetry topic in force right now (platform-auth Phase 4).
+ *
+ * Starts as the unscoped `xorgate/devices/{deviceId}/telemetry` and switches to
+ * the tenant-scoped topic the moment the cloud tells this device which
+ * organization and workspace it is in. That message is RETAINED, so the switch
+ * happens within a second or so of every connect and needs nothing persisted
+ * locally: the handful of samples published before it arrives go to the
+ * unscoped topic, which the cloud still ingests.
+ *
+ * Deliberately mutable rather than a restart-time constant. The cloud can move
+ * a device between workspaces, and a device that had to be rebooted to notice
+ * would keep publishing where its new tenant cannot see it and its old tenant
+ * still can.
+ */
+let telemetryTopic = config.telemetryTopic;
+
+function scopedTelemetryTopic(scope: { organizationId: string; workspaceId: string }): string {
+  return `xorgate/orgs/${scope.organizationId}/ws/${scope.workspaceId}/devices/${config.deviceId}/telemetry`;
+}
+
 function handleConfigMessage(payload: Buffer): void {
   const now = Date.now();
   const message = parseCloudMessage(payload);
@@ -434,6 +455,23 @@ function handleConfigMessage(payload: Buffer): void {
       store.flush(now, true);
     }
   }
+  // Tenant scope (platform-auth Phase 4). Handled OUTSIDE the rev guard below,
+  // on purpose and for the same reason `uploadBucket` is: the guard exists to
+  // stop a redelivered document from reverting local SETTINGS the device has
+  // since changed, and the topic a device reports on is not a setting anybody
+  // can change locally. Putting it behind the guard would mean a device that
+  // had already applied this rev — which, after a restart, is every device —
+  // never learned where to publish.
+  if (parsed.scope) {
+    const next = scopedTelemetryTopic(parsed.scope);
+    if (next !== telemetryTopic) {
+      telemetryTopic = next;
+      console.log(`[agent] telemetry topic -> ${next}`);
+      store.event("info", `telemetry topic scoped to ws ${parsed.scope.workspaceId}`, now);
+      store.flush(now, true);
+    }
+  }
+
   // Rev guard (Phase 3): this message is RETAINED, so the broker replays it on
   // every single connect. Re-applying a document the device has already applied
   // is what makes local state revert on reconnect; skipping it here is what
@@ -724,7 +762,7 @@ client.on("connect", () => {
         recording: recordingStatus,
       };
       store.setLatest(payload);
-      client.publish(config.telemetryTopic, JSON.stringify(payload), { qos: 0 }, (err) => {
+      client.publish(telemetryTopic, JSON.stringify(payload), { qos: 0 }, (err) => {
         if (shuttingDown) return; // don't re-write state after the final flush
         const t = Date.now();
         if (err) store.recordPublishError(err.message, t);

@@ -113,6 +113,22 @@ export interface CloudConfig {
    * one place.
    */
   uploadBucket?: string;
+  /**
+   * The device's tenant (platform-auth Phase 4). Carried on the envelope, not
+   * in a settings namespace, for the same reason `uploadBucket` is: it is not
+   * something an operator sets, and this retained channel is the only way to
+   * reach a device that is already in the field.
+   *
+   * What the agent does with it: publish telemetry to
+   * `xorgate/orgs/{organizationId}/ws/{workspaceId}/devices/{deviceId}/telemetry`
+   * instead of the unscoped topic. Only that topic shape can be written into a
+   * per-tenant IAM policy, which is what lets a third party be given live
+   * telemetry for its own devices and nobody else's.
+   *
+   * Absent on an older backend, and absent for a device whose workspace row has
+   * gone. Both mean "keep using the unscoped topic", which is still ingested.
+   */
+  scope?: { organizationId: string; workspaceId: string };
 }
 
 /**
@@ -173,6 +189,19 @@ function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   const uploadBucket = (obj as { uploadBucket?: unknown }).uploadBucket;
   if (typeof uploadBucket === "string" && uploadBucket.length > 0) {
     out.uploadBucket = uploadBucket;
+  }
+  const scope = (obj as { scope?: unknown }).scope;
+  if (scope && typeof scope === "object" && !Array.isArray(scope)) {
+    const { organizationId, workspaceId } = scope as Record<string, unknown>;
+    // Both halves or neither. A half-populated scope would build a topic with
+    // an empty segment, which the broker refuses — the device would simply stop
+    // reporting, which is a much worse failure than ignoring the field.
+    if (
+      typeof organizationId === "string" && organizationId.length > 0 &&
+      typeof workspaceId === "string" && workspaceId.length > 0
+    ) {
+      out.scope = { organizationId, workspaceId };
+    }
   }
   const recording = (obj as { recording?: unknown }).recording;
   if (recording && typeof recording === "object" && !Array.isArray(recording)) {

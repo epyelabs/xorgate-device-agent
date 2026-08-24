@@ -9,9 +9,17 @@ name: Device — deploy prod
 # so the prod install.sh can pin a specific build by setting DEVICE_DIST_VERSION
 # on the InstallScriptFn (defaults to `latest`).
 #
-# Prerequisites are the same IAM machine user / repo secrets as the dev workflow
-# (see .github/workflows/device-deploy-dev.yml). The user's policy must also
-# cover the prod dist bucket and the XorgateCoreStorageStack stack output.
+# Prerequisites: since the 2026-08 account split, prod lives in its own AWS
+# account (865609249890) and each stage carries its own machine user, delivered
+# via GitHub ENVIRONMENT secrets (per-environment AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY; the `environment:` on the job below selects which set
+# this run gets). This job uses the `production` environment, whose secrets
+# belong to the prod-account machine user (xorgate-device-ci in 865609249890:
+# cloudformation:DescribeStacks on XorgateCoreStorageStack + s3 put/list on the
+# prod dist bucket, nothing else). The dev workflow's `development` environment
+# holds the dev-account user. If the production environment ever gets
+# deployment branch/tag restrictions, they must allow release tags — this
+# workflow runs on tag refs, not main.
 
 on:
   release:
@@ -32,6 +40,7 @@ concurrency:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    environment: production # scopes secrets.AWS_* to the prod-account machine user
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,11 +104,24 @@ jobs:
           echo "builtAt=$BUILT_AT" >> "$GITHUB_OUTPUT"
           echo "packageVersion=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
+      # These resolve from the `production` ENVIRONMENT secrets (prod-account
+      # machine user), not the repo-level/`development` ones the dev workflow
+      # uses — same names, different scope.
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      # Fails fast if the environment carries the wrong account's keys (e.g. a
+      # copy-paste of the dev user into the production environment).
+      - name: Verify target account
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$ACCOUNT" != "865609249890" ]; then
+            echo "expected to be in prod account 865609249890, got $ACCOUNT"
+            exit 1
+          fi
 
       - name: Resolve dist bucket from CloudFormation
         id: bucket

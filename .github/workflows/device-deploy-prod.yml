@@ -9,14 +9,17 @@ name: Device — deploy prod
 # so the prod install.sh can pin a specific build by setting DEVICE_DIST_VERSION
 # on the InstallScriptFn (defaults to `latest`).
 #
-# Prerequisites: the same repo secrets as the dev workflow (see
-# .github/workflows/device-deploy-dev.yml), which authenticate as the machine
-# user in the DEV account (111910761410). Since the 2026-08 account split, prod
-# lives in its own account (865609249890): this workflow chains an AssumeRole of
-# EpyeAgentOperator in that account on top of the static keys, then resolves the
-# prod dist bucket from CloudFormation THERE. EpyeAgentOperator's trust policy
-# must name the machine user the repo secrets belong to (as of 2026-08-24 it
-# trusts only arn:aws:iam::111910761410:user/aws-cdk-deploy).
+# Prerequisites: since the 2026-08 account split, prod lives in its own AWS
+# account (865609249890) and each stage carries its own machine user, delivered
+# via GitHub ENVIRONMENT secrets (per-environment AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY; the `environment:` on the job below selects which set
+# this run gets). This job uses the `production` environment, whose secrets
+# belong to the prod-account machine user (xorgate-device-ci in 865609249890:
+# cloudformation:DescribeStacks on XorgateCoreStorageStack + s3 put/list on the
+# prod dist bucket, nothing else). The dev workflow's `development` environment
+# holds the dev-account user. If the production environment ever gets
+# deployment branch/tag restrictions, they must allow release tags — this
+# workflow runs on tag refs, not main.
 
 on:
   release:
@@ -37,6 +40,7 @@ concurrency:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    environment: production # scopes secrets.AWS_* to the prod-account machine user
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,21 +104,17 @@ jobs:
           echo "builtAt=$BUILT_AT" >> "$GITHUB_OUTPUT"
           echo "packageVersion=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
-      # Chain into the PROD account: static keys (dev-account machine user) as
-      # the source identity, then assume the operator role in 865609249890.
-      # skip-session-tagging is required — the role's trust policy allows only
-      # sts:AssumeRole, and the action's default session tagging would need
-      # sts:TagSession too.
+      # These resolve from the `production` ENVIRONMENT secrets (prod-account
+      # machine user), not the repo-level/`development` ones the dev workflow
+      # uses — same names, different scope.
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          role-to-assume: arn:aws:iam::865609249890:role/EpyeAgentOperator
-          role-session-name: device-deploy-prod
-          role-skip-session-tagging: true
-          role-duration-seconds: 900
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
+      # Fails fast if the environment carries the wrong account's keys (e.g. a
+      # copy-paste of the dev user into the production environment).
       - name: Verify target account
         run: |
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)

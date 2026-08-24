@@ -4,12 +4,13 @@ name: Device — deploy dev
 # (xorgate-device-dist-dev-<account>-<region>). install.sh (served per-request
 # by `GET /get/:code` on the dev API) downloads the build from this bucket.
 #
-# # Prerequisites (one-time, manual, in AWS)
+# # Prerequisites (one-time, manual)
 #
-# Since the 2026-08 account split, ONE machine user no longer covers both
-# workflows directly: dev deploys stay in 111910761410 (this workflow), while
-# prod deploys assume EpyeAgentOperator in 865609249890 on top of the same
-# secrets (see device-deploy-prod.yml's header).
+# Since the 2026-08 account split each stage has its own AWS account and its
+# own machine user, delivered via GitHub ENVIRONMENT secrets: the `development`
+# environment holds the dev-account user's keys (this workflow), `production`
+# holds the prod-account user's (device-deploy-prod.yml). Same secret names in
+# both; the job's `environment:` selects which set a run gets.
 #
 #   1. An IAM machine user in the DEV account (111910761410) with an inline
 #      policy granting:
@@ -19,10 +20,10 @@ name: Device — deploy dev
 #        - cloudformation:DescribeStacks on XorgateCoreStorageStackDev (so we
 #          read the dist bucket name from the stack output instead of
 #          hard-coding it)
-#        - sts:AssumeRole on arn:aws:iam::865609249890:role/EpyeAgentOperator
-#          (for the prod workflow; the role's trust policy must name this user)
+#      (The prod-account equivalent, xorgate-device-ci in 865609249890, is
+#      described in device-deploy-prod.yml's header.)
 #   2. Mint one access-key pair for that user.
-#   3. Store as GitHub repo SECRETS (Settings → Secrets and variables → Actions):
+#   3. Store as ENVIRONMENT secrets on `development` (Settings → Environments):
 #        AWS_ACCESS_KEY_ID     = AKIA…
 #        AWS_SECRET_ACCESS_KEY = the secret half
 #      Optional repo VARIABLE (Variables tab), defaults to us-east-1:
@@ -53,6 +54,7 @@ concurrency:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    environment: development # scopes secrets.AWS_* to the dev-account machine user
     steps:
       - uses: actions/checkout@v4
 

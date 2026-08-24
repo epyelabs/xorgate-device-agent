@@ -53,6 +53,14 @@ export interface MediaConfig {
    * encoding, so this is a safety valve rather than a product setting.
    */
   idleTeardownSecs: string;
+  /**
+   * Spawn guard (cm4-support Phase 2), installed by the worker when the device
+   * has a hardware block: a stream whose expected camera is absent, or whose
+   * pipeline file never rendered, is parked as `no-camera`/`no-pipeline`
+   * instead of spawning a master that would fall back to the runtime's
+   * built-in test pipeline. Absent (legacy device, no block) = spawn as today.
+   */
+  streamGuard?: (streamKey: string) => "ok" | "no-camera" | "no-pipeline";
   /** The device IoT cert + key the runtime authenticates with (AWS_IOT_CORE_CERT/PRIVATE_KEY). */
   certPath: string;
   keyPath: string;
@@ -102,6 +110,12 @@ export interface AgentConfig {
   creds: CredBundle | null;
   /** KVS WebRTC media-runtime config. */
   media: MediaConfig;
+  /**
+   * Device hardware block file (cm4-support): seeded by the installer from
+   * the claim response, refreshed by the worker when the retained config
+   * message carries a changed block. Absent file = legacy behavior.
+   */
+  hardwarePath: string;
 }
 
 /** Flags that take no value. Everything else consumes the following token. */
@@ -236,6 +250,10 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     caCertPath: resolve(get("media-cacert", "KVS_CACERT_PATH", join(dirname(mediaBin), "cert.pem"))!),
   };
 
+  const hardwarePath = resolve(
+    get("hardware", "HARDWARE_MANIFEST", "/etc/xorgate/hardware.json")!,
+  );
+
   return {
     deviceId,
     endpoint,
@@ -255,5 +273,6 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     caPath,
     creds,
     media,
+    hardwarePath,
   };
 }

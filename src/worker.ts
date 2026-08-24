@@ -35,6 +35,15 @@ import { IotCredentialsProvider } from "./recording/iot-creds.js";
 import { s3Put } from "./recording/s3-put.js";
 import { RecordingManager, type RecordingUploadOptions } from "./recording/manager.js";
 import { LedManager } from "./agent/led-manager.js";
+import { LedDriver } from "./hardware/led.js";
+import {
+  hardwareBlocksEqual,
+  loadHardwareBlock,
+  saveHardwareBlock,
+} from "./hardware/hardware-config.js";
+import { reconcileHardware, type StreamHardwareStatus } from "./media/hardware-reconcile.js";
+import { resolveChannelPipeline } from "./media/pipeline.js";
+import { shmSocketPathFor } from "./recording/config.js";
 import type { PowerSampleReading } from "./recording/boot-policy.js";
 import { resolveBridgedCameras } from "./recording/video-capture.js";
 import type {
@@ -78,6 +87,64 @@ ensureConfigSyncBaseline();
   }
 }
 
+/**
+ * Device hardware block (cm4-support plan): platform facts from the device's
+ * model — seeded at install (hardware.json from the claim response), refreshed
+ * from the retained config message. Null = legacy device / v1 model: every
+ * gate below then falls back to the exact pre-plan behavior (hardcoded CM5
+ * wiring, sw-h264 pipelines, all collectors self-gating).
+ */
+let hardwareBlock = loadHardwareBlock(config.hardwarePath);
+if (hardwareBlock) {
+  console.log(
+    `[agent] hardware block: ${hardwareBlock.platform} encoder=${hardwareBlock.encoder} ` +
+      `cameras=${hardwareBlock.video.map((v) => `${v.key}@${v.connector}`).join(",") || "none"} ` +
+      `rails=${hardwareBlock.rails} led=${hardwareBlock.statusLed ? "yes" : "no"} imu=${hardwareBlock.imu ?? "none"}`,
+  );
+}
+
+/**
+ * Per-stream reconcile verdicts, feeding the media spawn guard. Armed only
+ * after a reconcile pass that could actually enumerate cameras — when
+ * enumeration is unavailable the guard stays open rather than holding down
+ * streams it knows nothing about.
+ */
+const streamHardware = new Map<string, StreamHardwareStatus>();
+let streamGuardArmed = false;
+
+async function reconcileHardwareNow(): Promise<string[]> {
+  if (!hardwareBlock || config.mode !== "real" || config.offline) return [];
+  const res = await reconcileHardware(hardwareBlock, {
+    pipelineDir: config.media.pipelineDir,
+    shmSocketPathFor,
+    log: (level, msg) => {
+      const t = Date.now();
+      console[level === "warn" ? "warn" : "log"](`[hardware] ${msg}`);
+      store.event(level, `hardware: ${msg}`, t);
+      store.flush(t, true);
+    },
+  });
+  if (res.cameras !== null) {
+    streamHardware.clear();
+    for (const [key, status] of res.statuses) streamHardware.set(key, status);
+    streamGuardArmed = true;
+  }
+  return res.changedStreams;
+}
+
+// Spawn guard for the media supervisor (see MediaConfig.streamGuard): a
+// manifest channel the model does not declare (an orphan channel row), or one
+// whose camera did not enumerate, gets NO master — never the runtime's
+// built-in test pipeline.
+config.media.streamGuard = (streamKey) => {
+  if (!hardwareBlock || !streamGuardArmed) return "ok";
+  const status = streamHardware.get(streamKey);
+  if (status === undefined || status === "no-camera") return "no-camera";
+  return resolveChannelPipeline(config.media.pipelineDir, streamKey, config.media.pipelinePath)
+    ? "ok"
+    : "no-pipeline";
+};
+
 // Real mode enables every self-detecting collector; each one stays inert when
 // its hardware is absent, so the worker is healthy with or without it:
 //   - IMU    — runs i2cdetect, emits nothing when no BNO085 is on the bus.
@@ -99,7 +166,15 @@ const source: {
 } =
   config.mode === "real"
     ? createCollector(
-        { sensors: { imu: true }, system: true, comm: { gps: true, signal: true } },
+        {
+          // Hardware-block gating (cm4-support): a model that declares no IMU
+          // skips the collector (and its i2cdetect probe) outright; rails:false
+          // pre-latches the PMIC reads off. No block = enable-all + self-gate,
+          // the exact pre-plan behavior.
+          sensors: { imu: hardwareBlock ? hardwareBlock.imu !== null : true },
+          system: hardwareBlock ? { rails: hardwareBlock.rails } : true,
+          comm: { gps: true, signal: true },
+        },
         config.media,
       )
     : (() => {
@@ -206,6 +281,11 @@ function buildUploadOptions(): RecordingUploadOptions | undefined {
 // steps into it so post-step segments carry the honest "gps"/"nitz" value.
 const timeSource = createTimeSourceTracker();
 
+// Reconcile pipelines against the hardware block BEFORE anything reads them:
+// the recording manager's camera set and the media masters both consume the
+// files this (re)renders. Awaited — enumeration is one bounded rpicam exec.
+await reconcileHardwareNow();
+
 // On-device recording (offline telemetry plan, Phase 1). Runs independently of
 // MQTT connectivity — its own sampling interval, applied live from settings.json.
 const recording = new RecordingManager({
@@ -222,6 +302,9 @@ const recording = new RecordingManager({
         config.media.pipelineDir,
         loadManifest(config.media.manifestPath)?.channels ?? [],
       ),
+    // Recording follows the model's encoder token (cm4-support D6): hw-h264
+    // on the CM4, sw-h264 (today's exact argv) everywhere else / no block.
+    encoder: () => hardwareBlock?.encoder ?? "sw-h264",
     // A KVS master attached to a dead shm writer wedges instead of crashing
     // (shmsrc shm_open loop, black stream) — bounce it onto the new socket.
     onCaptureSpawned: (streamKey) => source.restartMediaChannel?.(streamKey),
@@ -316,6 +399,21 @@ function recordingStatusForLed(): RecordingStatus {
 }
 
 const led = new LedManager({
+  // Pin map from the hardware block (cm4-support): a model that declares no
+  // status LED gets an inert driver (never drives pins blind on an unknown
+  // carrier); a declared map replaces the hardcoded Argus CM5 default. No
+  // block = the hardcoded default, exactly as before.
+  ...(hardwareBlock
+    ? {
+        driver: hardwareBlock.statusLed
+          ? new LedDriver({
+              map: { kind: "rgb-gpio", pins: hardwareBlock.statusLed, activeHigh: true },
+            })
+          : new LedDriver({
+              probe: async () => ({ ok: false, reason: "model declares no status LED" }),
+            }),
+      }
+    : {}),
   signals: () => ({
     connection: store.snapshot().connection,
     recording: recordingStatusForLed(),
@@ -470,6 +568,37 @@ function handleConfigMessage(payload: Buffer): void {
       store.event("info", `telemetry topic scoped to ws ${parsed.scope.workspaceId}`, now);
       store.flush(now, true);
     }
+  }
+  // Hardware block (cm4-support): envelope data like `scope`/`uploadBucket`,
+  // handled OUTSIDE the rev guard for the same reason — it is a fact about the
+  // hardware, not a setting anyone edits locally, and after a restart the
+  // rev-guarded path would never re-deliver it. A CHANGED block is persisted
+  // (next boot seeds from it) and pipelines re-render live: changed .gst files
+  // bounce their masters, and reapply() picks up a changed camera set/encoder.
+  if (parsed.hardware === null) {
+    console.warn("[agent] config message carried an invalid hardware block — keeping current");
+    store.event("warn", "invalid hardware block on config message — keeping current", now);
+    store.flush(now, true);
+  } else if (parsed.hardware && !hardwareBlocksEqual(parsed.hardware, hardwareBlock)) {
+    hardwareBlock = parsed.hardware;
+    try {
+      saveHardwareBlock(config.hardwarePath, hardwareBlock);
+    } catch (err) {
+      console.warn(`[agent] hardware block persist failed: ${(err as Error).message}`);
+    }
+    console.log(
+      `[agent] hardware block updated from cloud (${hardwareBlock.platform}, ${hardwareBlock.encoder}) — re-rendering pipelines`,
+    );
+    store.event("info", `hardware block updated: ${hardwareBlock.platform}/${hardwareBlock.encoder}`, now);
+    store.flush(now, true);
+    void reconcileHardwareNow()
+      .then((changedStreams) => {
+        for (const streamKey of changedStreams) source.restartMediaChannel?.(streamKey);
+        recording.reapply();
+      })
+      .catch((err) => {
+        console.error("[agent] hardware reconcile failed", (err as Error).message);
+      });
   }
 
   // Rev guard (Phase 3): this message is RETAINED, so the broker replays it on

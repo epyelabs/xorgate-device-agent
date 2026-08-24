@@ -29,7 +29,7 @@ import { commandExists } from "../../lib/exec.js";
  * throttled (all-Pi) keeps working. cpu_usage + ram_usage are always present
  * (readMemory/os fallback never fails).
  */
-export function createSystemCollector(): Collector {
+export function createSystemCollector(opts: { rails?: boolean } = {}): Collector {
   // Seeded at creation; the first read() diffs against it. If that read fires
   // immediately, cpu_usage may read ~0 for one tick (benign — same first-tick
   // behavior as the IMU collector returning {}).
@@ -38,11 +38,14 @@ export function createSystemCollector(): Collector {
   // Power-health gates: vcgencmd presence is checked once (dev boxes never
   // exec it per tick), and a Pi 4's unsupported pmic_read_adc latches
   // pmicUnsupported after the first null so we stop retrying a failing exec.
+  // A hardware block declaring `rails: false` (cm4-support — no PMIC ADC on
+  // the CM4) pre-latches it, so the doomed probe is never even attempted;
+  // omitted/true keeps the probe-and-latch behavior (legacy devices).
   const hasVcgencmd = commandExists("vcgencmd");
-  let pmicUnsupported = false;
+  let pmicUnsupported = opts.rails === false;
   // PSU max current is negotiated once at boot (device-tree is immutable per
   // boot) — read once here, re-emit every tick so recorded sessions carry it.
-  const psuMaxCurrentMa = readMaxCurrentMa();
+  const psuMaxCurrentMa = opts.rails === false ? Promise.resolve(null) : readMaxCurrentMa();
 
   async function compute(prevSample: CpuSample): Promise<{
     fields: Record<string, unknown>;

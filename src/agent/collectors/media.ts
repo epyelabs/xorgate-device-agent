@@ -154,6 +154,28 @@ export function createMediaCollector(cfg: MediaConfig): MediaSupervisor {
     const c = channels.get(channelName);
     if (!c || stopped || shed || c.disabled || !manifest) return;
 
+    // Spawn guard (cm4-support Phase 2): on hardware-block devices, a stream
+    // whose camera is absent or whose pipeline never rendered gets NO master —
+    // the alternative is the runtime's built-in test pipeline silently burning
+    // CPU on a channel that can never show real video (inventory #5). Parked
+    // with the slow retry so a camera that appears (re-seat, overlay fix +
+    // reboot never reaches here, but a cloud-corrected block does) heals
+    // without a daemon restart. Logged only on verdict change, not per retry.
+    const guard = cfg.streamGuard?.(c.streamKey) ?? "ok";
+    if (guard !== "ok") {
+      if (c.state !== guard) {
+        console.warn(
+          `[media ${channelName}] not starting a master: ${guard}` +
+            (guard === "no-camera"
+              ? " (model expects a camera that did not enumerate)"
+              : " (no pipeline file rendered/resolved)"),
+        );
+      }
+      c.state = guard;
+      scheduleRestart(c, PARKED_RETRY_MS);
+      return;
+    }
+
     // Each channel/camera gets its own pipeline: <pipelineDir>/<streamKey>.gst,
     // falling back to the global KVS_GST_PIPELINE, then the runtime's default.
     const pipelinePath = resolveChannelPipeline(cfg.pipelineDir, c.streamKey, cfg.pipelinePath);

@@ -52,6 +52,7 @@ import {
   type TimeSyncSettings,
 } from "../daemon/settings.js";
 import { parseImuMount, type ImuMount } from "../lib/orientation.js";
+import { parseHardwareBlock, type DeviceHardwareBlock } from "../hardware/hardware-config.js";
 
 export interface CloudConfig {
   /**
@@ -129,6 +130,17 @@ export interface CloudConfig {
    * gone. Both mean "keep using the unscoped topic", which is still ingested.
    */
   scope?: { organizationId: string; workspaceId: string };
+  /**
+   * Device hardware block (cm4-support): the model's platform facts, on the
+   * envelope for the same reason `scope` and `uploadBucket` are — not an
+   * operator setting, and the retained topic is the one channel that reaches
+   * a fielded device. Never written into settings.json: the worker persists
+   * it to hardware.json and re-renders pipelines when it changes.
+   * `null` = the message carried a `hardware` key that failed validation
+   * (log + keep the current block); absent = message had none (v1 model or
+   * old backend — keep the current block too).
+   */
+  hardware?: DeviceHardwareBlock | null;
 }
 
 /**
@@ -221,6 +233,10 @@ function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   const cellular = (obj as { cellular?: unknown }).cellular;
   if (cellular && typeof cellular === "object" && !Array.isArray(cellular)) {
     out.cellular = parseCellularSettings(cellular) ?? null;
+  }
+  const hardware = (obj as { hardware?: unknown }).hardware;
+  if (hardware && typeof hardware === "object" && !Array.isArray(hardware)) {
+    out.hardware = parseHardwareBlock(hardware);
   }
   return out;
 }

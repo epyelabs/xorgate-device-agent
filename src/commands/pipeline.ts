@@ -31,6 +31,7 @@ import {
 import { loadManifest } from "../media/manifest.js";
 import { bridgedKvsPipeline } from "../recording/video-capture.js";
 import { shmSocketPathFor } from "../recording/config.js";
+import { loadHardwareBlock } from "../hardware/hardware-config.js";
 
 const DEFAULT_DIR = "/etc/xorgate/pipelines";
 const DEFAULT_MANIFEST = "/etc/xorgate/kvs.json";
@@ -186,7 +187,12 @@ function bridge(dir: string, key: string | undefined): void {
     writeFileSync(directBackupFor(dir, key), readFileSync(gst, "utf8"));
   }
   writeFileSync(cameraFileFor(dir, key), `${cameraName}\n`);
-  writeFileSync(gst, `${bridgedKvsPipeline(shmSocketPathFor(key))}\n`);
+  // Encoder from the device's hardware block when present (cm4-support):
+  // hw-h264 on a CM4, sw-h264 (the historical bytes) everywhere else.
+  const encoder =
+    loadHardwareBlock(process.env.HARDWARE_MANIFEST ?? "/etc/xorgate/hardware.json", () => {})
+      ?.encoder ?? "sw-h264";
+  writeFileSync(gst, `${bridgedKvsPipeline(shmSocketPathFor(key), encoder)}\n`);
   console.log(`✓ ${key} bridged: capture daemon will own ${cameraName}`);
   console.log(`  .gst → shmsrc consumer (direct pipeline saved to ${directBackupFor(dir, key)})`);
   console.log("  NOTE: live streaming on this camera now requires the agent's capture");

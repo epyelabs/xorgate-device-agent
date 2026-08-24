@@ -66,7 +66,8 @@ export function powerReadingFromFields(
 export interface IoCapabilities {
   sensors?: { imu?: boolean };
   comm?: { gps?: boolean; signal?: boolean };
-  system?: boolean;
+  /** `{ rails: false }` (cm4-support) gates the PMIC 5V-rail/PSU reads off. */
+  system?: boolean | { rails?: boolean };
 }
 
 /**
@@ -116,7 +117,11 @@ export function createCollector(
   gnssView(): GnssView | null;
 } {
   const collectors: Collector[] = [];
-  const system = ioCapabilities.system ? createSystemCollector() : null;
+  const system = ioCapabilities.system
+    ? createSystemCollector(
+        typeof ioCapabilities.system === "object" ? ioCapabilities.system : {},
+      )
+    : null;
   const gps = ioCapabilities.comm?.gps ? createGpsCollector() : null;
   if (ioCapabilities.sensors?.imu) collectors.push(createImuCollector());
   if (gps) collectors.push(gps);

@@ -6,14 +6,21 @@ name: Device — deploy dev
 #
 # # Prerequisites (one-time, manual, in AWS)
 #
-#   1. An IAM machine user (one user can cover both dev + prod CI) with an
-#      inline policy granting:
-#        - s3:PutObject, s3:PutObjectAcl, s3:DeleteObject on the dev AND prod
-#          dist buckets ("/*" suffix)
-#        - s3:ListBucket on the dev AND prod dist buckets (no suffix)
-#        - cloudformation:DescribeStacks on XorgateCoreStorageStackDev AND
-#          XorgateCoreStorageStack (so we read the dist bucket name from the
-#          stack output instead of hard-coding it)
+# Since the 2026-08 account split, ONE machine user no longer covers both
+# workflows directly: dev deploys stay in 111910761410 (this workflow), while
+# prod deploys assume EpyeAgentOperator in 865609249890 on top of the same
+# secrets (see device-deploy-prod.yml's header).
+#
+#   1. An IAM machine user in the DEV account (111910761410) with an inline
+#      policy granting:
+#        - s3:PutObject, s3:PutObjectAcl, s3:DeleteObject on the dev dist
+#          bucket ("/*" suffix)
+#        - s3:ListBucket on the dev dist bucket (no suffix)
+#        - cloudformation:DescribeStacks on XorgateCoreStorageStackDev (so we
+#          read the dist bucket name from the stack output instead of
+#          hard-coding it)
+#        - sts:AssumeRole on arn:aws:iam::865609249890:role/EpyeAgentOperator
+#          (for the prod workflow; the role's trust policy must name this user)
 #   2. Mint one access-key pair for that user.
 #   3. Store as GitHub repo SECRETS (Settings → Secrets and variables → Actions):
 #        AWS_ACCESS_KEY_ID     = AKIA…

@@ -9,9 +9,14 @@ name: Device — deploy prod
 # so the prod install.sh can pin a specific build by setting DEVICE_DIST_VERSION
 # on the InstallScriptFn (defaults to `latest`).
 #
-# Prerequisites are the same IAM machine user / repo secrets as the dev workflow
-# (see .github/workflows/device-deploy-dev.yml). The user's policy must also
-# cover the prod dist bucket and the XorgateCoreStorageStack stack output.
+# Prerequisites: the same repo secrets as the dev workflow (see
+# .github/workflows/device-deploy-dev.yml), which authenticate as the machine
+# user in the DEV account (111910761410). Since the 2026-08 account split, prod
+# lives in its own account (865609249890): this workflow chains an AssumeRole of
+# EpyeAgentOperator in that account on top of the static keys, then resolves the
+# prod dist bucket from CloudFormation THERE. EpyeAgentOperator's trust policy
+# must name the machine user the repo secrets belong to (as of 2026-08-24 it
+# trusts only arn:aws:iam::111910761410:user/aws-cdk-deploy).
 
 on:
   release:
@@ -95,11 +100,28 @@ jobs:
           echo "builtAt=$BUILT_AT" >> "$GITHUB_OUTPUT"
           echo "packageVersion=$PKG_VERSION" >> "$GITHUB_OUTPUT"
 
+      # Chain into the PROD account: static keys (dev-account machine user) as
+      # the source identity, then assume the operator role in 865609249890.
+      # skip-session-tagging is required — the role's trust policy allows only
+      # sts:AssumeRole, and the action's default session tagging would need
+      # sts:TagSession too.
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::865609249890:role/EpyeAgentOperator
+          role-session-name: device-deploy-prod
+          role-skip-session-tagging: true
+          role-duration-seconds: 900
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Verify target account
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$ACCOUNT" != "865609249890" ]; then
+            echo "expected to be in prod account 865609249890, got $ACCOUNT"
+            exit 1
+          fi
 
       - name: Resolve dist bucket from CloudFormation
         id: bucket

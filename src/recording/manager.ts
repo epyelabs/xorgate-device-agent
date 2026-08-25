@@ -117,6 +117,12 @@ export interface RecordingVideoOptions {
    * without live streaming.
    */
   setDisabledCameras?: (streamKeys: string[]) => void;
+  /**
+   * Recording encoder token from the device's hardware block (cm4-support
+   * D6), read per apply pass so a cloud-delivered block change restarts the
+   * capture with the new encoder. Absent = sw-h264 (today's exact argv).
+   */
+  encoder?: () => "sw-h264" | "hw-h264";
   /** Overrides for tests. */
   shmDir?: string;
   spawn?: CaptureSpawn;
@@ -492,11 +498,15 @@ export class RecordingManager {
     // crash evidence — keeps running; it is not touched by the ladder).
     if (record && shed !== null && shed.level >= 2) record = false;
     const preset = resolveVideoPreset(this.cfg.video.preset);
+    const encoder = vo.encoder?.() ?? "sw-h264";
     const key = JSON.stringify({
       record,
       preset: preset.name,
       seg: this.cfg.video.segmentSeconds,
       stagger: this.cfg.video.spawnStaggerSecs,
+      // In the tuple so a hardware-block encoder change replaces the capture
+      // supervisor (a new session with the new encoder), like a preset change.
+      encoder,
     });
     const camerasKey = JSON.stringify(cameras);
     if (key === this.videoKey && camerasKey === this.videoCamerasKey) return;
@@ -536,7 +546,7 @@ export class RecordingManager {
       if (prev) await prev.stopAndWait();
       // Superseded by a newer config/camera change while we were stopping.
       if (this.videoKey !== key || this.videoCamerasKey !== camerasKey) return;
-      this.startVideo(cameras, record, preset);
+      this.startVideo(cameras, record, preset, encoder);
     });
   }
 
@@ -655,6 +665,7 @@ export class RecordingManager {
     cameras: CaptureCamera[],
     record: boolean,
     preset: ReturnType<typeof resolveVideoPreset>,
+    encoder: "sw-h264" | "hw-h264" = "sw-h264",
   ): void {
     const vo = this.opts.video!;
     this.videoCapture = new VideoCaptureSupervisor({
@@ -662,6 +673,7 @@ export class RecordingManager {
       cameras,
       record,
       preset,
+      encoder,
       segmentSeconds: this.cfg.video.segmentSeconds,
       staggerMs: this.cfg.video.spawnStaggerSecs * 1000,
       videoRoot: videoRoot(this.root),

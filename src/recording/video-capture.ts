@@ -30,6 +30,12 @@ import { join } from "node:path";
 import { watch, type FSWatcher } from "node:fs";
 import { runStream, type StreamHandle } from "../lib/exec.js";
 import { isBridgedPipeline, resolveCameraName } from "../media/pipeline.js";
+import {
+  buildBridgedKvsPipeline,
+  buildRecordEncodeArgs,
+  SHM_BRIDGE_CAPS,
+} from "../media/pipeline-builder.js";
+import type { EncoderToken } from "../hardware/hardware-config.js";
 import type { KvsChannel } from "../media/manifest.js";
 import type { TimeSource } from "./session.js";
 import { mintSessionId, readBootId } from "./session.js";
@@ -40,8 +46,8 @@ import {
   type VideoSessionManifest,
 } from "./video-segments.js";
 
-/** Fixed low-res bridge caps — MUST match the bridged .gst's shmsrc caps. */
-export const SHM_BRIDGE_CAPS = "video/x-raw,format=I420,width=1280,height=720,framerate=15/1";
+/** Fixed low-res bridge caps — re-exported from the pipeline-builder (cm4-support). */
+export { SHM_BRIDGE_CAPS };
 
 const STABLE_MS = 15_000;
 const BASE_BACKOFF_MS = 2_000;
@@ -114,6 +120,12 @@ export interface CapturePipelineSpec {
   /** Session dir splitmuxsink writes fragments into. */
   outputDir: string;
   shmSocketPath: string;
+  /**
+   * Encoder token from the device's hardware block (cm4-support D6): the
+   * recording branch follows the model — `hw-h264` (v4l2h264enc) on the CM4,
+   * `sw-h264` (x264enc, today's exact argv) everywhere else. Absent = sw.
+   */
+  encoder?: EncoderToken;
 }
 
 /**
@@ -157,20 +169,10 @@ export function buildCapturePipelineArgs(spec: CapturePipelineSpec): string[] {
     "!",
     "queue",
     "!",
-    "x264enc",
-    // ultrafast, not veryfast: measured 65% vs 98% of a core per camera at
-    // 1080p15-2mbps (spike) — dual-camera headroom + the PSU brownout margin
-    // outweigh the compression-efficiency loss for dashcam footage.
-    "speed-preset=ultrafast",
-    "tune=zerolatency",
-    // Pin the encoder thread pool like the KVS side does (threads=2 there):
-    // unpinned, x264 spawns ~1.5x logical cores worth of threads per camera —
-    // 6 per encoder on the Pi 5 — and dual-camera boot bursts all of them at
-    // once. Two threads comfortably cover every preset in the table at
-    // ultrafast and bound the worst-case simultaneous demand.
-    "threads=2",
-    `bitrate=${preset.bitrateKbps}`,
-    `key-int-max=${keyIntMax}`,
+    // Encoder stage from the tested per-token template (cm4-support D6):
+    // x264enc argv byte-identical to the pre-plan pipeline for sw-h264, the
+    // Appendix-A v4l2h264enc control set (preset bitrate/GOP) for hw-h264.
+    ...buildRecordEncodeArgs(spec.encoder ?? "sw-h264", preset.bitrateKbps, keyIntMax),
     "!",
     "h264parse",
     "!",
@@ -212,19 +214,15 @@ export function buildCapturePipelineArgs(spec: CapturePipelineSpec): string[] {
 
 /**
  * Content of a BRIDGED per-stream .gst (the KVS master's pipeline when the
- * capture daemon owns the camera). Same encoder settings as today's direct
- * pipelines; `name=sampleVideoEncoder` keeps TWCC's live bitrate mutation
- * working because this encoder still lives inside the KVS process.
+ * capture daemon owns the camera). Delegates to the single pipeline-builder
+ * (cm4-support): sw-h264 stays byte-for-byte what this function has always
+ * returned; pass the device's encoder token for the hardware variant.
  */
-export function bridgedKvsPipeline(shmSocketPath: string): string {
-  return (
-    `shmsrc socket-path=${shmSocketPath} is-live=true do-timestamp=true ! ` +
-    `${SHM_BRIDGE_CAPS} ! ` +
-    `x264enc name=sampleVideoEncoder bframes=0 speed-preset=ultrafast bitrate=1000 ` +
-    `byte-stream=TRUE tune=zerolatency threads=2 ! ` +
-    `video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! ` +
-    `appsink sync=TRUE emit-signals=TRUE name=appsink-video`
-  );
+export function bridgedKvsPipeline(
+  shmSocketPath: string,
+  encoder: EncoderToken = "sw-h264",
+): string {
+  return buildBridgedKvsPipeline(encoder, shmSocketPath);
 }
 
 export type CaptureState = "starting" | "running" | "retrying" | "failed" | "stopped";
@@ -251,6 +249,8 @@ export interface VideoCaptureOptions {
   record: boolean;
   preset: VideoPreset;
   segmentSeconds: number;
+  /** Recording encoder token (cm4-support D6); absent = sw-h264 (today's argv). */
+  encoder?: EncoderToken;
   /**
    * Inter-camera spawn delay (Phase 2 staged boot): camera N starts N*staggerMs
    * after start(). The 2026-07-21 bench brownouts fired within seconds of the
@@ -538,6 +538,7 @@ export class VideoCaptureSupervisor {
         segmentSeconds: this.opts.segmentSeconds,
         outputDir: sessionDir,
         shmSocketPath: this.shmSocketPath(streamKey),
+        ...(this.opts.encoder ? { encoder: this.opts.encoder } : {}),
       });
     } else {
       run.sessionId = null;

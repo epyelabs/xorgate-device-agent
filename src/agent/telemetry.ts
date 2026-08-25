@@ -90,8 +90,14 @@ export interface MediaStream {
   streamKey: string;
   /** Signaling channel the master connects to as MASTER (`${deviceId}-${streamKey}`). */
   channelName: string;
-  /** Supervisor lifecycle state for this channel's master process. */
-  state: "starting" | "running" | "retrying" | "failed" | "stopped";
+  /**
+   * Supervisor lifecycle state for this channel's master process.
+   * `no-camera` / `no-pipeline` (cm4-support): the spawn guard held the master
+   * down — the model expects a camera that is not attached, or no pipeline
+   * file resolved — instead of letting it fall back to the runtime's built-in
+   * test pipeline (the fleet hazard of inventory #5).
+   */
+  state: "starting" | "running" | "retrying" | "failed" | "stopped" | "no-camera" | "no-pipeline";
   /**
    * True while this stream's capture daemon is writing segments to disk
    * (offline recording plan, Phase 3). Optional: absent on devices without

@@ -389,6 +389,9 @@ const STREAM_STATE_COLOR: Record<MediaStream["state"], string> = {
   retrying: "yellow",
   failed: "red",
   stopped: "gray",
+  // Spawn-guard verdicts (cm4-support): held down deliberately, not crashed.
+  "no-camera": "magenta",
+  "no-pipeline": "magenta",
 };
 
 const media: Module = {

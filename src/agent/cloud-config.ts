@@ -40,12 +40,14 @@
  */
 import {
   readSettingsFile,
+  parseCameraMountSettings,
   parseCellularSettings,
   parseLteRecoverySettings,
   parseRecordingSettings,
   parseTimeSyncSettings,
   saveSettings,
   settingsPath,
+  type CameraMountSettings,
   type CellularSettings,
   type LteRecoverySettings,
   type RecordingSettings,
@@ -107,6 +109,15 @@ export interface CloudConfig {
    * different APN, and a wrong one strands a device.
    */
   cellular?: CellularSettings | null;
+  /**
+   * Camera mounting rotation (cam-sensor-level-rotate plan). Same
+   * replace-whole-namespace semantics: null = carried but nothing valid →
+   * remove the local key (no camera managed, boot config left alone); absent =
+   * never cloud-configured, leave local settings alone. Persisting it is all
+   * that happens here — the boot-config reconciler is what turns it into an
+   * edit of config.txt, and only a REBOOT turns that into a flipped image.
+   */
+  cameraMount?: CameraMountSettings | null;
   /**
    * Segment-upload S3 bucket (Phase 6.2 backfill for devices fielded before
    * Phase 2 provisioning). Persisted into kvs.json — NOT settings.json — by
@@ -234,6 +245,10 @@ function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   if (cellular && typeof cellular === "object" && !Array.isArray(cellular)) {
     out.cellular = parseCellularSettings(cellular) ?? null;
   }
+  const cameraMount = (obj as { cameraMount?: unknown }).cameraMount;
+  if (cameraMount && typeof cameraMount === "object" && !Array.isArray(cameraMount)) {
+    out.cameraMount = parseCameraMountSettings(cameraMount) ?? null;
+  }
   const hardware = (obj as { hardware?: unknown }).hardware;
   if (hardware && typeof hardware === "object" && !Array.isArray(hardware)) {
     out.hardware = parseHardwareBlock(hardware);
@@ -329,13 +344,24 @@ export function applyCloudConfig(
       cellularChange = target ? "set" : "clear";
     }
   }
+  // ... and for the camera-mount namespace. Clearing removes the local key,
+  // which the reconciler reads as "no camera is managed" — it then leaves
+  // config.txt exactly as it is rather than resetting anything to 0.
+  let cameraMountChange: "set" | "clear" | undefined;
+  if (config.cameraMount !== undefined) {
+    const target = config.cameraMount ?? undefined;
+    if (JSON.stringify(target) !== JSON.stringify(current.cameraMount)) {
+      cameraMountChange = target ? "set" : "clear";
+    }
+  }
   if (
     Object.keys(next).length === 0 &&
     imuMountChange === undefined &&
     recordingChange === undefined &&
     lteRecoveryChange === undefined &&
     timeSyncChange === undefined &&
-    cellularChange === undefined
+    cellularChange === undefined &&
+    cameraMountChange === undefined
   ) {
     return { changed: false };
   }
@@ -350,6 +376,8 @@ export function applyCloudConfig(
   else if (timeSyncChange === "clear") delete merged.timeSync;
   if (cellularChange === "set") merged.cellular = config.cellular as CellularSettings;
   else if (cellularChange === "clear") delete merged.cellular;
+  if (cameraMountChange === "set") merged.cameraMount = config.cameraMount as CameraMountSettings;
+  else if (cameraMountChange === "clear") delete merged.cameraMount;
   saveSettings(merged, path);
   return { changed: true };
 }

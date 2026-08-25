@@ -61,7 +61,8 @@ import {
   type SimRegistration,
   type SimState,
 } from "../hardware/modem.js";
-import type { CellularSettings } from "../daemon/settings.js";
+import type { CameraMountSettings, CellularSettings } from "../daemon/settings.js";
+import type { CameraMountState } from "../hardware/boot-config.js";
 import type { CloudConfig } from "./cloud-config.js";
 
 /**
@@ -579,6 +580,7 @@ export function buildEffective(
   settings: AgentSettings,
   modem: ModemBiasSample,
   mode?: string,
+  cameraMount?: CameraMountState | null,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   // The APPLIED bias, not the requested one; omitted entirely when the modem
@@ -597,6 +599,15 @@ export function buildEffective(
   // "device differs from defaults".
   const cellular = effectiveCellular(settings.cellular, modem.apn);
   if (cellular !== undefined) out.cellular = cellular;
+  // `cameraMount` follows `gnssAntBias`/`cellular`: what is IN FORCE, not what
+  // was asked for. The rotation the cloud set lands in config.txt immediately
+  // but only reaches the sensor at the next boot, so `cameras` carries the
+  // rotation the running kernel booted with (read back from the device tree)
+  // and `pending` carries what is written and waiting. Reporting the desired
+  // value as effective would claim a flipped picture the device is not
+  // producing — which is the whole thing this namespace has to get right.
+  const cameraMountBlock = effectiveCameraMount(settings.cameraMount, cameraMount);
+  if (cameraMountBlock !== undefined) out.cameraMount = cameraMountBlock;
   // `build` rides alongside `mode` for the same reason and with the same rules:
   // reported-only, not a config namespace, so it never appears in the desired
   // document, never gets a `status` entry, and the local-edit fold-back cannot
@@ -632,6 +643,42 @@ function effectiveCellular(
   if (desired === "") return { ...settings };
   if (apn?.apn_applied === undefined) return undefined;
   return { ...settings, apn: apn.apn_applied };
+}
+
+/**
+ * The `cameraMount` namespace as in force.
+ *
+ *  - namespace absent            -> undefined (nothing managed, device defaults)
+ *  - reconciler has not run yet  -> the namespace as held, marked unreconciled
+ *  - otherwise                   -> `cameras` = the rotation each managed camera
+ *                                   is ACTUALLY running, `pending` = the ones
+ *                                   written to the boot config and waiting for
+ *                                   a reboot, plus the `rebootRequired` flag
+ *                                   both frontends badge from.
+ *
+ * A camera whose in-force rotation could not be read is omitted from `cameras`
+ * rather than defaulted to 0 — "we could not tell" and "it is upright" are
+ * different answers, and only one of them is honest.
+ */
+function effectiveCameraMount(
+  settings: CameraMountSettings | undefined,
+  state: CameraMountState | null | undefined,
+): Record<string, unknown> | undefined {
+  if (settings === undefined) return undefined;
+  if (!state) return { ...settings, reconciled: false };
+  const cameras: Record<string, { rotationDeg: number }> = {};
+  const pending: Record<string, { rotationDeg: number }> = {};
+  for (const cam of state.cameras) {
+    if (cam.inForceDeg !== null) cameras[cam.streamKey] = { rotationDeg: cam.inForceDeg };
+    if (cam.inForceDeg !== cam.desiredDeg && cam.bootDeg === cam.desiredDeg) {
+      pending[cam.streamKey] = { rotationDeg: cam.desiredDeg };
+    }
+  }
+  return {
+    cameras,
+    ...(Object.keys(pending).length > 0 ? { pending } : {}),
+    rebootRequired: state.rebootRequired,
+  };
 }
 
 // --- status -----------------------------------------------------------------
@@ -702,6 +749,7 @@ export function buildStatus(
   modem: ModemBiasSample,
   at: number,
   hints: ReportHints = {},
+  cameraMount?: CameraMountState | null,
 ): Record<string, NamespaceStatus> {
   const out: Record<string, NamespaceStatus> = {};
   if (desired === null) return out;
@@ -753,6 +801,16 @@ export function buildStatus(
       continue;
     }
 
+    if (key === "cameraMount") {
+      // Like `cellular`, and for the same reason: the verdict comes from the
+      // apply machinery, not from a value comparison. "written to the boot
+      // config, waiting for a reboot" is a state a desired-vs-inForce diff
+      // cannot express, and it is the state this namespace spends most of its
+      // life in.
+      out[key] = cameraMountStatus(cameraMount, at);
+      continue;
+    }
+
     if (key === "cellular") {
       // The APN's verdict comes from the modem daemon's own apply machinery,
       // not from a value comparison: "applying", "rolled back" and "gave up"
@@ -772,6 +830,65 @@ export function buildStatus(
     out[key] = detail ? { state: "applied", at, detail } : { state: "applied", at };
   }
   return out;
+}
+
+/**
+ * The `cameraMount` namespace's verdict.
+ *
+ * The shape is chosen so BOTH frontends stay truthful with no per-namespace
+ * plumbing: `adjusted` + `detail` is the only reported state that renders as
+ * "saved, but not what you asked for yet" in xorgate-web AND in alocate's
+ * generic namespace badge. A new `pending-reboot` state would fall through
+ * alocate's switch and show up as APPLIED — a green tick over a device whose
+ * picture is still upside down.
+ *
+ * Precedence is worst-first: one camera the device cannot rotate at all
+ * outranks another that is merely waiting for a reboot.
+ */
+function cameraMountStatus(state: CameraMountState | null | undefined, at: number): NamespaceStatus {
+  if (!state) {
+    return {
+      state: "adjusted",
+      at,
+      detail: "saved; the device has not reconciled its boot config yet",
+    };
+  }
+  const blocked = state.cameras.filter(
+    (c) =>
+      c.verdict === "unsupported" ||
+      c.verdict === "no-overlay" ||
+      c.verdict === "unknown-camera" ||
+      c.verdict === "write-failed",
+  );
+  if (blocked.length > 0) {
+    return {
+      state: "rejected",
+      at,
+      reason: blocked.map((c) => `${c.streamKey}: ${c.detail ?? c.verdict}`).join("; "),
+    };
+  }
+  const pending = state.cameras.filter((c) => c.verdict === "pending-reboot");
+  if (pending.length > 0) {
+    const which = pending
+      .map((c) => `${c.streamKey} ${c.desiredDeg}° (running ${c.inForceDeg ?? "?"}°)`)
+      .join(", ");
+    return {
+      state: "adjusted",
+      at,
+      detail: `written to the boot config — REBOOT REQUIRED to apply: ${which}`,
+    };
+  }
+  const unconfirmed = state.cameras.filter((c) => c.verdict === "unconfirmed");
+  if (unconfirmed.length > 0) {
+    return {
+      state: "adjusted",
+      at,
+      detail:
+        "written to the boot config, but the device could not read back the rotation " +
+        `currently in force (${unconfirmed.map((c) => c.streamKey).join(", ")}) — reboot to apply`,
+    };
+  }
+  return { state: "applied", at };
 }
 
 /**
@@ -891,13 +1008,19 @@ export interface ReportInput {
   hints?: ReportHints;
   /** The run mode in force (`config.mode`) — reported-only, see buildEffective. */
   mode?: string;
+  /**
+   * The boot-config reconciler's last verdict (cam-sensor-level-rotate plan).
+   * null/absent = it has not run yet, which the status says out loud rather
+   * than guessing at.
+   */
+  cameraMount?: CameraMountState | null;
   /** Locally-changed namespaces; only meaningful on an `origin: "local"` report. */
   changed?: Record<string, unknown>;
 }
 
 /** Assemble a complete report. Pure — every input is supplied by the caller. */
 export function buildConfigReport(input: ReportInput): ConfigReport {
-  const effective = buildEffective(input.settings, input.modem, input.mode);
+  const effective = buildEffective(input.settings, input.modem, input.mode, input.cameraMount);
   const report: ConfigReport = {
     v: 1,
     deviceId: input.deviceId,
@@ -905,7 +1028,14 @@ export function buildConfigReport(input: ReportInput): ConfigReport {
     rev: input.lastAppliedRev,
     origin: input.origin,
     effective,
-    status: buildStatus(input.desired, effective, input.modem, input.ts, input.hints),
+    status: buildStatus(
+      input.desired,
+      effective,
+      input.modem,
+      input.ts,
+      input.hints,
+      input.cameraMount,
+    ),
   };
   // Only a local report carries `changed`; on any other origin the cloud is the
   // author of the desired document and has nothing to learn from us about it.
@@ -932,6 +1062,12 @@ export interface ConfigSyncOptions {
   readSettings?: () => SettingsReadResult;
   modem?: (now: number) => Promise<ModemBiasSample>;
   hints?: () => ReportHints;
+  /**
+   * Read hook for the boot-config reconciler's latest verdict. Like `hints`,
+   * a snapshot the worker already holds — nothing here may run a reconcile,
+   * let alone a privileged write, on the report path.
+   */
+  cameraMount?: () => CameraMountState | null;
   onEvent?: (level: "info" | "warn", msg: string) => void;
   now?: () => number;
   statePath?: string;
@@ -1362,6 +1498,7 @@ export class ConfigSync {
         modem,
         desired: this.desired,
         hints: this.opts.hints?.(),
+        cameraMount: this.opts.cameraMount?.(),
         mode: this.opts.mode,
         changed,
       });

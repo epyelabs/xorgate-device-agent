@@ -228,6 +228,56 @@ export function parseCellularSettings(v: unknown): CellularSettings | undefined 
   return { apn };
 }
 
+/**
+ * Camera mounting rotation (cam-sensor-level-rotate plan) — the `cameraMount`
+ * namespace in settings.json. Per-camera 0/180, keyed by KVS stream key
+ * exactly like `recording.video.cameras`.
+ *
+ * Applied by the worker's boot-config reconciler, which edits the `rotation`
+ * parameter on that camera's `dtoverlay=` line in /boot/firmware/config.txt —
+ * the sensor then flips the image in its own readout registers, at zero CPU
+ * cost, for every consumer. It therefore takes effect on the NEXT BOOT, and
+ * the agent NEVER reboots the device itself: it edits the line and reports
+ * `rebootRequired` (see hardware/boot-config.ts).
+ *
+ * An ABSENT camera key is UNMANAGED — the reconciler leaves that overlay line
+ * exactly as it found it, so an installer's hand-set rotation on a device the
+ * cloud never configured is never silently stripped. `{"rotationDeg": 0}` is
+ * how you take a camera over and force it upright.
+ */
+export interface CameraMountSettings {
+  cameras?: Record<string, { rotationDeg: CameraRotationDeg }>;
+}
+
+/** The only values the camera overlay's `rotation` parameter accepts. */
+export type CameraRotationDeg = 0 | 180;
+
+/**
+ * Validate an untrusted `cameraMount` value. Forgiving like its siblings —
+ * unknown keys and impossible rotations are DROPPED rather than rejecting the
+ * whole namespace — with one deliberate exception to the "clamp, don't drop"
+ * posture: a rotation is never rounded to the nearest legal value. 90 is not
+ * "almost 180", and the number ends up in a boot config.
+ *
+ * `{cameras: {}}` parses to itself (a valid "manage no camera"), while a value
+ * carrying no usable `cameras` object at all returns undefined — the cloud's
+ * "revert this namespace" marker, which removes the local key.
+ */
+export function parseCameraMountSettings(v: unknown): CameraMountSettings | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const cameras = (v as { cameras?: unknown }).cameras;
+  if (!cameras || typeof cameras !== "object" || Array.isArray(cameras)) return undefined;
+  const out: Record<string, { rotationDeg: CameraRotationDeg }> = {};
+  for (const [key, entry] of Object.entries(cameras as Record<string, unknown>)) {
+    if (!STREAM_KEY_RE.test(key)) continue;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const deg = (entry as { rotationDeg?: unknown }).rotationDeg;
+    if (deg !== 0 && deg !== 180) continue;
+    out[key] = { rotationDeg: deg };
+  }
+  return { cameras: out };
+}
+
 export interface AgentSettings {
   mode?: RunMode;
   /*
@@ -276,6 +326,14 @@ export interface AgentSettings {
    * stored APN is left alone.
    */
   cellular?: CellularSettings;
+  /**
+   * Camera mounting rotation (see CameraMountSettings). Set from the web
+   * device settings page or `xorgate set cameraMount.<streamKey>.rotationDeg`;
+   * applied by the worker's boot-config reconciler, which edits config.txt and
+   * then reports that a REBOOT is required. Absent = no camera is managed and
+   * the boot config is left exactly as it is.
+   */
+  cameraMount?: CameraMountSettings;
 }
 
 /** Clamp `rateHz` to what the collectors can produce (IMU caps at 20 Hz). */
@@ -516,6 +574,8 @@ function parseSettingsObject(obj: Record<string, unknown>): AgentSettings {
   if (timeSync) out.timeSync = timeSync;
   const cellular = parseCellularSettings((obj as { cellular?: unknown }).cellular);
   if (cellular) out.cellular = cellular;
+  const cameraMount = parseCameraMountSettings((obj as { cameraMount?: unknown }).cameraMount);
+  if (cameraMount) out.cameraMount = cameraMount;
   return out;
 }
 

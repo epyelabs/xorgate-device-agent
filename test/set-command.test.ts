@@ -115,3 +115,49 @@ describe("the retired `media` setting", () => {
     );
   });
 });
+
+describe("xorgate set cameraMount.<streamKey>.rotationDeg", () => {
+  const stdout = (): string => vi.mocked(console.log).mock.calls.flat().join(" ");
+
+  it("persists a rotation and merges into the camera map", async () => {
+    await setCommand(["cameraMount.cam0.rotationDeg", "180"]);
+    expect(loadSettings().cameraMount).toEqual({ cameras: { cam0: { rotationDeg: 180 } } });
+
+    await setCommand(["cameraMount.cam1.rotationDeg", "0"]);
+    expect(loadSettings().cameraMount).toEqual({
+      cameras: { cam0: { rotationDeg: 180 }, cam1: { rotationDeg: 0 } },
+    });
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("says out loud that a REBOOT is needed — the whole contract of this setting", async () => {
+    await setCommand(["cameraMount.cam0.rotationDeg", "180"]);
+    expect(stdout()).toMatch(/REBOOT is required/);
+    expect(stdout()).toMatch(/never reboots itself/);
+  });
+
+  it("takes only 0 and 180, and only a real stream key", async () => {
+    for (const args of [
+      ["cameraMount.cam0.rotationDeg", "90"],
+      ["cameraMount.cam0.rotationDeg", "true"],
+      ["cameraMount.cam0.rotationDeg"],
+      ["cameraMount.cam 0.rotationDeg", "180"],
+      ["cameraMount.cam0.rotation", "180"],
+      ["cameraMount.cam0", "180"],
+    ]) {
+      process.exitCode = undefined;
+      await setCommand(args);
+      expect(process.exitCode, args.join(" ")).toBe(1);
+      expect(loadSettings().cameraMount, args.join(" ")).toBeUndefined();
+    }
+  });
+
+  it("leaves the other namespaces alone", async () => {
+    saveSettings({ gnssAntBias: true, recording: { telemetry: { rateHz: 5 } } });
+    await setCommand(["cameraMount.cam0.rotationDeg", "180"]);
+    const settings = loadSettings();
+    expect(settings.gnssAntBias).toBe(true);
+    expect(settings.recording?.telemetry?.rateHz).toBe(5);
+    expect(settings.cameraMount?.cameras?.cam0?.rotationDeg).toBe(180);
+  });
+});

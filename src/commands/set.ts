@@ -53,10 +53,17 @@
  * worker's clock stepper each tick (~30 s; no restart):
  *   timeSync.offlineSources <on|off>       timeSync.stepThresholdSecs <2-600>
  *   timeSync.maxStepsPerBoot <1-20>
+ *
+ * `cameraMount.<streamKey>.rotationDeg <0|180>` (cam-sensor-level-rotate plan)
+ * is the odd one out: the worker's reconciler picks it up within a minute and
+ * edits the `rotation` parameter on that camera's `dtoverlay=` line in
+ * /boot/firmware/config.txt, which the sensor only reads at boot. So this one
+ * needs a REBOOT — the agent will never do it for you, by design.
  */
 import {
   APN_RE,
   loadSettings,
+  parseCameraMountSettings,
   parseRecordingSettings,
   parseTimeSyncSettings,
   saveSettings,
@@ -65,6 +72,7 @@ import {
   RECORDING_RATE_HZ_MIN,
   STREAM_KEY_RE,
   type AgentSettings,
+  type CameraRotationDeg,
   type RecordingSettings,
   type TimeSyncSettings,
 } from "../daemon/settings.js";
@@ -84,7 +92,7 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, apn <value|\"\"> [--no-wait], wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>)";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, apn <value|\"\"> [--no-wait], wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>, cameraMount.<streamKey>.rotationDeg <0|180>)";
 
 /** Parse an on/off/true/false/1/0 CLI value; undefined when unrecognizable. */
 function parseBoolValue(v: string | undefined): boolean | undefined {
@@ -246,6 +254,60 @@ function setCameraEnable(key: string, streamKey: string, value: string | undefin
 }
 
 /**
+ * `xorgate set cameraMount.<streamKey>.rotationDeg <0|180>` — declare that a
+ * camera is mounted upside down (or is not).
+ *
+ * Writes settings.json only. The worker's boot-config reconciler is the single
+ * writer of config.txt (it needs root, via the xorgate-camrotate helper), and
+ * it picks this up within a minute. The image itself does not change until the
+ * device is REBOOTED, which the agent will never do on its own — so the note
+ * printed here is the whole user-facing contract of this setting.
+ */
+function setCameraMountCommand(key: string, value: string | undefined): void {
+  const parts = key.split(".");
+  const [, streamKey, field] = parts;
+  if (parts.length !== 3 || !streamKey || field !== "rotationDeg") {
+    console.error(
+      "cameraMount keys are dotted paths, e.g. xorgate set cameraMount.cam0.rotationDeg 180",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (!STREAM_KEY_RE.test(streamKey)) {
+    console.error(`'${streamKey}' is not a valid stream key (see kvs.json channels)`);
+    process.exitCode = 1;
+    return;
+  }
+  if (value !== "0" && value !== "180") {
+    console.error(`${key} must be 0 or 180, got '${value ?? ""}'`);
+    process.exitCode = 1;
+    return;
+  }
+  const rotationDeg: CameraRotationDeg = value === "180" ? 180 : 0;
+
+  // Same validator loadSettings uses, so a CLI write can never persist
+  // something the worker would drop on read.
+  const patch = parseCameraMountSettings({ cameras: { [streamKey]: { rotationDeg } } });
+  if (!patch?.cameras?.[streamKey]) {
+    console.error(`unknown or invalid cameraMount setting '${key}' = '${value ?? ""}'`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const settings: AgentSettings = { ...loadSettings() };
+  const current = settings.cameraMount?.cameras ?? {};
+  settings.cameraMount = { cameras: { ...current, [streamKey]: { rotationDeg } } };
+  saveSettings(settings);
+  console.log(`✓ ${key} = ${rotationDeg} (persisted to settings.json)`);
+  console.log(
+    "  the agent updates the camera overlay in /boot/firmware/config.txt within ~a minute,",
+  );
+  console.log(
+    "  then a REBOOT is required before the image changes (the agent never reboots itself).",
+  );
+}
+
+/**
  * `xorgate set timeSync.<field> <value>` — validate one offline-time-sync knob,
  * merge it into the persisted `timeSync` namespace, and let the worker's clock
  * stepper pick it up on its next tick (~30 s; no restart). Cloud-delivered
@@ -361,6 +423,13 @@ export async function setCommand(rest: string[]): Promise<void> {
     return;
   }
 
+  // cameraMount keys are picked up by the worker's boot-config reconciler —
+  // no restart, but a reboot before the picture changes.
+  if (key.startsWith("cameraMount.")) {
+    setCameraMountCommand(key, value);
+    return;
+  }
+
   // Merge onto existing settings so toggling one key never clobbers the other.
   const next: AgentSettings = { ...loadSettings() };
   let applied: string;
@@ -429,7 +498,7 @@ export async function setCommand(rest: string[]): Promise<void> {
     return;
   } else {
     console.error(
-      `unknown setting '${key}' (supported: mode, gps-antenna, gps-fix-reset-policy, deadzone-profile, apn, wifi, recording.*, timeSync.*)`,
+      `unknown setting '${key}' (supported: mode, gps-antenna, gps-fix-reset-policy, deadzone-profile, apn, wifi, recording.*, timeSync.*, cameraMount.*)`,
     );
     process.exitCode = 1;
     return;

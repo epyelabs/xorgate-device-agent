@@ -60,10 +60,15 @@ const MODEM_ASSETS: Array<[src: string, dest: string, mode: number]> = [
 const SYSTEM_ASSETS: Array<[src: string, dest: string, mode: number]> = [
   ["system/xorgate-setclock", "/usr/local/bin/xorgate-setclock", 0o755],
   ["system/xorgate-fake-hwclock.cron", "/etc/cron.d/xorgate-fake-hwclock", 0o644],
+  // The camera-rotation writer (cam-sensor-level-rotate plan): the agent runs
+  // unprivileged and /boot/firmware is root-owned, so this helper is the whole
+  // sudo surface for editing the camera overlay's `rotation` parameter.
+  ["system/xorgate-camrotate", "/usr/local/bin/xorgate-camrotate", 0o755],
 ];
 
 const CLOCK_SUDOERS_DEST = "/etc/sudoers.d/021_xorgate-clock";
 const UPDATE_SUDOERS_DEST = "/etc/sudoers.d/022_xorgate-update";
+const CAMROTATE_SUDOERS_DEST = "/etc/sudoers.d/023_xorgate-camrotate";
 
 // The oneshot unit that runs THIS command as root when the cloud asks for an
 // update (device_update_management, Phase 3). Installed here as well as by the
@@ -159,6 +164,41 @@ async function installUpdateSudoers(): Promise<void> {
     }
     copyFileSync(tmp, UPDATE_SUDOERS_DEST);
     chmodSync(UPDATE_SUDOERS_DEST, 0o440);
+  } finally {
+    rmSync(join(tmp, ".."), { recursive: true, force: true });
+  }
+}
+
+/**
+ * Install the sudoers drop-in that lets the (non-root) agent set the camera
+ * overlay's rotation parameter — and only that.
+ *
+ * The helper takes its own arguments (sensor, camN, 0|180) rather than a file
+ * path or a body to write, and re-validates all three, so the grant cannot be
+ * turned into "write anything into config.txt as root". Same posture as its
+ * two siblings: visudo-validated before it lands (a malformed sudoers file
+ * locks out sudo machine-wide), and a refusal is logged rather than fatal —
+ * the device keeps working, the rotation just reports as un-appliable until
+ * the entry exists.
+ */
+async function installCamRotateSudoers(): Promise<void> {
+  const user = serviceUser();
+  if (!user || user === "root") return; // root agent needs no sudo grant
+  const body =
+    `# Installed by xorgate. Allows the agent (running as ${user}) to set the\n` +
+    `# camera overlay's rotation parameter in the boot config, and nothing else.\n` +
+    `# See device-agent src/hardware/boot-config.ts + system/xorgate-camrotate.\n` +
+    `${user} ALL=(root) NOPASSWD: /usr/local/bin/xorgate-camrotate\n`;
+  const tmp = join(mkdtempSync(join(tmpdir(), "xg-sudoers-")), "023_xorgate-camrotate");
+  try {
+    writeFileSync(tmp, body, { mode: 0o440 });
+    const check = await run("visudo", ["-cf", tmp]);
+    if (check.failed || check.notFound) {
+      log("warning: camrotate sudoers drop-in failed visudo validation; camera rotation will not apply");
+      return;
+    }
+    copyFileSync(tmp, CAMROTATE_SUDOERS_DEST);
+    chmodSync(CAMROTATE_SUDOERS_DEST, 0o440);
   } finally {
     rmSync(join(tmp, ".."), { recursive: true, force: true });
   }
@@ -283,7 +323,10 @@ export async function updateCommand(argv: string[]): Promise<void> {
     }
 
     // 5c. System assets (Phase 4): the sudo clock helper, the fake-hwclock
-    //     cadence cron drop-in, and the sudoers grant for the service user.
+    //     cadence cron drop-in, the camera-rotation helper, and the sudoers
+    //     grants for the service user. Each grant is guarded on its helper
+    //     actually having been installed, so rolling BACK to a build without
+    //     one does not leave a sudoers entry pointing at a missing binary.
     for (const [src, dest, mode] of SYSTEM_ASSETS) {
       const from = join(INSTALL_PREFIX, src);
       if (!existsSync(from)) continue;
@@ -291,6 +334,9 @@ export async function updateCommand(argv: string[]): Promise<void> {
       chmodSync(dest, mode);
     }
     await installClockSudoers();
+    if (existsSync("/usr/local/bin/xorgate-camrotate")) {
+      await installCamRotateSudoers();
+    }
 
     // 5d. The remote-update rail (Phase 3): the oneshot unit that runs this
     //     very command as root, plus its exact-args sudoers grant. Guarded on

@@ -14,6 +14,7 @@
 import { loadConfig } from "./agent/config.js";
 import { applyCloudConfig, parseCloudMessage } from "./agent/cloud-config.js";
 import { ConfigSync, ensureConfigSyncBaseline } from "./agent/config-sync.js";
+import { reconcileCameraMount, type CameraMountState } from "./hardware/boot-config.js";
 import { migrateMediaEnabled } from "./daemon/settings-migrate.js";
 import { createClockStepper, resolveTimeSyncConfig } from "./agent/clock-step.js";
 import type { GpsClockReading } from "./agent/collectors/gps.js";
@@ -130,6 +131,59 @@ async function reconcileHardwareNow(): Promise<string[]> {
     streamGuardArmed = true;
   }
   return res.changedStreams;
+}
+
+/**
+ * Camera mounting rotation (cam-sensor-level-rotate plan): make the boot
+ * config's `rotation` parameter agree with the `cameraMount` namespace.
+ *
+ * Runs at startup (after the hardware reconcile, whose `.camera` files are how
+ * we read the rotation actually in force), on every cloud config message, and
+ * on a slow poll so a local `xorgate set` lands too. It writes config.txt only
+ * when the value genuinely differs, and — the invariant this whole feature
+ * hangs on — it NEVER reboots: it reports `rebootRequired` and leaves the
+ * decision to a human.
+ */
+let cameraMountState: CameraMountState | null = null;
+/**
+ * Set once the report plane exists. The first reconcile runs BEFORE it (so the
+ * very first report is already truthful), and reaching for `configSync` there
+ * would be a temporal-dead-zone throw on the startup path.
+ */
+let requestConfigReport: ((origin: "boot") => void) | null = null;
+
+async function reconcileCameraMountNow(): Promise<void> {
+  if (config.mode !== "real") return;
+  try {
+    const next = await reconcileCameraMount({
+      settings: loadSettings().cameraMount,
+      hardware: hardwareBlock,
+      pipelineDir: config.media.pipelineDir,
+      log: (level, msg) => {
+        const t = Date.now();
+        console[level === "warn" ? "warn" : "log"](`[camera-mount] ${msg}`);
+        store.event(level, `camera mount: ${msg}`, t);
+        store.flush(t, true);
+      },
+    });
+    const before = cameraMountState;
+    cameraMountState = next;
+    // Tell the cloud as soon as the answer moves — a "reboot required" an
+    // operator only learns about at the hourly heartbeat is a setting that
+    // looks broken for an hour.
+    if (JSON.stringify(summariseCameraMount(before)) !== JSON.stringify(summariseCameraMount(next))) {
+      requestConfigReport?.("boot");
+    }
+  } catch (err) {
+    // A reconcile failure must never touch the rest of the agent: no camera
+    // rotation is worth a dead worker.
+    console.warn(`[agent] camera mount reconcile failed: ${(err as Error).message}`);
+  }
+}
+
+/** The parts of the verdict worth re-reporting on (ignores the timestamp). */
+function summariseCameraMount(state: CameraMountState | null): unknown {
+  return state?.cameras.map((c) => [c.streamKey, c.desiredDeg, c.inForceDeg, c.bootDeg, c.verdict]);
 }
 
 // Spawn guard for the media supervisor (see MediaConfig.streamGuard): a
@@ -286,6 +340,11 @@ const timeSource = createTimeSourceTracker();
 // files this (re)renders. Awaited — enumeration is one bounded rpicam exec.
 await reconcileHardwareNow();
 
+// Camera rotation: after the hardware reconcile (it needs this boot's
+// enumerated camera identities) and before the report plane comes up, so the
+// first report already carries an honest verdict.
+await reconcileCameraMountNow();
+
 // On-device recording (offline telemetry plan, Phase 1). Runs independently of
 // MQTT connectivity — its own sampling interval, applied live from settings.json.
 const recording = new RecordingManager({
@@ -439,6 +498,20 @@ const heartbeat = setInterval(() => {
   if (store.snapshot().connection !== "connected") store.flush(Date.now(), true);
 }, 1000);
 
+/**
+ * Camera-rotation poll. The cloud path reconciles on delivery; this is what
+ * catches a LOCAL edit (`xorgate set cameraMount…`, a hand-edited
+ * settings.json) and re-reads the boot config after someone has changed it by
+ * hand. Slow on purpose — a rotation is an install-time decision, the pass is
+ * two small file reads when nothing has moved, and it must never contend with
+ * the second-by-second work above.
+ */
+const cameraMountPoll = setInterval(() => {
+  if (shuttingDown) return;
+  void reconcileCameraMountNow();
+}, 60_000);
+cameraMountPoll.unref?.();
+
 // Last-resort net so a stray rejection (e.g. a P5 collector read) doesn't crash
 // the detached daemon silently with a frozen state file.
 process.on("unhandledRejection", (reason) => {
@@ -472,6 +545,10 @@ const configSync = new ConfigSync({
   // Gates retiring a local change: a report published into a dead link never
   // reached the mirror, so it must stay pending and be re-sent on connect.
   online: () => store.snapshot().connection === "connected",
+  // The boot-config reconciler's latest verdict (cam-sensor-level-rotate).
+  // A read of a snapshot the worker already holds — the report path never
+  // triggers a reconcile, and certainly never a privileged write.
+  cameraMount: () => cameraMountState,
   hints: () => {
     const status = recording.status();
     return {
@@ -493,6 +570,8 @@ const configSync = new ConfigSync({
 // hand-edit with vim. Started before MQTT connects on purpose: an edit made
 // while the agent was stopped is just as real, and `config-sync.json` carries
 // the baseline that makes it detectable.
+requestConfigReport = (origin) => configSync.request(origin);
+
 configSync.startWatcher();
 
 // APN-machinery watch (Phase 2): an apply's confirm/rollback lands on the
@@ -630,6 +709,11 @@ function handleConfigMessage(payload: Buffer): void {
     // Called on the skipped path too, so the apply machinery's cadence is
     // byte-identical to pre-Phase-3 (it is a no-op re-read when nothing moved).
     recording.reapply();
+    // ... and the same for `cameraMount`: reconcile the boot config against
+    // whatever settings.json now holds. Not awaited — an apply path may never
+    // block on a subprocess (design.md §7) — and idempotent, so the skipped
+    // redelivery path costs two file reads.
+    void reconcileCameraMountNow();
   } catch (err) {
     console.error("[agent] cloud config apply failed", (err as Error).message);
     store.event("warn", `cloud config apply failed: ${(err as Error).message}`, now);
@@ -943,6 +1027,7 @@ function shutdown(sig: string): void {
   console.log(`\n[agent] shutting down (${sig})…`);
   if (timer) clearInterval(timer);
   clearInterval(heartbeat);
+  clearInterval(cameraMountPoll);
   // Best-effort blank (pinctrl is ~1 ms/call, and this runs well before the
   // exit below). systemd's ExecStopPost=`xorgate led exit-state` is the actual
   // guarantee — and unlike us it can tell a clean stop from a crash.

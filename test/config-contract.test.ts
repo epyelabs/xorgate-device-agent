@@ -80,6 +80,7 @@ describe("config contract: the agent matches the cloud registry", () => {
     // cloud setting (design Q4). If one appears here, the worker needs to learn
     // about it.
     expect(Object.keys(contract.namespaces).sort()).toEqual([
+      "cameraMount",
       "cellular",
       "gnssAntBias",
       "imuMount",

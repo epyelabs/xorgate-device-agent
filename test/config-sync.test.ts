@@ -1095,6 +1095,7 @@ describe("apply classes", () => {
       lteRecovery: "modem-poll",
       timeSync: "agent-poll",
       cellular: "modem-poll",
+      cameraMount: "agent-poll",
     });
   });
 });

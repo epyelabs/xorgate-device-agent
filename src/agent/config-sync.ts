@@ -135,6 +135,11 @@ export const CONFIG_APPLY_CLASSES: Readonly<Record<string, ApplyClass>> = {
   lteRecovery: "modem-poll",
   timeSync: "agent-poll",
   cellular: "modem-poll",
+  // The boot-config reconciler picks it up on every cloud message like the
+  // other agent-applied namespaces; the EDIT is immediate, the effect waits
+  // for the next boot (the namespace's status carries that — the agent never
+  // reboots by itself).
+  cameraMount: "agent-poll",
 };
 
 /** Namespace keys in publish order (matches the cloud registry's order). */

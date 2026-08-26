@@ -154,6 +154,26 @@ describe("pipeline templates", () => {
       "!",
       "v4l2h264enc",
       "extra-controls=controls,video_bitrate=2000000,repeat_sequence_header=1,h264_i_frame_period=30",
+      "!",
+      "video/x-h264,profile=(string)constrained-baseline,level=(string)4",
+    ]);
+  });
+
+  it("the hw recording stage carries the caps v4l2h264enc needs to negotiate", () => {
+    // Not a consumer preference — without these the encoder fails to preroll
+    // on a CM4 and takes the shm bridge (i.e. LIVE video) down with it. Bench-
+    // isolated with videotestsrc, cam-sensor-level-rotate Phase 4.
+    const hw = buildRecordEncodeArgs("hw-h264", 1000, 30);
+    expect(hw.at(-2)).toBe("!");
+    expect(hw.at(-1)).toContain("profile=(string)constrained-baseline");
+    // The software path has no such constraint and must stay byte-identical.
+    expect(buildRecordEncodeArgs("sw-h264", 1000, 30)).toEqual([
+      "x264enc",
+      "speed-preset=ultrafast",
+      "tune=zerolatency",
+      "threads=2",
+      "bitrate=1000",
+      "key-int-max=30",
     ]);
   });
 

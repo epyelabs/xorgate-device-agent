@@ -46,6 +46,18 @@ const SW_ENCODE_DIRECT =
   "x264enc bframes=0 speed-preset=ultrafast bitrate=1000 " +
   "byte-stream=TRUE tune=zerolatency threads=2";
 
+/**
+ * The output caps `v4l2h264enc` needs to negotiate at all — NOT a consumer
+ * preference (cam-sensor-level-rotate plan, Phase 4).
+ *
+ * Isolated on a CM4 bench with `videotestsrc`, the same pipeline twice:
+ * without these caps it dies with `streaming stopped, reason error (-5)` /
+ * `pipeline doesn't want to preroll`; with them it runs clean. The KVS `.gst`
+ * carried them from the start, which is why LIVE video always worked on a CM4
+ * while recording never did.
+ */
+const HW_RECORD_OUT_CAPS = "video/x-h264,profile=(string)constrained-baseline,level=(string)4";
+
 /** Appendix A's v4l2h264enc stage (1 Mbps, SPS/PPS on every IDR, IDR every 30 frames). */
 const HW_ENCODE =
   "v4l2h264enc extra-controls=controls,video_bitrate=1000000,repeat_sequence_header=1,h264_i_frame_period=30";
@@ -92,9 +104,14 @@ export function buildDirectKvsPipeline(
  *
  * sw-h264 is today's exact x264enc argv. hw-h264 mirrors Appendix A's control
  * set with the preset's bitrate/GOP; the convert element is as load-bearing
- * here as on the KVS side. No profile caps are forced on the recording side —
- * the constrained-baseline requirement is a BROWSER decode constraint, and
- * disk fragments have no such consumer.
+ * here as on the KVS side, and so — it turns out — are the output caps.
+ *
+ * This used to end at the encoder, on the reasoning that constrained-baseline
+ * is a BROWSER decode constraint and a disk fragment has no such consumer.
+ * That reasoning was wrong about the mechanism: on a CM4, `v4l2h264enc`
+ * without those caps fails to negotiate at all (`Failed to process frame`,
+ * then the shm bridge collapses behind it), so enabling recording took the
+ * whole capture process down — live video with it. See HW_RECORD_OUT_CAPS.
  */
 export function buildRecordEncodeArgs(
   encoder: EncoderToken,
@@ -107,6 +124,8 @@ export function buildRecordEncodeArgs(
       "!",
       "v4l2h264enc",
       `extra-controls=controls,video_bitrate=${bitrateKbps * 1000},repeat_sequence_header=1,h264_i_frame_period=${keyIntMax}`,
+      "!",
+      HW_RECORD_OUT_CAPS,
     ];
   }
   return [

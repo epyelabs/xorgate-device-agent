@@ -42,7 +42,7 @@ export const VIDEO_PRESETS: readonly VideoPreset[] = [
 ];
 
 /** Default preset name — must exist in VIDEO_PRESETS (see RECORDING_DEFAULTS). */
-export const DEFAULT_VIDEO_PRESET = "1080p15-2mbps";
+export const DEFAULT_VIDEO_PRESET = "720p15-1mbps";
 
 export function findVideoPreset(name: string): VideoPreset | undefined {
   return VIDEO_PRESETS.find((p) => p.name === name);

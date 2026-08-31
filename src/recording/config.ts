@@ -44,10 +44,10 @@ export interface ResolvedRecordingConfig {
 }
 
 export const RECORDING_DEFAULTS: ResolvedRecordingConfig = {
-  telemetry: { enabled: false, rateHz: 10 },
+  telemetry: { enabled: false, rateHz: 1 },
   video: {
     enabled: false,
-    preset: "1080p15-2mbps",
+    preset: "720p15-1mbps",
     segmentSeconds: 60,
     bootDefer: "auto",
     bootDeferMaxSecs: 90,

@@ -555,7 +555,8 @@ describe("RecordingManager video wiring", () => {
     await manager.start();
     await delay(20);
     const firstSession = manager.videoStatus().streams[0].sessionId;
-    expect(spawner.spawns[0].args.join(" ")).toContain("width=1920");
+    // Default preset is 720p15-1mbps; the change below moves the framerate.
+    expect(spawner.spawns[0].args.join(" ")).toContain("width=1280,height=720,framerate=15/1");
 
     saveSettings({ recording: { video: { enabled: true, preset: "720p30-2mbps", bootDefer: "off" } } });
     manager.reapply();

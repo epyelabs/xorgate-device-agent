@@ -29,6 +29,7 @@ import {
   type DeviceCommandName,
 } from "./agent/commands.js";
 import { connect } from "./agent/mqtt.js";
+import { TelemetryScope, type ScopeChange } from "./agent/telemetry-scope.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector, type GroupSample } from "./agent/collectors/index.js";
 import { loadManifest, persistUploadBucket } from "./media/manifest.js";
@@ -525,6 +526,29 @@ process.on("unhandledRejection", (reason) => {
 const client = connect(config);
 
 /**
+ * The telemetry topic in force right now (platform-auth Phase 4), plus the
+ * unscoped-topic fallback that stops a tenancy change from stranding this
+ * device (transfer-device-ownership Phase 1.1 — see `agent/telemetry-scope.ts`
+ * for the failure mode and the thresholds).
+ *
+ * Starts as the unscoped `xorgate/devices/{deviceId}/telemetry` and switches to
+ * the tenant-scoped topic the moment the cloud tells this device which
+ * organization and workspace it is in. That message is RETAINED, so the switch
+ * happens within a second or so of every connect and needs nothing persisted
+ * locally: the handful of samples published before it arrives go to the
+ * unscoped topic, which the cloud still ingests.
+ *
+ * Deliberately mutable rather than a restart-time constant. The cloud can move
+ * a device between workspaces, and a device that had to be rebooted to notice
+ * would keep publishing where its new tenant cannot see it and its old tenant
+ * still can.
+ */
+const telemetryScope = new TelemetryScope({
+  deviceId: config.deviceId,
+  unscopedTopic: config.telemetryTopic,
+});
+
+/**
  * The reported half of the config plane (settings-management plan, Phase 3):
  * owns the rev guard, `config-sync.json`, and the debounced publisher that
  * echoes what this device actually holds back to the cloud.
@@ -549,6 +573,10 @@ const configSync = new ConfigSync({
   // A read of a snapshot the worker already holds — the report path never
   // triggers a reconcile, and certainly never a privileged write.
   cameraMount: () => cameraMountState,
+  // Reported-only, like `mode`: `effective.telemetryScope` is how the cloud
+  // sees that this device fell back to the unscoped telemetry topic. Nothing
+  // else off-box can tell — the first-party console subscribes to both planes.
+  telemetryScope: () => telemetryScope.report(),
   hints: () => {
     const status = recording.status();
     return {
@@ -582,25 +610,34 @@ configSync.startApnWatch();
 // Cloud config messages (retained; re-delivered on every connect). Persist into
 // settings.json — the sim7600-lte daemon polls the file and applies gnssAntBias
 // live.
-/**
- * The telemetry topic in force right now (platform-auth Phase 4).
- *
- * Starts as the unscoped `xorgate/devices/{deviceId}/telemetry` and switches to
- * the tenant-scoped topic the moment the cloud tells this device which
- * organization and workspace it is in. That message is RETAINED, so the switch
- * happens within a second or so of every connect and needs nothing persisted
- * locally: the handful of samples published before it arrives go to the
- * unscoped topic, which the cloud still ingests.
- *
- * Deliberately mutable rather than a restart-time constant. The cloud can move
- * a device between workspaces, and a device that had to be rebooted to notice
- * would keep publishing where its new tenant cannot see it and its old tenant
- * still can.
- */
-let telemetryTopic = config.telemetryTopic;
-
-function scopedTelemetryTopic(scope: { organizationId: string; workspaceId: string }): string {
-  return `xorgate/orgs/${scope.organizationId}/ws/${scope.workspaceId}/devices/${config.deviceId}/telemetry`;
+/** Log + journal a topic change. One place, so every route says the same thing. */
+function noteScopeChange(change: ScopeChange, now: number): void {
+  if (change.kind === "scoped") {
+    const how = change.reason === "reprobe" ? " (re-probe after fallback)" : "";
+    console.log(`[agent] telemetry topic -> ${change.topic}${how}`);
+    store.event(
+      "info",
+      `telemetry topic scoped to ws ${change.scope.workspaceId}${how}`,
+      now,
+    );
+  } else {
+    const mins = Math.round(change.reprobeInMs / 60_000);
+    console.warn(
+      `[agent] telemetry topic FALLBACK -> ${change.topic}: the broker refused ` +
+        `ws ${change.scope.workspaceId} on ${change.cycles} consecutive connections. ` +
+        `Publishing on the unscoped topic (still ingested); re-probing in ~${mins} min.`,
+    );
+    store.event(
+      "warn",
+      `telemetry topic fallback to unscoped: ws ${change.scope.workspaceId} refused ` +
+        `(${change.cycles} cycles); re-probe in ~${mins} min`,
+      now,
+    );
+  }
+  store.flush(now, true);
+  // The cloud only learns about this through a report — `effective.telemetryScope`
+  // is the one signal an operator has that a transfer left this device behind.
+  requestConfigReport?.("boot");
 }
 
 function handleConfigMessage(payload: Buffer): void {
@@ -640,13 +677,8 @@ function handleConfigMessage(payload: Buffer): void {
   // had already applied this rev — which, after a restart, is every device —
   // never learned where to publish.
   if (parsed.scope) {
-    const next = scopedTelemetryTopic(parsed.scope);
-    if (next !== telemetryTopic) {
-      telemetryTopic = next;
-      console.log(`[agent] telemetry topic -> ${next}`);
-      store.event("info", `telemetry topic scoped to ws ${parsed.scope.workspaceId}`, now);
-      store.flush(now, true);
-    }
+    const change = telemetryScope.applyScope(parsed.scope, now);
+    if (change) noteScopeChange(change, now);
   }
   // Hardware block (cm4-support): envelope data like `scope`/`uploadBucket`,
   // handled OUTSIDE the rev guard for the same reason — it is a fact about the
@@ -901,6 +933,9 @@ client.on("connect", () => {
   store.setConnection("connected", now);
   store.event("info", `connected to ${config.endpoint}`, now);
   store.flush(now, true);
+  // Starts the scoped-topic measurement cycle. A connection that dies young
+  // having published is the signature of a refused topic (telemetry-scope.ts).
+  telemetryScope.noteConnect(now);
   recording.notifyConnectivity(true); // resume any pending segment uploads
 
   client.publish(
@@ -975,11 +1010,20 @@ client.on("connect", () => {
         recording: recordingStatus,
       };
       store.setLatest(payload);
-      client.publish(telemetryTopic, JSON.stringify(payload), { qos: 0 }, (err) => {
+      // The backoff re-probe lives on this tick rather than its own timer: it
+      // only ever matters while we are publishing, and this is the publish.
+      const reprobe = telemetryScope.noteTick(ts);
+      if (reprobe) noteScopeChange(reprobe, ts);
+      client.publish(telemetryScope.topic, JSON.stringify(payload), { qos: 0 }, (err) => {
         if (shuttingDown) return; // don't re-write state after the final flush
         const t = Date.now();
         if (err) store.recordPublishError(err.message, t);
-        else store.recordPublish(t);
+        else {
+          store.recordPublish(t);
+          // Counts toward "this connection carried traffic on the scoped topic",
+          // which is half of what makes a short connection suspicious.
+          telemetryScope.notePublish();
+        }
         store.flush(t);
       });
     } catch (err) {
@@ -1012,6 +1056,12 @@ client.on("close", () => {
   store.setConnection("closed", now);
   store.event("warn", "connection closed", now);
   store.flush(now, true);
+  // Scored ONLY for a broker/link close. Our own shutdown closes the socket too
+  // and would otherwise read as a suspicious short cycle on the way out.
+  if (!shuttingDown) {
+    const change = telemetryScope.noteClose(now);
+    if (change) noteScopeChange(change, now);
+  }
   recording.notifyConnectivity(false); // abort any in-flight segment upload
 });
 

@@ -64,6 +64,7 @@ import {
 import type { CameraMountSettings, CellularSettings } from "../daemon/settings.js";
 import type { CameraMountState } from "../hardware/boot-config.js";
 import type { CloudConfig } from "./cloud-config.js";
+import type { TelemetryScopeReport } from "./telemetry-scope.js";
 
 /**
  * How a namespace reaches the hardware once settings.json holds it. Mirrors
@@ -581,6 +582,7 @@ export function buildEffective(
   modem: ModemBiasSample,
   mode?: string,
   cameraMount?: CameraMountState | null,
+  telemetryScope?: TelemetryScopeReport | null,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   // The APPLIED bias, not the requested one; omitted entirely when the modem
@@ -614,6 +616,13 @@ export function buildEffective(
   // write it into `devices.config`. The cloud mirrors it into `agent_version`
   // and the web UI polls it to confirm a remote update landed.
   if (mode !== undefined) out.agent = { mode, build: loadBuildInfo() };
+  // `telemetryScope` (transfer-device-ownership Phase 1.1) is reported-only for
+  // the same reason `agent`/`sim` are: tenancy is not a setting anyone edits
+  // locally, so there is no desired counterpart and no `status` badge. It is
+  // here because it is the ONLY way the cloud learns that this device fell back
+  // to the unscoped telemetry topic — the console renders telemetry from both
+  // planes with wildcards, so a stranded device looks perfectly healthy there.
+  if (telemetryScope) out.telemetryScope = telemetryScope;
   if (modem.sim !== undefined) out.sim = modem.sim;
   if (modem.uplink !== undefined) out.uplink = modem.uplink;
   // The APN machinery itself is reported-only, like `sim` — it is what the UI
@@ -1014,13 +1023,25 @@ export interface ReportInput {
    * than guessing at.
    */
   cameraMount?: CameraMountState | null;
+  /**
+   * Where telemetry is actually going and whether the scoped topic was refused
+   * (transfer-device-ownership Phase 1.1). Reported-only; absent = an agent or
+   * a caller that does not track it.
+   */
+  telemetryScope?: TelemetryScopeReport | null;
   /** Locally-changed namespaces; only meaningful on an `origin: "local"` report. */
   changed?: Record<string, unknown>;
 }
 
 /** Assemble a complete report. Pure — every input is supplied by the caller. */
 export function buildConfigReport(input: ReportInput): ConfigReport {
-  const effective = buildEffective(input.settings, input.modem, input.mode, input.cameraMount);
+  const effective = buildEffective(
+    input.settings,
+    input.modem,
+    input.mode,
+    input.cameraMount,
+    input.telemetryScope,
+  );
   const report: ConfigReport = {
     v: 1,
     deviceId: input.deviceId,
@@ -1068,6 +1089,8 @@ export interface ConfigSyncOptions {
    * let alone a privileged write, on the report path.
    */
   cameraMount?: () => CameraMountState | null;
+  /** Live view of the telemetry topic in force; see `telemetry-scope.ts`. */
+  telemetryScope?: () => TelemetryScopeReport | null;
   onEvent?: (level: "info" | "warn", msg: string) => void;
   now?: () => number;
   statePath?: string;
@@ -1499,6 +1522,7 @@ export class ConfigSync {
         desired: this.desired,
         hints: this.opts.hints?.(),
         cameraMount: this.opts.cameraMount?.(),
+        telemetryScope: this.opts.telemetryScope?.(),
         mode: this.opts.mode,
         changed,
       });

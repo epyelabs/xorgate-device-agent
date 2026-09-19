@@ -148,17 +148,65 @@ describe("telemetry scope: the 2026-09-18 loop", () => {
     expect(s.fallenBack).toBe(false);
   });
 
-  it("ignores a short connection that never published", () => {
-    // Nothing was offered to the broker, so nothing was refused.
+  it("ignores short connections until the scoped topic has been offered at all", () => {
+    // Nothing was ever published on it, so nothing was refused — this is a
+    // device with a bad link, not a device with a bad tenancy.
     const s = make({ graceMs: 0 });
     s.applyScope(WS_A, 0);
     let t = 0;
-    for (let i = 0; i < 10; i += 1) {
+    for (let i = 0; i < 40; i += 1) {
       s.noteConnect(t);
       expect(s.noteClose(t + 1_300)).toBeNull();
       t += 3_300;
     }
     expect(s.fallenBack).toBe(false);
+  });
+
+  it("keeps counting through cycles that carry no publish callback", () => {
+    // THE bench regression (2026-09-19). The broker cycles every ~2.3 s while
+    // the agent publishes at 1 Hz and mqtt.js queues across the gaps, so plenty
+    // of connections carry no callback. Requiring one per cycle made a 30 s
+    // unbroken run essentially impossible, and the real loop ran past 70 s
+    // untouched.
+    const s = make();
+    s.applyScope(WS_A, 0);
+    let t = 0;
+    s.noteConnect(t);
+    s.notePublish(); // offered once, right at the start — and never again
+    s.noteClose(t + 1_300);
+    t += 2_300;
+    let fallback: ScopeChange | null = null;
+    for (let i = 0; i < 100 && !fallback; i += 1) {
+      s.noteConnect(t);
+      fallback = s.noteClose(t + 1_300);
+      t += 2_300;
+    }
+    expect(fallback).toMatchObject({ kind: "fallback" });
+    expect(t).toBeLessThan(45_000);
+  });
+
+  it("is not thrown off by a close with no connection behind it", () => {
+    // A handshake that never completed is not evidence either way; it must not
+    // clear a run that is otherwise building.
+    const s = make();
+    s.applyScope(WS_A, 0);
+    let t = 0;
+    s.noteConnect(t);
+    s.notePublish();
+    s.noteClose(t + 1_300);
+    t += 2_300;
+    let fallback: ScopeChange | null = null;
+    for (let i = 0; i < 100 && !fallback; i += 1) {
+      if (i % 3 === 0) {
+        expect(s.noteClose(t)).toBeNull(); // failed connect attempt
+        t += 2_000;
+        continue;
+      }
+      s.noteConnect(t);
+      fallback = s.noteClose(t + 1_300);
+      t += 2_300;
+    }
+    expect(fallback).toMatchObject({ kind: "fallback" });
   });
 });
 

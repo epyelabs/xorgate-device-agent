@@ -36,10 +36,21 @@
  * a restart would have done: drop to the unscoped topic. Fail OPEN to the legacy
  * plane, never into a loop.
  *
- * The signature is a connection that (a) carried at least one publish on the
- * scoped topic and (b) died in under `shortConnectionMs`. One of those is
- * nothing — a tunnel blink looks the same. A RUN of them that has been going for
- * at least `graceMs` is the loop, and nothing else the agent does produces it.
+ * The signature is a connection that died in under `shortConnectionMs` while the
+ * scoped topic was armed and this agent had actually published on it. One of
+ * those is nothing — a tunnel blink looks the same. A RUN of them that has been
+ * going for at least `graceMs` is the loop, and nothing else the agent does
+ * produces it.
+ *
+ * "Had actually published" is deliberately CUMULATIVE (since the topic was
+ * armed), not per-connection. Requiring a publish inside each short window is
+ * the obvious way to write this and it does not work: measured against the real
+ * loop on the bench (2026-09-19), the broker cycles every ~2.3 s while the agent
+ * publishes at 1 Hz and mqtt.js queues across the gaps, so a good fraction of
+ * connections carry no publish CALLBACK at all. Resetting the run on those means
+ * a 30 s unbroken run essentially never happens — the loop ran past 70 s
+ * untouched before this was fixed. A connection that dies in under five seconds
+ * is evidence whether or not a callback happened to land inside it.
  *
  * `graceMs` (30 s) is the important number and it is chosen against a real
  * observation, not a hunch: a correctly-ordered transfer whose two writes were
@@ -96,7 +107,7 @@ export interface TelemetryScopeOptions {
   /** `xorgate/devices/{deviceId}/telemetry` — always permitted by the policy. */
   unscopedTopic: string;
   deviceId: string;
-  /** A connection shorter than this that published is "suspicious". */
+  /** A connection shorter than this, on an armed scoped topic, is "suspicious". */
   shortConnectionMs?: number;
   /** Consecutive suspicious cycles before the FIRST fallback. */
   failureThreshold?: number;
@@ -156,7 +167,12 @@ export class TelemetryScope {
    * matter what the broker did to it. null = not connected.
    */
   private cycleStartedAt: number | null = null;
-  private publishesThisCycle = 0;
+  /**
+   * Publishes on the scoped topic since it was armed. Cumulative on purpose —
+   * see the header. It only has to answer "have we ever offered this topic to
+   * the broker", which is what separates "refused" from "never tried".
+   */
+  private publishesSinceArm = 0;
   /** Consecutive suspicious cycles, and when the run began. */
   private runCycles = 0;
   private runStartedAt = 0;
@@ -205,12 +221,11 @@ export class TelemetryScope {
   /** MQTT connected. */
   noteConnect(now: number): void {
     this.cycleStartedAt = now;
-    this.publishesThisCycle = 0;
   }
 
   /** A telemetry publish left the client on the current topic. */
   notePublish(): void {
-    this.publishesThisCycle += 1;
+    if (this.scoped) this.publishesSinceArm += 1;
   }
 
   /**
@@ -221,16 +236,19 @@ export class TelemetryScope {
   noteClose(now: number): ScopeChange | null {
     const startedAt = this.cycleStartedAt;
     this.cycleStartedAt = null;
-    const published = this.publishesThisCycle;
-    this.publishesThisCycle = 0;
 
-    // A cycle says nothing about the scoped topic unless we were using it.
-    if (!this.scoped || this.desired === null || startedAt === null) {
+    // A cycle says nothing about the scoped topic unless we were using it and
+    // have offered it to the broker at least once.
+    if (!this.scoped || this.desired === null || this.publishesSinceArm === 0) {
       this.runCycles = 0;
       return null;
     }
-    const suspicious = published > 0 && now - startedAt < this.opts.shortConnectionMs;
-    if (!suspicious) {
+    // A close with no connection behind it — a handshake that never completed —
+    // is not evidence either way, so it neither counts nor clears the run.
+    if (startedAt === null) return null;
+    if (now - startedAt >= this.opts.shortConnectionMs) {
+      // Long enough to be a working connection. Whatever we were watching, it
+      // is over.
       this.runCycles = 0;
       return null;
     }
@@ -293,10 +311,8 @@ export class TelemetryScope {
   private armScoped(now: number): void {
     this.scoped = true;
     this.runCycles = 0;
+    this.publishesSinceArm = 0;
     // Only meaningful while connected; a connect will set it otherwise.
-    if (this.cycleStartedAt !== null) {
-      this.cycleStartedAt = now;
-      this.publishesThisCycle = 0;
-    }
+    if (this.cycleStartedAt !== null) this.cycleStartedAt = now;
   }
 }

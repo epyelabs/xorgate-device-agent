@@ -1086,6 +1086,58 @@ describe("reported-only agent state", () => {
   });
 });
 
+/**
+ * `telemetryScope` (transfer-device-ownership Phase 1.1). Reported-only, like
+ * `agent`/`sim`/`apn` — tenancy is not a setting anyone edits locally, so there
+ * is no desired counterpart and nothing for a status badge to compare.
+ *
+ * It exists because the cloud has NO other sight of a device that fell back to
+ * the unscoped telemetry topic: the first-party console subscribes to both
+ * telemetry planes with wildcards, so a stranded device renders perfectly.
+ */
+describe("reported-only telemetry scope", () => {
+  const SCOPED = {
+    topic: "xorgate/orgs/org-1/ws/ws-a/devices/dev-1/telemetry",
+    scoped: true,
+    organizationId: "org-1",
+    workspaceId: "ws-a",
+  };
+
+  it("omits the block entirely when the caller does not track it", () => {
+    // An older agent, or any caller of buildEffective that has no scope object.
+    expect(buildEffective({}, NO_MODEM, "real")).not.toHaveProperty("telemetryScope");
+  });
+
+  it("carries the topic in force, and never a status entry", () => {
+    const report = buildConfigReport({
+      deviceId: "dev-1",
+      ts: 5,
+      origin: "boot",
+      lastAppliedRev: 3,
+      settings: { gnssAntBias: true },
+      modem: FRESH,
+      desired: desiredFrom({ rev: 3, gnssAntBias: true }),
+      mode: "real",
+      telemetryScope: SCOPED,
+    });
+    expect(report.effective.telemetryScope).toEqual(SCOPED);
+    expect(report.status.telemetryScope).toBeUndefined();
+    expect(Object.keys(report.status)).toEqual(["gnssAntBias"]);
+  });
+
+  it("carries the fallback block, naming the tenancy it could not reach", () => {
+    const fallen = {
+      topic: "xorgate/devices/dev-1/telemetry",
+      scoped: false,
+      organizationId: "org-1",
+      workspaceId: "ws-a",
+      fallback: { since: 1_700_000_000_000, count: 1 },
+    };
+    const effective = buildEffective({}, NO_MODEM, "real", null, fallen);
+    expect(effective.telemetryScope).toEqual(fallen);
+  });
+});
+
 describe("apply classes", () => {
   it("declares one for every namespace the worker applies", () => {
     expect(CONFIG_APPLY_CLASSES).toEqual({

@@ -57,7 +57,12 @@ export async function detectRuntime(binaryPath: string): Promise<KvsRuntimeDetec
   if (platform() !== "linux") {
     return { available: false, gstreamer: false, reason: "media runtime needs Linux (aarch64 device)" };
   }
-  if (arch() !== "arm64") {
+  // The SHIPPED binary is aarch64 only. An operator who points KVS_RUNTIME_BIN
+  // at a binary built for this host (the device-simulator container builds the
+  // fork from source for amd64) has said so explicitly — only then is another
+  // arch allowed. Absent the env var, a Pi and a dev box behave exactly as
+  // before.
+  if (arch() !== "arm64" && !process.env.KVS_RUNTIME_BIN) {
     return {
       available: false,
       gstreamer: false,

@@ -32,6 +32,7 @@ import { connect } from "./agent/mqtt.js";
 import { TelemetryScope, type ScopeChange } from "./agent/telemetry-scope.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector, type GroupSample } from "./agent/collectors/index.js";
+import { createMediaCollector } from "./agent/collectors/media.js";
 import { loadManifest, persistUploadBucket } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
 import { s3Put } from "./recording/s3-put.js";
@@ -234,8 +235,20 @@ const source: {
       )
     : (() => {
         const next = createSimulator();
+        // Device-simulator plan (Phase 0 spike): a sim run that opts in with
+        // XORGATE_SIM_MEDIA supervises the KVS masters exactly like real mode,
+        // so a container whose capture pipeline is fed from a file can stream
+        // live video. Absent the env var the default `sim` rig is unchanged:
+        // no masters, the hardcoded idle media block.
+        const simMedia =
+          ["1", "true"].includes(process.env.XORGATE_SIM_MEDIA ?? "") && config.media.enabled
+            ? createMediaCollector(config.media)
+            : null;
         return {
-          read: async () => next(),
+          read: async () => {
+            const reading = next();
+            return simMedia ? { ...reading, media: simMedia.read() } : reading;
+          },
           // Recorder view of the simulator: every group counts as freshly
           // updated each call; the recorder's native-cadence caps still hold
           // non-IMU groups to ~1 Hz, so sim recordings look like real ones.
@@ -248,6 +261,15 @@ const source: {
             }
             return out;
           },
+          ...(simMedia
+            ? {
+                stop: () => simMedia.stop(),
+                restartMediaChannel: (streamKey: string) => simMedia.restartChannel(streamKey),
+                setLiveShed: (shed: boolean) => simMedia.setShed(shed),
+                setDisabledStreams: (streamKeys: readonly string[]) =>
+                  simMedia.setDisabledStreams(streamKeys),
+              }
+            : {}),
         };
       })();
 

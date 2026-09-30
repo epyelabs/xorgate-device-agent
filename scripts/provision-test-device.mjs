@@ -6,7 +6,7 @@
 // Usage:
 //   ID_TOKEN="<cognito idToken>" node scripts/provision-test-device.mjs
 //
-// Optional env: API_BASE_URL, ORG_ID, PROJECT_ID, MODEL_SKU, SERIAL.
+// Optional env: API_BASE_URL, ORG_ID, WORKSPACE_ID, MODEL_SKU, SERIAL.
 import { mkdirSync, writeFileSync } from "node:fs"
 import { resolve } from "node:path"
 
@@ -30,7 +30,7 @@ async function api(path, init = {}, orgId) {
     ...(orgId ? { "X-Organization-Id": orgId } : {}),
     ...(init.headers ?? {}),
   }
-  const res = await fetch(`${API_BASE_URL}${path}`, { ...init, headers })
+  const res = await fetch(`${API_BASE_URL}/v1${path}`, { ...init, headers })
   const text = await res.text()
   if (!res.ok) {
     throw new Error(`${init.method ?? "GET"} ${path} → ${res.status} ${text}`)
@@ -56,19 +56,19 @@ const model = (models.device_models ?? []).find((dm) => dm.sku === MODEL_SKU)
 if (!model) throw new Error(`Device model with sku "${MODEL_SKU}" not found.`)
 console.log(`model:   ${model.id} (${MODEL_SKU})`)
 
-// 3. Pick a project in that org.
-let projectId = process.env.PROJECT_ID
-if (!projectId) {
-  const projects = await api("/projects", {}, orgId)
-  const first = (projects.projects ?? [])[0]
-  if (!first) throw new Error("No project found in this org; set PROJECT_ID.")
-  projectId = first.id
+// 3. Pick a workspace in that org (devices are workspace-scoped).
+let workspaceId = process.env.WORKSPACE_ID
+if (!workspaceId) {
+  const workspaces = await api("/workspaces", {}, orgId)
+  const first = (workspaces.workspaces ?? [])[0]
+  if (!first) throw new Error("No workspace found in this org; set WORKSPACE_ID.")
+  workspaceId = first.id
 }
-console.log(`project: ${projectId}`)
+console.log(`workspace: ${workspaceId}`)
 
 // 4. Create a fresh device.
 const createBody = {
-  projectId,
+  workspaceId,
   deviceModelId: model.id,
   serial: SERIAL,
   name: `Simulator ${SERIAL}`,
@@ -125,4 +125,4 @@ console.log("Run the synthetic-video master (feeds the live VIEWER) with:\n")
 console.log(
   `  docker run --rm -v "${credsDir}:/creds:ro" xorgate-synthetic-master\n`,
 )
-console.log(`Live screen: /devices/${device.id}/live`)
+console.log(`Live screen: /devices/${device.id}/streams`)

@@ -113,6 +113,22 @@ export function resolveBridgedCameras(
   return out;
 }
 
+/**
+ * The pipeline HEAD — the element(s) that produce raw frames for the tee.
+ * Today that is `libcamerasrc camera-name=<cam>`; the device-simulator plan's
+ * Phase 0 spike replaces it, in a container with no camera, with a real-time
+ * paced file decode (`filesrc … ! avdec_h264 ! identity sync=true ! … !
+ * videorate`) via XORGATE_CAPTURE_SOURCE_HEAD. Whitespace-split into argv
+ * tokens (no quoting hazards: paths and element names carry no spaces).
+ * Everything after the head — caps, tee, x264enc → splitmuxsink, shmsink —
+ * is untouched. Absent the env var: byte-for-byte today's head.
+ */
+function captureSourceHead(cameraName: string): string[] {
+  const override = process.env.XORGATE_CAPTURE_SOURCE_HEAD?.trim();
+  if (override) return override.split(/\s+/);
+  return ["libcamerasrc", `camera-name=${cameraName}`];
+}
+
 export interface CapturePipelineSpec {
   cameraName: string;
   preset: VideoPreset;
@@ -136,8 +152,7 @@ export interface CapturePipelineSpec {
  */
 export function buildBridgeOnlyPipelineArgs(cameraName: string, shmSocketPath: string): string[] {
   return [
-    "libcamerasrc",
-    `camera-name=${cameraName}`,
+    ...captureSourceHead(cameraName),
     "!",
     SHM_BRIDGE_CAPS,
     "!",
@@ -158,8 +173,7 @@ export function buildCapturePipelineArgs(spec: CapturePipelineSpec): string[] {
   const keyIntMax = preset.fps * 2; // one keyframe ≈ every 2 s → seekable fragments
   return [
     "-e", // EOS-on-shutdown: SIGINT finalizes the active fragment (clean moov)
-    "libcamerasrc",
-    `camera-name=${spec.cameraName}`,
+    ...captureSourceHead(spec.cameraName),
     "!",
     `video/x-raw,format=I420,width=${preset.width},height=${preset.height},framerate=${preset.fps}/1`,
     "!",

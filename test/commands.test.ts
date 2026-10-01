@@ -40,6 +40,28 @@ describe("parseCommand", () => {
     expect(parseCommand(msg({ command: "power_off" }))?.command).toBe("power_off");
     expect(parseCommand(msg({ command: "refresh" }))?.command).toBe("refresh");
     expect(parseCommand(msg({ command: "update" }))?.command).toBe("update");
+    expect(parseCommand(msg({ command: "read_sms" }))?.command).toBe("read_sms");
+  });
+
+  it("read_sms carries a clamped limit; missing/invalid args default to 10", () => {
+    const limit = (args: unknown) => parseCommand(msg({ command: "read_sms", args }))?.args?.limit;
+    expect(limit({ limit: 25 })).toBe(25);
+    expect(limit({ limit: 0 })).toBe(1);
+    expect(limit({ limit: 500 })).toBe(50);
+    expect(limit({ limit: 7.8 })).toBe(7);
+    expect(limit({ limit: "20" })).toBe(10);
+    expect(limit({})).toBe(10);
+    expect(limit(undefined)).toBe(10);
+    expect(limit("garbage")).toBe(10);
+    expect(limit(null)).toBe(10);
+  });
+
+  it("ignores args on every other command (contract §1)", () => {
+    for (const command of ["reboot", "power_off", "refresh", "update"]) {
+      const cmd = parseCommand(msg({ command, args: { limit: 5, evil: true } }));
+      expect(cmd).not.toBeNull();
+      expect(cmd).not.toHaveProperty("args");
+    }
   });
 
   it("rejects malformed payloads and wrong versions", () => {
@@ -170,6 +192,19 @@ describe("executeCommand", () => {
     expect(calls).toEqual([
       ["sudo", ["-n", "systemctl", "start", "--no-block", "xorgate-updater.service"]],
     ]);
+  });
+
+  it("never routes the in-process read-only commands to sudo", async () => {
+    const calls: unknown[] = [];
+    const runner = async (cmd: string, args: string[]): Promise<RunResult> => {
+      calls.push([cmd, args]);
+      return okResult;
+    };
+    for (const c of ["refresh", "read_sms"] as const) {
+      const res = await executeCommand(c, runner);
+      expect(res.failed).toBe(true);
+    }
+    expect(calls).toEqual([]);
   });
 
   it("surfaces a refused sudo rather than throwing", async () => {

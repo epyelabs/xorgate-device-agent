@@ -30,6 +30,13 @@ import {
   type DeviceCommandName,
 } from "./agent/commands.js";
 import { createReplaySource, loadScenario, type ReplaySource } from "./agent/replay.js";
+import {
+  buildSmsPayload,
+  clampSmsLimit,
+  fixtureSmsSweep,
+  SmsReader,
+  type SmsSweep,
+} from "./hardware/sms-modem.js";
 import { seedOnce } from "./agent/replay-seed.js";
 import { recordingsRoot, shmSocketPathFor as shmSocketPathForStream } from "./recording/config.js";
 import { bridgedKvsPipeline } from "./recording/video-capture.js";
@@ -902,6 +909,42 @@ const REFRESH_REPROBE_REPORT_MS = 45_000;
 let lastRefreshAt = 0;
 
 /**
+ * `read_sms` (device-sms-inbox plan). One reader per process: concurrent
+ * requests join the running sweep and a request within 5 s of the last one
+ * reuses its result, so a hammered button costs one modem round per 5 s.
+ * The lock file keeps `xorgate sms` on the box from interleaving with us.
+ */
+const smsReader = new SmsReader({ lockPath: join(runtimeHome(), "sms-reader.lock") });
+
+/**
+ * Sweep (or, off real hardware, answer from the fixture) and publish this
+ * request's result. Logs counts/status/duration only — never a number or a
+ * message body (contract §6).
+ */
+async function runSmsRead(cmd: { requestId: string; args?: { limit: number } }): Promise<void> {
+  const limit = clampSmsLimit(cmd.args?.limit);
+  // Only `real` touches the modem. `sim` and `replay` run on dev boxes and in
+  // simulator containers with no SIM7600, so they answer from a fixed inbox
+  // and cloud dev E2E works without hardware.
+  const sweep: SmsSweep =
+    config.mode === "real" ? await smsReader.read() : fixtureSmsSweep(Date.now());
+  const payload = buildSmsPayload(sweep, { deviceId: config.deviceId, requestId: cmd.requestId, limit });
+  const unread = payload.messages.filter((m) => m.unread).length;
+  const line =
+    `read_sms ${cmd.requestId}: status=${payload.status} total=${payload.total} ` +
+    `sent=${payload.messages.length} unread=${unread} skipped=${payload.skipped} ` +
+    `partial=${payload.partial} durationMs=${payload.durationMs}` +
+    (payload.status === "ok" ? "" : ` error=${payload.error}`);
+  console.log(`[agent] ${line}`);
+  const t = Date.now();
+  store.event(payload.status === "ok" ? "info" : "warn", line, t);
+  store.flush(t, true);
+  client.publish(config.smsTopic, JSON.stringify(payload), { qos: 1 }, (err) => {
+    if (err) console.warn(`[agent] read_sms ${cmd.requestId}: publish failed: ${err.message}`);
+  });
+}
+
+/**
  * Publish a command ack and resolve once the broker has PUBACKed it — or once
  * ACK_FLUSH_TIMEOUT_MS elapses, so a slow broker cannot wedge the command.
  * Awaited before executing: a reboot severs the connection, so an unflushed ack
@@ -1021,6 +1064,21 @@ async function handleCommandMessage(payload: Buffer): Promise<void> {
     // daemon has had time to honour the flag, so the re-probed values land.
     configSync.request("boot");
     setTimeout(() => configSync.request("boot"), REFRESH_REPROBE_REPORT_MS).unref();
+    return;
+  }
+
+  // `read_sms` is read-only and in-process too. No device-side rejection for
+  // rate: the reader's 5 s reuse window absorbs repeats, and every request
+  // still gets its own reply on the sms topic. Same in replay mode (fixture),
+  // so it never reaches the container-exit branch below.
+  if (cmd.command === "read_sms") {
+    await publishCommandAck({ ...cmd, status: "accepted" });
+    void runSmsRead(cmd).catch((err: Error) => {
+      const t = Date.now();
+      console.error(`[agent] read_sms ${cmd.requestId} crashed: ${err.message}`);
+      store.event("warn", `read_sms crashed: ${err.message}`, t);
+      store.flush(t, true);
+    });
     return;
   }
 

@@ -114,6 +114,12 @@ export interface AgentConfig {
   commandTopic: string;
   /** Accept/reject/fail acks for commandTopic are published here. */
   commandResponseTopic: string;
+  /**
+   * `read_sms` results (device-sms-inbox contract §2), QoS 1, not retained,
+   * one message per requestId. Covered by the device policy's
+   * `xorgate/devices/${thingName}/*` publish grant.
+   */
+  smsTopic: string;
   certPath: string;
   keyPath: string;
   caPath: string;
@@ -290,6 +296,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     configReportedTopic: `xorgate/devices/${deviceId}/config/reported`,
     commandTopic: `xorgate/devices/${deviceId}/command`,
     commandResponseTopic: `xorgate/devices/${deviceId}/command/response`,
+    smsTopic: `xorgate/devices/${deviceId}/sms`,
     certPath,
     keyPath,
     caPath,

@@ -5,8 +5,10 @@
  * `xorgate/devices/{deviceId}/command/response`, then executes.
  *
  * Payload shape:
- *   { "v": 1, "requestId": <uuid>, "command": "reboot"|"power_off"|"refresh"|"update",
- *     "ts": <epoch ms issued>, "expiresAt": <epoch ms> }
+ *   { "v": 1, "requestId": <uuid>,
+ *     "command": "reboot"|"power_off"|"refresh"|"update"|"read_sms",
+ *     "ts": <epoch ms issued>, "expiresAt": <epoch ms>,
+ *     "args"?: { "limit": 1..50 } }        // read_sms only; ignored elsewhere
  *
  * This is deliberately NOT the config plane (see plans/two-way-sync-config).
  * Config is desired state and is retained so an offline device converges on
@@ -34,9 +36,10 @@ import { join } from "node:path";
 import { atomicWriteJson } from "../lib/atomicWrite.js";
 import { runtimeHome } from "../daemon/runtime.js";
 import { run, type RunResult } from "../lib/exec.js";
+import { clampSmsLimit } from "../hardware/sms-modem.js";
 
 /**
- * `refresh` (manage_sim_card_info plan, Phase 2 §4d) is the one READ-ONLY
+ * `refresh` (manage_sim_card_info plan, Phase 2 §4d) is a READ-ONLY
  * command: re-probe what the device can (SIM identity, applied APN, antenna
  * bias) and publish a fresh config report now. It reuses this module's TTL +
  * ledger guards unchanged — they cost nothing and a QoS-1 redelivery storm
@@ -51,14 +54,20 @@ import { run, type RunResult } from "../lib/exec.js";
  * WITHOUT extra locking: distinct requestIds slip past the ledger (which only
  * dedups broker redelivery), but `systemctl start` on an already-activating
  * oneshot coalesces into the running job, so N commands cause one updater run.
+ *
+ * `read_sms` (device-sms-inbox plan) is the second read-only command: the
+ * worker sweeps the modem's stored SMS over the spare AT port and publishes
+ * the newest `args.limit` on `xorgate/devices/{id}/sms`. In-process like
+ * `refresh`, never via `executeCommand`.
  */
-export type DeviceCommandName = "reboot" | "power_off" | "refresh" | "update";
+export type DeviceCommandName = "reboot" | "power_off" | "refresh" | "update" | "read_sms";
 
 const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>([
   "reboot",
   "power_off",
   "refresh",
   "update",
+  "read_sms",
 ]);
 
 /**
@@ -81,6 +90,12 @@ export interface DeviceCommand {
   ts: number;
   /** Epoch ms after which the device must refuse it. Already TTL-clamped. */
   expiresAt: number;
+  /**
+   * Command parameters. Present only for `read_sms` (contract §1): `limit` is
+   * already clamped to 1..50, defaulting to 10 when missing or invalid.
+   * Every other command ignores `args` entirely.
+   */
+  args?: { limit: number };
 }
 
 export type RejectReason = "expired" | "duplicate";
@@ -122,12 +137,17 @@ export function parseCommand(payload: Buffer | string): DeviceCommand | null {
   if (typeof o.command !== "string" || !COMMANDS.has(o.command)) return null;
   if (typeof o.ts !== "number" || !Number.isFinite(o.ts)) return null;
   if (typeof o.expiresAt !== "number" || !Number.isFinite(o.expiresAt)) return null;
-  return {
+  const cmd: DeviceCommand = {
     requestId: o.requestId,
     command: o.command as DeviceCommandName,
     ts: o.ts,
     expiresAt: Math.min(o.expiresAt, o.ts + MAX_TTL_MS),
   };
+  if (cmd.command === "read_sms") {
+    const args = o.args && typeof o.args === "object" ? (o.args as Record<string, unknown>) : {};
+    cmd.args = { limit: clampSmsLimit(args.limit) };
+  }
+  return cmd;
 }
 
 export function isExpired(cmd: DeviceCommand, now: number = Date.now()): boolean {
@@ -210,7 +230,7 @@ export function executeCommand(
   command: DeviceCommandName,
   runner: (cmd: string, args: string[]) => Promise<RunResult> = run,
 ): Promise<RunResult> {
-  if (command === "refresh") {
+  if (command === "refresh" || command === "read_sms") {
     // Never reaches sudo: the worker handles refresh in-process. Guarded here
     // so a future caller cannot accidentally route it into systemctl.
     return Promise.resolve<RunResult>({
@@ -218,7 +238,7 @@ export function executeCommand(
       notFound: false,
       exitCode: 1,
       stdout: "",
-      stderr: "refresh is handled in-process, not via executeCommand",
+      stderr: `${command} is handled in-process, not via executeCommand`,
     });
   }
   if (command === "update") {

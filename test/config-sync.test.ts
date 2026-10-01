@@ -1084,6 +1084,14 @@ describe("reported-only agent state", () => {
     expect(agent.build).toHaveProperty("builtAt");
     expect(agent.build).toHaveProperty("packageVersion");
   });
+
+  it("advertises the build's capabilities (device-sms-inbox contract §3)", () => {
+    for (const mode of ["real", "sim", "replay"]) {
+      const agent = buildEffective({}, NO_MODEM, mode).agent as { capabilities: unknown };
+      expect(Array.isArray(agent.capabilities)).toBe(true);
+      expect(agent.capabilities).toContain("sms.read");
+    }
+  });
 });
 
 /**

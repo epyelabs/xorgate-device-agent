@@ -582,6 +582,18 @@ export interface ReportHints {
  * SIM" for what is actually "no daemon" — the exact confusion this phase
  * exists to end.
  */
+/**
+ * Optional features this build supports, advertised as
+ * `effective.agent.capabilities` (reported-only, like `mode`/`build`). The
+ * cloud gates new commands on these so an older agent gets a clean 409 rather
+ * than a request that times out. Static per build; also true in sim/replay
+ * mode, which answer from fixtures.
+ *
+ *   sms.read  the `read_sms` command + `xorgate/devices/{id}/sms` result
+ *             (device-sms-inbox contract §3)
+ */
+export const AGENT_CAPABILITIES: readonly string[] = ["sms.read"];
+
 export function buildEffective(
   settings: AgentSettings,
   modem: ModemBiasSample,
@@ -623,7 +635,9 @@ export function buildEffective(
   // document, never gets a `status` entry, and the local-edit fold-back cannot
   // write it into `devices.config`. The cloud mirrors it into `agent_version`
   // and the web UI polls it to confirm a remote update landed.
-  if (mode !== undefined) out.agent = { mode, build: loadBuildInfo() };
+  if (mode !== undefined) {
+    out.agent = { mode, build: loadBuildInfo(), capabilities: [...AGENT_CAPABILITIES] };
+  }
   // `telemetryScope` (transfer-device-ownership Phase 1.1) is reported-only for
   // the same reason `agent`/`sim` are: tenancy is not a setting anyone edits
   // locally, so there is no desired counterpart and no `status` badge. It is

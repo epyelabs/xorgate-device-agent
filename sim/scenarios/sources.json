@@ -1,0 +1,128 @@
+{
+  "v": 1,
+  "notes": "Source manifest for the demo scenario asset pack (device-simulator plan, Phase 1). `scripts/build-scenario.mjs` rebuilds every scenario from these ids alone: it syncs the source objects from `sourceBucket` (read-only; run with `--source-profile xorgate-prod`), builds `demo-assets/v1/<id>/` and `catalog.json`. The privacy block records the Q11 decision per clip.",
+  "sourceBucket": "s3://xorgate-core-865609249890-us-east-1",
+  "home": {
+    "lat": 43.6633,
+    "lon": -79.5193,
+    "label": "Toronto West"
+  },
+  "seedSet": [
+    "city-2026-09-27",
+    "niagara-2026-09-25",
+    "highway-2026-09-20",
+    "urban-2026-09-18",
+    "parked-2026-09-17"
+  ],
+  "scenarios": [
+    {
+      "id": "highway-2026-09-20",
+      "title": "Highway drive west",
+      "description": "27-minute drive out of Toronto West onto the highway: sustained highway speeds with a few slowdowns and a run back through suburban streets.",
+      "source": {
+        "deviceId": "8061fbd7-e5ef-44aa-aff4-18d62244a514",
+        "streamKey": "cam0",
+        "mediaSessionId": "01a0bf5d-ea7b-73b1-b7da-9c7b92ada957",
+        "telemetrySessionIds": [
+          "01a0bab2-7116-782c-ace4-f1ca21355a3c",
+          "01a0bf76-1919-734e-9de6-c9e91b4504c6"
+        ]
+      },
+      "privacy": {
+        "decision": "as-is",
+        "reviewedAt": "2026-10-01",
+        "reviewedBy": "agent A (device-simulator Phase 1)",
+        "legiblePlates": true,
+        "identifiableFaces": false,
+        "notes": "Reviewed 2 frames/fragment (54 frames) at 640px + full-res spot checks. Plates on cars stopped directly ahead at lights are legible at 1280x720 (e.g. a white BMW X3 and a red Hyundai around fragments 10-13); highway-distance plates are not. No identifiable faces. Q11-B (blur) deferred to the user: needs plate detection + re-encode and would break the byte-for-byte originals."
+      }
+    },
+    {
+      "id": "niagara-2026-09-25",
+      "title": "Long fast drive toward Niagara",
+      "description": "45-minute fast highway run from Toronto West toward the Niagara region: the longest and fastest lap in the pack.",
+      "source": {
+        "deviceId": "8061fbd7-e5ef-44aa-aff4-18d62244a514",
+        "streamKey": "cam0",
+        "mediaSessionId": "01a0d8b9-2f22-7509-8ee9-6e20738781dc",
+        "telemetrySessionIds": [
+          "01a0d89b-fe19-72ce-ad2c-d2f819ca7472",
+          "01a0d8e2-bf42-74d5-ab89-047e36458c88"
+        ]
+      },
+      "privacy": {
+        "decision": "as-is",
+        "reviewedAt": "2026-10-01",
+        "reviewedBy": "agent A (device-simulator Phase 1)",
+        "legiblePlates": true,
+        "identifiableFaces": false,
+        "notes": "Reviewed 2 frames/fragment (91 frames) at 640px. Mostly highway-distance traffic into strong sun glare; a few plates at lights near the start (a Dodge Caravan) and parked cars in the village at the end are legible at 1280x720. One pedestrian at a plaza, not identifiable. Q11-B deferred to the user."
+      }
+    },
+    {
+      "id": "city-2026-09-27",
+      "title": "City drive with stops",
+      "description": "16-minute evening city drive with traffic-light stops and a short expressway stretch; the newest recording in the pack.",
+      "source": {
+        "deviceId": "8061fbd7-e5ef-44aa-aff4-18d62244a514",
+        "streamKey": "cam0",
+        "mediaSessionId": "01a0e466-2fe2-7973-85cb-0423ec44da42",
+        "telemetrySessionIds": [
+          "01a0e465-6c2f-7547-bc47-9752ed6c5264",
+          "01a0e4b4-cf0a-7b33-93bd-a657c9c085f7"
+        ]
+      },
+      "privacy": {
+        "decision": "as-is",
+        "reviewedAt": "2026-10-01",
+        "reviewedBy": "agent A (device-simulator Phase 1)",
+        "legiblePlates": true,
+        "identifiableFaces": false,
+        "notes": "Reviewed 2 frames/fragment (31 frames) at 640px. Cars stopped ahead at lights (a Honda Civic, a Hyundai Santa Fe) show legible plates at 1280x720; pedestrians at a crosswalk are small and not identifiable. Q11-B deferred to the user."
+      }
+    },
+    {
+      "id": "urban-2026-09-18",
+      "title": "Short stop-and-go urban",
+      "description": "15-minute stop-and-go drive through residential and arterial streets; never faster than about 70 km/h.",
+      "source": {
+        "deviceId": "8061fbd7-e5ef-44aa-aff4-18d62244a514",
+        "streamKey": "cam0",
+        "mediaSessionId": "01a0b5a9-2101-705c-b652-e03ee2f7101b",
+        "telemetrySessionIds": [
+          "01a0b5a8-f060-72f9-b868-e0f420ec4e50",
+          "01a0b5b6-e1f1-7d11-8cdb-1650c81c8c2f"
+        ]
+      },
+      "privacy": {
+        "decision": "as-is",
+        "reviewedAt": "2026-10-01",
+        "reviewedBy": "agent A (device-simulator Phase 1)",
+        "legiblePlates": true,
+        "identifiableFaces": false,
+        "notes": "Reviewed 2 frames/fragment (30 frames) at 640px + two full-res frames. A white Subaru stopped ahead (fragment 7, ~20 s) has a clearly legible Ontario plate; a silver sedan at a light (fragment 10-11) too. No identifiable faces. Q11-B deferred to the user."
+      }
+    },
+    {
+      "id": "parked-2026-09-17",
+      "title": "Parked (stationary)",
+      "description": "Ten minutes stationary at the home base: a fixed GPS position and a static elevated camera view over a residential neighbourhood.",
+      "source": {
+        "deviceId": "8061fbd7-e5ef-44aa-aff4-18d62244a514",
+        "streamKey": "cam0",
+        "mediaSessionId": "01a0b15e-81ea-7afb-ae45-6cc97db244ce",
+        "telemetrySessionIds": [
+          "01a08b4a-bb58-74ef-ac83-5fdd2751b143"
+        ]
+      },
+      "privacy": {
+        "decision": "as-is",
+        "reviewedAt": "2026-10-01",
+        "reviewedBy": "agent A (device-simulator Phase 1)",
+        "legiblePlates": false,
+        "identifiableFaces": false,
+        "notes": "Reviewed 2 frames/fragment (19 frames). Static elevated view over a residential neighbourhood toward the skyline; no vehicles or people close enough to identify. No plates, no faces."
+      }
+    }
+  ]
+}

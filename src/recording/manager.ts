@@ -123,6 +123,13 @@ export interface RecordingVideoOptions {
    * capture with the new encoder. Absent = sw-h264 (today's exact argv).
    */
   encoder?: () => "sw-h264" | "hw-h264";
+  // --- replay-mode hooks (device-simulator plan, Phase 2); see the same
+  // names on VideoCaptureOptions. A real device sets none of them. ---
+  sourceHead?: (cam: CaptureCamera) => string[];
+  onPlaying?: (streamKey: string, wallMs: number) => void;
+  onEnded?: (streamKey: string, clean: boolean) => void;
+  eosIsClean?: boolean;
+  respawnHoldMs?: (streamKey: string) => number | null;
   /** Overrides for tests. */
   shmDir?: string;
   spawn?: CaptureSpawn;
@@ -173,6 +180,13 @@ export interface RecordingManagerOptions {
   /** Load-shedding policy override (tests inject a fake clock). */
   shedPolicy?: LoadShedPolicy;
   shedSampleMs?: number;
+  /**
+   * Replay mode (device-simulator plan): evaluate the boot defer and the
+   * GPS/LTE gate as `off` whatever the settings say — a container has no PMIC
+   * budget file and no receiver, so `auto` would arm, wait and fail open 90 s
+   * into every boot. Never set on real hardware.
+   */
+  forceBootPolicyOff?: boolean;
 }
 
 export class RecordingManager {
@@ -350,6 +364,28 @@ export class RecordingManager {
     this.videoCamerasKey = "";
   }
 
+  /**
+   * Replay mode (device-simulator plan): end every camera's current lap cleanly
+   * and respawn after the capture supervisor's `respawnHoldMs` — a scenario
+   * switch in place, or "power on" after a parked `loop:false`. No-op without
+   * a capture supervisor. Never called on real hardware.
+   */
+  cycleVideo(): void {
+    this.videoCapture?.cycleAll();
+  }
+
+  /**
+   * Replay mode: close the current telemetry session and open a new one, so
+   * each replayed lap is one clean media + telemetry session pair (README
+   * §3.4 "sessions per lap"). No-op while telemetry recording is off.
+   */
+  rotateTelemetrySession(why: string): void {
+    if (!this.recorder) return;
+    this.stopRecorder(why);
+    this.startRecorder();
+    this.notifyStatus();
+  }
+
   /** Video state for the worker's media block + state.json. */
   videoStatus(): VideoRecordingStatus {
     return {
@@ -459,10 +495,10 @@ export class RecordingManager {
     let gateWhy = "";
     if (cameras.length > 0) {
       const verdict = this.bootPolicy.evaluate({
-        mode: this.cfg.video.bootDefer,
+        mode: this.opts.forceBootPolicyOff ? "off" : this.cfg.video.bootDefer,
         maxSecs: this.cfg.video.bootDeferMaxSecs,
         minBudgetMa: this.cfg.video.bootDeferMinBudgetMa,
-        gateMode: this.cfg.video.gpsGate,
+        gateMode: this.opts.forceBootPolicyOff ? "off" : this.cfg.video.gpsGate,
         gateMaxSecs: this.cfg.video.gpsGateMaxSecs,
         gateNoProgressSecs: this.cfg.video.gpsGateNoProgressSecs,
       });
@@ -688,6 +724,11 @@ export class RecordingManager {
       onStatus: () => this.notifyStatus(),
       onEvent: (level, msg) => this.opts.onEvent?.(level, msg),
       onSpawned: (streamKey) => vo.onCaptureSpawned?.(streamKey),
+      sourceHead: vo.sourceHead,
+      onPlaying: vo.onPlaying,
+      onEnded: vo.onEnded,
+      eosIsClean: vo.eosIsClean,
+      respawnHoldMs: vo.respawnHoldMs,
       spawn: vo.spawn,
       stableMs: vo.stableMs,
       sweepPollMs: vo.sweepPollMs,

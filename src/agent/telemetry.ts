@@ -193,7 +193,12 @@ export interface LiveBlock {
   since: number;
 }
 
-export type RunMode = "sim" | "real";
+/**
+ * `replay` (plans/xorgate-device-simulator, Phase 2): the real agent in a
+ * container, sensors fed from a recorded telemetry trace and the camera from a
+ * recorded clip. Reported-only like the other two — never cloud-writable.
+ */
+export type RunMode = "sim" | "real" | "replay";
 
 export type ConnectionState =
   | "connecting"

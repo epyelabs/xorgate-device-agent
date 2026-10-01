@@ -48,6 +48,14 @@ let cachedBootId: string | null = null;
  */
 export function readBootId(): string {
   if (cachedBootId) return cachedBootId;
+  // Device-simulator plan: a container shares the HOST's boot_id, which never
+  // changes across container restarts, so the entrypoint mints one per start
+  // and hands it in here. Never set on real hardware.
+  const forced = process.env.XORGATE_BOOT_ID?.trim();
+  if (forced) {
+    cachedBootId = forced;
+    return cachedBootId;
+  }
   try {
     cachedBootId = readFileSync(BOOT_ID_FILE, "utf8").trim();
   } catch {

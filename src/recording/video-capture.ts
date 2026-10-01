@@ -123,14 +123,29 @@ export function resolveBridgedCameras(
  * Everything after the head — caps, tee, x264enc → splitmuxsink, shmsink —
  * is untouched. Absent the env var: byte-for-byte today's head.
  */
-function captureSourceHead(cameraName: string): string[] {
+function captureSourceHead(cameraName: string, head?: string[]): string[] {
+  // Replay mode (device-simulator Phase 2) hands the head in explicitly; the
+  // env override below stays as the Phase 0 test seam. Neither is set on a Pi.
+  if (head && head.length > 0) return head;
   const override = process.env.XORGATE_CAPTURE_SOURCE_HEAD?.trim();
   if (override) return override.split(/\s+/);
   return ["libcamerasrc", `camera-name=${cameraName}`];
 }
 
+/**
+ * gst-launch-1.0 prints these on STDOUT. "New clock:" is logged the instant
+ * the pipeline reaches PLAYING — for a file source that is when frames start
+ * flowing at real time, i.e. the replay lap's true start. "Got EOS" is the
+ * natural end of a file source (the lap's end); a SIGINT stop with `-e` logs it
+ * too, which the supervisor already treats as clean.
+ */
+const GST_PLAYING_RE = /New clock:/;
+const GST_EOS_RE = /Got EOS from element/;
+
 export interface CapturePipelineSpec {
   cameraName: string;
+  /** Explicit pipeline head (replay mode); absent = libcamerasrc for `cameraName`. */
+  head?: string[];
   preset: VideoPreset;
   segmentSeconds: number;
   /** Session dir splitmuxsink writes fragments into. */
@@ -150,9 +165,13 @@ export interface CapturePipelineSpec {
  * streaming keeps working — just no encode, no disk. Near-zero CPU (raw
  * 720p15 passthrough at the camera's native 720p mode).
  */
-export function buildBridgeOnlyPipelineArgs(cameraName: string, shmSocketPath: string): string[] {
+export function buildBridgeOnlyPipelineArgs(
+  cameraName: string,
+  shmSocketPath: string,
+  head?: string[],
+): string[] {
   return [
-    ...captureSourceHead(cameraName),
+    ...captureSourceHead(cameraName, head),
     "!",
     SHM_BRIDGE_CAPS,
     "!",
@@ -173,7 +192,7 @@ export function buildCapturePipelineArgs(spec: CapturePipelineSpec): string[] {
   const keyIntMax = preset.fps * 2; // one keyframe ≈ every 2 s → seekable fragments
   return [
     "-e", // EOS-on-shutdown: SIGINT finalizes the active fragment (clean moov)
-    ...captureSourceHead(spec.cameraName),
+    ...captureSourceHead(spec.cameraName, spec.head),
     "!",
     `video/x-raw,format=I420,width=${preset.width},height=${preset.height},framerate=${preset.fps}/1`,
     "!",
@@ -292,6 +311,33 @@ export interface VideoCaptureOptions {
    * stream — hardware-verified), so it must be restarted onto the new socket.
    */
   onSpawned?: (streamKey: string) => void;
+  // --- replay-mode hooks (device-simulator plan, Phase 2). All optional; a
+  // real device sets none of them and every path below is byte-for-byte the
+  // pre-plan behaviour. ---
+  /**
+   * Pipeline HEAD per camera (the element(s) producing raw frames for the
+   * tee); absent = `libcamerasrc camera-name=<cam>`. Re-evaluated on EVERY
+   * spawn, so a scenario switch takes effect at the next lap.
+   */
+  sourceHead?: (cam: CaptureCamera) => string[];
+  /** gst-launch reported PLAYING ("New clock:") — frames are flowing from `wallMs`. */
+  onPlaying?: (streamKey: string, wallMs: number) => void;
+  /** A capture child exited and its session was swept; `clean` = EOS ran (last fragment finalized). */
+  onEnded?: (streamKey: string, clean: boolean) => void;
+  /**
+   * Treat a child that printed "Got EOS" before exiting as a CLEAN stop: the
+   * last fragment is `finalized:true` and the respawn is scheduled through
+   * `respawnHoldMs` instead of the crash backoff. A file source ends every lap
+   * this way (Phase 0 surprise 5: EOF exits with code 1 because shmsink's
+   * teardown complains, which read as a crash). Off = today's behaviour.
+   */
+  eosIsClean?: boolean;
+  /**
+   * Delay before respawning after a clean EOS end or a `cycle()` — the parked
+   * gap between laps. null = do not respawn (park as `stopped`) until the next
+   * `cycle()`. Only consulted when `eosIsClean` or `cycle()` made the stop clean.
+   */
+  respawnHoldMs?: (streamKey: string) => number | null;
   /** Test seams. */
   spawn?: CaptureSpawn;
   stableMs?: number;
@@ -332,6 +378,12 @@ interface CameraRun {
    * clear it.
    */
   stallFailures: number;
+  /** gst-launch printed "Got EOS" (the file source ran out, or `-e` + SIGINT finalized). */
+  eosSeen: boolean;
+  /** Being ended on purpose by `cycle()`: clean stop, respawn after the hold. */
+  cycling: boolean;
+  /** `onPlaying` already fired for this child. */
+  playingReported: boolean;
 }
 
 /**
@@ -417,6 +469,9 @@ export class VideoCaptureSupervisor {
         progressAt: 0,
         stalled: false,
         stallFailures: 0,
+        eosSeen: false,
+        cycling: false,
+        playingReported: false,
       };
       this.runs.set(cam.streamKey, run);
       const delayMs = index * staggerMs;
@@ -480,6 +535,33 @@ export class VideoCaptureSupervisor {
     const out = new Set<string>();
     for (const r of this.runs.values()) if (r.sessionId) out.add(r.sessionId);
     return out;
+  }
+
+  /**
+   * End this camera's current child CLEANLY and respawn it after
+   * `respawnHoldMs` (replay mode: a scenario switch, or "power on" after a
+   * parked `loop:false`). SIGINT with `-e` finalizes the active fragment; the
+   * respawn is a new session with a freshly evaluated `sourceHead`. A parked
+   * or retrying camera (no child) is simply spawned now.
+   */
+  cycle(streamKey: string): void {
+    const run = this.runs.get(streamKey);
+    if (!run || this.stopped || run.retiring) return;
+    if (run.restartTimer) {
+      clearTimeout(run.restartTimer);
+      run.restartTimer = null;
+    }
+    if (run.handle) {
+      run.cycling = true;
+      run.handle.stop("SIGINT");
+      return;
+    }
+    this.spawn(streamKey);
+  }
+
+  /** `cycle()` every camera. */
+  cycleAll(): void {
+    for (const streamKey of [...this.runs.keys()]) this.cycle(streamKey);
   }
 
   /** True while any camera is actively capturing TO DISK (payload media.recording flag). */
@@ -548,6 +630,7 @@ export class VideoCaptureSupervisor {
       run.manifest = manifest;
       args = buildCapturePipelineArgs({
         cameraName: run.cam.cameraName,
+        head: this.opts.sourceHead?.(run.cam),
         preset: this.opts.preset,
         segmentSeconds: this.opts.segmentSeconds,
         outputDir: sessionDir,
@@ -558,7 +641,11 @@ export class VideoCaptureSupervisor {
       run.sessionId = null;
       run.sessionDir = null;
       run.manifest = null;
-      args = buildBridgeOnlyPipelineArgs(run.cam.cameraName, this.shmSocketPath(streamKey));
+      args = buildBridgeOnlyPipelineArgs(
+        run.cam.cameraName,
+        this.shmSocketPath(streamKey),
+        this.opts.sourceHead?.(run.cam),
+      );
     }
     run.state = "starting";
     run.startedAt = Date.now();
@@ -568,6 +655,9 @@ export class VideoCaptureSupervisor {
     run.progressBytes = 0;
     run.progressAt = run.startedAt;
     run.stalled = false;
+    run.eosSeen = false;
+    run.cycling = false;
+    run.playingReported = false;
 
     // A socket file left by a killed predecessor makes the new shmsink accept
     // nothing ("Connection refused" on the KVS side) — verified on hardware.
@@ -581,6 +671,16 @@ export class VideoCaptureSupervisor {
     run.handle = spawn("gst-launch-1.0", args, {
       onStderr: (line) => {
         if (line.trim()) console.error(`[video-capture ${streamKey}] ${line}`);
+      },
+      // gst-launch's own progress lines ride stdout. Consumed always (an
+      // unread pipe could block a chatty child); ACTED on only by the replay
+      // hooks, which a real device never installs.
+      onStdout: (line) => {
+        if (GST_EOS_RE.test(line)) run.eosSeen = true;
+        if (!run.playingReported && GST_PLAYING_RE.test(line)) {
+          run.playingReported = true;
+          this.opts.onPlaying?.(streamKey, Date.now());
+        }
       },
     });
 
@@ -637,14 +737,19 @@ export class VideoCaptureSupervisor {
 
     // Close out whatever the child left: clean stop (EOS ran) → the last
     // fragment is finalized; crash → it may be truncated. Either way it gets a
-    // sidecar; `finalized` records which case we believe we're in.
-    const cleanStop = this.stopped || run.retiring;
+    // sidecar; `finalized` records which case we believe we're in. A replay
+    // lap ends by EOF (eosSeen) or by cycle(): both are clean by construction.
+    const eosEnd = run.eosSeen && this.opts.eosIsClean === true;
+    const cycled = run.cycling;
+    run.cycling = false;
+    const cleanStop = this.stopped || run.retiring || cycled || eosEnd;
     this.finalSweep(run, cleanStop);
     const endedSession = run.sessionId;
     run.sessionId = null;
     run.sessionDir = null;
     run.manifest = null;
     this.opts.onActiveSegment?.(streamKey, null);
+    this.opts.onEnded?.(streamKey, cleanStop);
 
     if (run.retiring) {
       // Disabled camera (setCameras): its session is finalized and swept —
@@ -656,6 +761,27 @@ export class VideoCaptureSupervisor {
     }
     if (this.stopped) {
       run.state = "stopped";
+      this.opts.onStatus?.();
+      return;
+    }
+
+    // Replay lap boundary: a clean end is not a failure. Respawn after the
+    // parked gap (a new lap = a new session), or park when told not to loop.
+    if ((cycled || eosEnd) && this.opts.respawnHoldMs) {
+      run.quickFailures = 0;
+      run.backoffMs = BASE_BACKOFF_MS;
+      const hold = this.opts.respawnHoldMs(streamKey);
+      if (hold === null) {
+        run.state = "stopped";
+        this.opts.onEvent?.("info", `video capture ${streamKey} ended cleanly; parked (no loop)`);
+      } else {
+        run.state = "retrying";
+        this.opts.onEvent?.(
+          "info",
+          `video capture ${streamKey} ended cleanly${endedSession ? ` (session ${endedSession.slice(0, 8)}…)` : ""}; next lap in ${Math.round(hold / 1000)}s`,
+        );
+        this.scheduleRestart(run, hold);
+      }
       this.opts.onStatus?.();
       return;
     }

@@ -11,3 +11,7 @@ xorgate-device-agent/test
 xorgate-device-agent/docs
 xorgate-device-agent/media/lib
 xorgate-device-agent/media/xorgate-kvs-webrtc
+xorgate-device-agent/sim/build
+xorgate-device-agent/sim/state
+xorgate-device-agent/sim/creds
+xorgate-device-agent/scripts

@@ -278,6 +278,54 @@ export function parseCameraMountSettings(v: unknown): CameraMountSettings | unde
   return { cameras: out };
 }
 
+/**
+ * Device-simulator scenario selection (plans/xorgate-device-simulator, Phase 2)
+ * — the `simulation` namespace in settings.json. Delivered by the cloud ONLY to
+ * devices created as simulated (the backend's `validateConfigPatch` rejects it
+ * for real hardware); on a real device the namespace is a no-op the replay
+ * source never reads. Applied LIVE by the replay source (5 s poll + forced on
+ * every cloud config message): a changed `scenarioId` ends the current lap and
+ * starts the new scenario in place, no process restart.
+ */
+export interface SimulationSettings {
+  /** Catalog id of the scenario to replay (`demo-assets/v1/<scenarioId>/`). */
+  scenarioId?: string;
+  /** Replay the scenario again after the parked gap (default true); false parks forever at the end. */
+  loop?: boolean;
+  /** Parked pause between laps, seconds 0..3600 (default 30). */
+  gapSeconds?: number;
+}
+
+/** Scenario ids are catalog keys and path segments: lowercase slug, no dots/slashes. */
+export const SCENARIO_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+export const SIMULATION_GAP_SECONDS_MIN = 0;
+export const SIMULATION_GAP_SECONDS_MAX = 3600;
+
+/**
+ * Validate an untrusted `simulation` value. Forgiving like its siblings:
+ * `gapSeconds` is clamped, a mistyped `loop` is dropped, and a `scenarioId`
+ * that is not a plausible catalog id is DROPPED (never "repaired" — it names
+ * a directory the replay source will open). Returns undefined when nothing
+ * valid remains.
+ */
+export function parseSimulationSettings(v: unknown): SimulationSettings | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const src = v as Record<string, unknown>;
+  const out: SimulationSettings = {};
+  if (typeof src.scenarioId === "string" && SCENARIO_ID_RE.test(src.scenarioId)) {
+    out.scenarioId = src.scenarioId;
+  }
+  if (typeof src.loop === "boolean") out.loop = src.loop;
+  if (typeof src.gapSeconds === "number" && Number.isFinite(src.gapSeconds)) {
+    out.gapSeconds = Math.min(
+      SIMULATION_GAP_SECONDS_MAX,
+      Math.max(SIMULATION_GAP_SECONDS_MIN, Math.round(src.gapSeconds)),
+    );
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface AgentSettings {
   mode?: RunMode;
   /*
@@ -334,6 +382,13 @@ export interface AgentSettings {
    * the boot config is left exactly as it is.
    */
   cameraMount?: CameraMountSettings;
+  /**
+   * Device-simulator scenario (see SimulationSettings). Cloud-delivered to
+   * simulated devices only; read LIVE by the replay source. Absent = the
+   * replay source's own default (env / first catalog entry). Persisted here
+   * like every other namespace so loadSettings' allowlist rewrite keeps it.
+   */
+  simulation?: SimulationSettings;
 }
 
 /** Clamp `rateHz` to what the collectors can produce (IMU caps at 20 Hz). */
@@ -561,7 +616,7 @@ export function loadSettings(path: string = settingsPath()): AgentSettings {
 function parseSettingsObject(obj: Record<string, unknown>): AgentSettings {
   const out: AgentSettings = {};
   const mode = (obj as { mode?: unknown }).mode;
-  if (mode === "sim" || mode === "real") out.mode = mode;
+  if (mode === "sim" || mode === "real" || mode === "replay") out.mode = mode;
   const gnssAntBias = (obj as { gnssAntBias?: unknown }).gnssAntBias;
   if (typeof gnssAntBias === "boolean") out.gnssAntBias = gnssAntBias;
   const imuMount = parseImuMount((obj as { imuMount?: unknown }).imuMount);
@@ -576,6 +631,8 @@ function parseSettingsObject(obj: Record<string, unknown>): AgentSettings {
   if (cellular) out.cellular = cellular;
   const cameraMount = parseCameraMountSettings((obj as { cameraMount?: unknown }).cameraMount);
   if (cameraMount) out.cameraMount = cameraMount;
+  const simulation = parseSimulationSettings((obj as { simulation?: unknown }).simulation);
+  if (simulation) out.simulation = simulation;
   return out;
 }
 

@@ -44,6 +44,7 @@ import {
   parseCellularSettings,
   parseLteRecoverySettings,
   parseRecordingSettings,
+  parseSimulationSettings,
   parseTimeSyncSettings,
   saveSettings,
   settingsPath,
@@ -51,6 +52,7 @@ import {
   type CellularSettings,
   type LteRecoverySettings,
   type RecordingSettings,
+  type SimulationSettings,
   type TimeSyncSettings,
 } from "../daemon/settings.js";
 import { parseImuMount, type ImuMount } from "../lib/orientation.js";
@@ -118,6 +120,15 @@ export interface CloudConfig {
    * edit of config.txt, and only a REBOOT turns that into a flipped image.
    */
   cameraMount?: CameraMountSettings | null;
+  /**
+   * Device-simulator scenario (plans/xorgate-device-simulator, Phase 2). Same
+   * replace-whole-namespace semantics: null = carried but nothing valid →
+   * remove the local key (the replay source falls back to its default
+   * scenario); absent = never cloud-configured, leave local settings alone.
+   * The cloud only publishes it to simulated devices; a real device that ever
+   * received it would persist a key nothing reads.
+   */
+  simulation?: SimulationSettings | null;
   /**
    * Segment-upload S3 bucket (Phase 6.2 backfill for devices fielded before
    * Phase 2 provisioning). Persisted into kvs.json — NOT settings.json — by
@@ -249,6 +260,10 @@ function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   if (cameraMount && typeof cameraMount === "object" && !Array.isArray(cameraMount)) {
     out.cameraMount = parseCameraMountSettings(cameraMount) ?? null;
   }
+  const simulation = (obj as { simulation?: unknown }).simulation;
+  if (simulation && typeof simulation === "object" && !Array.isArray(simulation)) {
+    out.simulation = parseSimulationSettings(simulation) ?? null;
+  }
   const hardware = (obj as { hardware?: unknown }).hardware;
   if (hardware && typeof hardware === "object" && !Array.isArray(hardware)) {
     out.hardware = parseHardwareBlock(hardware);
@@ -354,6 +369,16 @@ export function applyCloudConfig(
       cameraMountChange = target ? "set" : "clear";
     }
   }
+  // ... and for the simulation namespace (device-simulator plan). Clearing
+  // removes the local key; the replay source then falls back to its default
+  // scenario. On a real device this key is dead weight either way.
+  let simulationChange: "set" | "clear" | undefined;
+  if (config.simulation !== undefined) {
+    const target = config.simulation ?? undefined;
+    if (JSON.stringify(target) !== JSON.stringify(current.simulation)) {
+      simulationChange = target ? "set" : "clear";
+    }
+  }
   if (
     Object.keys(next).length === 0 &&
     imuMountChange === undefined &&
@@ -361,7 +386,8 @@ export function applyCloudConfig(
     lteRecoveryChange === undefined &&
     timeSyncChange === undefined &&
     cellularChange === undefined &&
-    cameraMountChange === undefined
+    cameraMountChange === undefined &&
+    simulationChange === undefined
   ) {
     return { changed: false };
   }
@@ -378,6 +404,8 @@ export function applyCloudConfig(
   else if (cellularChange === "clear") delete merged.cellular;
   if (cameraMountChange === "set") merged.cameraMount = config.cameraMount as CameraMountSettings;
   else if (cameraMountChange === "clear") delete merged.cameraMount;
+  if (simulationChange === "set") merged.simulation = config.simulation as SimulationSettings;
+  else if (simulationChange === "clear") delete merged.simulation;
   saveSettings(merged, path);
   return { changed: true };
 }

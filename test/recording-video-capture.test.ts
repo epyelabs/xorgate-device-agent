@@ -1476,3 +1476,155 @@ describe("RecordingManager liveBlock contract (Phase 2)", () => {
     expect(rig.liveShed).toEqual([true]);
   });
 });
+
+describe("VideoCaptureSupervisor replay hooks (device-simulator Phase 2)", () => {
+  const timeSource = (): TimeSource => "ntp";
+  const cams = [{ streamKey: "cam0", cameraName: "replay" }];
+
+  /** Fake spawner that also exposes the stdout handler so a test can "print" gst lines. */
+  function stdoutSpawner() {
+    const spawns: {
+      args: string[];
+      stdout: ((line: string) => void) | undefined;
+      exit: (code: number | null) => void;
+      stopped: NodeJS.Signals | null;
+    }[] = [];
+    const spawn = (
+      _cmd: string,
+      args: string[],
+      handlers: { onStdout?: (line: string) => void } = {},
+    ): StreamHandle => {
+      let resolveDone: (r: RunResult) => void;
+      const done = new Promise<RunResult>((res) => (resolveDone = res));
+      const entry = {
+        args,
+        stdout: handlers.onStdout,
+        stopped: null as NodeJS.Signals | null,
+        exit: (code: number | null) =>
+          resolveDone({ stdout: "", stderr: "", exitCode: code, failed: (code ?? 0) !== 0, notFound: false }),
+      };
+      spawns.push(entry);
+      return {
+        done,
+        stop: (sig: NodeJS.Signals = "SIGINT") => {
+          entry.stopped = sig;
+          // `-e` turns SIGINT into EOS before exit, like gst-launch does.
+          entry.stdout?.("Got EOS from element \"pipeline0\".");
+          entry.exit(0);
+        },
+      };
+    };
+    return { spawns, spawn };
+  }
+
+  it("sourceHead replaces the libcamerasrc head on every spawn and nothing after the tee", () => {
+    const heads = [["filesrc", "location=/a/lap.h264"], ["filesrc", "location=/b/lap.h264"]];
+    let n = 0;
+    const spawner = stdoutSpawner();
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "d", cameras: cams, record: true, preset, segmentSeconds: 60,
+      videoRoot: join(home, "video"), shmDir: join(home, "shm"), timeSource,
+      spawn: spawner.spawn, sourceHead: () => heads[n++], eosIsClean: true, respawnHoldMs: () => 0,
+    });
+    sup.start();
+    expect(spawner.spawns[0].args.slice(1, 3)).toEqual(heads[0]);
+    expect(spawner.spawns[0].args.join(" ")).not.toContain("libcamerasrc");
+    expect(spawner.spawns[0].args.join(" ")).toContain("splitmuxsink");
+    sup.stop();
+  });
+
+  it("reports PLAYING once per child and a clean EOS end; respawns after the hold as a new session", async () => {
+    const playing: string[] = [];
+    const ended: boolean[] = [];
+    const spawner = stdoutSpawner();
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "d", cameras: cams, record: true, preset, segmentSeconds: 60,
+      videoRoot: join(home, "video"), shmDir: join(home, "shm"), timeSource,
+      spawn: spawner.spawn, stableMs: 10,
+      sourceHead: () => ["filesrc", "location=/a/lap.h264"],
+      onPlaying: (k) => playing.push(k), onEnded: (_k, clean) => ended.push(clean),
+      eosIsClean: true, respawnHoldMs: () => 30,
+    });
+    sup.start();
+    const first = sup.status()[0].sessionId!;
+    spawner.spawns[0].stdout?.("Setting pipeline to PLAYING ...");
+    spawner.spawns[0].stdout?.("New clock: GstSystemClock");
+    spawner.spawns[0].stdout?.("New clock: GstSystemClock"); // a second print is not a second lap
+    expect(playing).toEqual(["cam0"]);
+    // Natural EOF: EOS on stdout, then the shmsink teardown's exit code 1 (Phase 0 surprise 5).
+    const dir = join(home, "video", "cam0", first);
+    writeFileSync(join(dir, "00000.mp4"), "x");
+    spawner.spawns[0].stdout?.("Got EOS from element \"pipeline0\".");
+    spawner.spawns[0].exit(1);
+    await delay(10);
+    expect(ended).toEqual([true]);
+    expect(JSON.parse(readFileSync(join(dir, "00000.json"), "utf8")).finalized).toBe(true);
+    expect(sup.status()[0].state).toBe("retrying");
+    expect(spawner.spawns).toHaveLength(1);
+    await delay(50);
+    expect(spawner.spawns).toHaveLength(2);
+    expect(sup.status()[0].sessionId).not.toBe(first);
+    sup.stop();
+  });
+
+  it("without eosIsClean an EOF exit is still a crash (real-mode behaviour)", async () => {
+    const ended: boolean[] = [];
+    const spawner = stdoutSpawner();
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "d", cameras: cams, record: true, preset, segmentSeconds: 60,
+      videoRoot: join(home, "video"), shmDir: join(home, "shm"), timeSource,
+      spawn: spawner.spawn, stableMs: 10, onEnded: (_k, clean) => ended.push(clean),
+    });
+    sup.start();
+    const dir = join(home, "video", "cam0", sup.status()[0].sessionId!);
+    writeFileSync(join(dir, "00000.mp4"), "x");
+    spawner.spawns[0].stdout?.("Got EOS from element \"pipeline0\".");
+    spawner.spawns[0].exit(1);
+    await delay(10);
+    expect(ended).toEqual([false]);
+    expect(JSON.parse(readFileSync(join(dir, "00000.json"), "utf8")).finalized).toBe(false);
+    sup.stop();
+  });
+
+  it("respawnHoldMs null parks the camera until cycle() spawns it again", async () => {
+    const spawner = stdoutSpawner();
+    let hold: number | null = null;
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "d", cameras: cams, record: false, preset, segmentSeconds: 60,
+      videoRoot: join(home, "video"), shmDir: join(home, "shm"), timeSource,
+      spawn: spawner.spawn, stableMs: 10, eosIsClean: true, respawnHoldMs: () => hold,
+    });
+    sup.start();
+    spawner.spawns[0].stdout?.("Got EOS from element \"pipeline0\".");
+    spawner.spawns[0].exit(1);
+    await delay(20);
+    expect(sup.status()[0].state).toBe("stopped");
+    expect(spawner.spawns).toHaveLength(1);
+    hold = 0;
+    sup.cycle("cam0");
+    expect(spawner.spawns).toHaveLength(2);
+    sup.stop();
+  });
+
+  it("cycle() on a running child SIGINTs it, finalizes, and respawns after the hold", async () => {
+    const ended: boolean[] = [];
+    const spawner = stdoutSpawner();
+    const sup = new VideoCaptureSupervisor({
+      deviceId: "d", cameras: cams, record: true, preset, segmentSeconds: 60,
+      videoRoot: join(home, "video"), shmDir: join(home, "shm"), timeSource,
+      spawn: spawner.spawn, stableMs: 10, onEnded: (_k, clean) => ended.push(clean),
+      eosIsClean: true, respawnHoldMs: () => 0,
+    });
+    sup.start();
+    const first = sup.status()[0].sessionId!;
+    writeFileSync(join(home, "video", "cam0", first, "00000.mp4"), "x");
+    sup.cycleAll();
+    expect(spawner.spawns[0].stopped).toBe("SIGINT");
+    await delay(20);
+    expect(ended).toEqual([true]);
+    expect(JSON.parse(readFileSync(join(home, "video", "cam0", first, "00000.json"), "utf8")).finalized).toBe(true);
+    expect(spawner.spawns).toHaveLength(2);
+    expect(sup.status()[0].sessionId).not.toBe(first);
+    sup.stop();
+  });
+});

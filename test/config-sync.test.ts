@@ -1148,6 +1148,7 @@ describe("apply classes", () => {
       timeSync: "agent-poll",
       cellular: "modem-poll",
       cameraMount: "agent-poll",
+      simulation: "agent-poll",
     });
   });
 });

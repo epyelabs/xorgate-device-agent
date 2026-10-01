@@ -3,3 +3,5 @@ dist/
 creds/
 *.log
 sim/build/
+sim/state/
+sim/creds/

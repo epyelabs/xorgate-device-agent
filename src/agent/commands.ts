@@ -86,6 +86,21 @@ export interface DeviceCommand {
 export type RejectReason = "expired" | "duplicate";
 
 /**
+ * Replay mode (plans/xorgate-device-simulator, Phase 2): the agent IS the
+ * container's main process, so a command that would reboot or power off a
+ * device becomes an exit code the host reads. `reboot` → 0 (Docker's
+ * `restart: unless-stopped` brings it straight back, ~10 s offline, LWT
+ * fires); `power_off` → 3 (the entrypoint parks the container until the sim
+ * host powers it on — README Q8). `update` is rejected: the image is managed
+ * by the host, not the updater.
+ */
+export const REPLAY_EXIT_CODES = { reboot: 0, power_off: 3 } as const;
+
+export function containerExitCode(command: "reboot" | "power_off"): number {
+  return REPLAY_EXIT_CODES[command];
+}
+
+/**
  * Parse + validate a command payload. Returns null when it is not a well-formed
  * v1 command for a known action — the worker cannot meaningfully ack those
  * (there may be no requestId to ack against), so they are dropped with a log.

@@ -23,11 +23,18 @@ import { createTimeSourceTracker } from "./recording/session.js";
 import { loadSettings } from "./daemon/settings.js";
 import {
   claimCommand,
+  containerExitCode,
   executeCommand,
   isExpired,
   parseCommand,
   type DeviceCommandName,
 } from "./agent/commands.js";
+import { createReplaySource, loadScenario, type ReplaySource } from "./agent/replay.js";
+import { seedOnce } from "./agent/replay-seed.js";
+import { recordingsRoot, shmSocketPathFor as shmSocketPathForStream } from "./recording/config.js";
+import { bridgedKvsPipeline } from "./recording/video-capture.js";
+import { cameraFileFor, pipelineFileFor } from "./media/pipeline.js";
+import { readBootId } from "./recording/session.js";
 import { connect } from "./agent/mqtt.js";
 import { TelemetryScope, type ScopeChange } from "./agent/telemetry-scope.js";
 import { createSimulator } from "./agent/simulator.js";
@@ -57,7 +64,7 @@ import type {
 } from "./agent/telemetry.js";
 import { StateStore } from "./daemon/state.js";
 import { ensureHome, runtimeHome, workerPath } from "./daemon/runtime.js";
-import { writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { removePidfile, writePidfile } from "./daemon/pidfile.js";
 import { loadBuildInfo } from "./lib/build-info.js";
@@ -193,6 +200,10 @@ function summariseCameraMount(state: CameraMountState | null): unknown {
 // whose camera did not enumerate, gets NO master — never the runtime's
 // built-in test pipeline.
 config.media.streamGuard = (streamKey) => {
+  // Replay mode: a channel the scenario has no footage for (cam1 on a cam0-only
+  // scenario) gets no master, so it can never fall back to the runtime's
+  // built-in test pattern before the cloud's `cameras:{cam1:false}` arrives.
+  if (replay) return replay.streamGuard(streamKey);
   if (!hardwareBlock || !streamGuardArmed) return "ok";
   const status = streamHardware.get(streamKey);
   if (status === undefined || status === "no-camera") return "no-camera";
@@ -200,6 +211,44 @@ config.media.streamGuard = (streamKey) => {
     ? "ok"
     : "no-pipeline";
 };
+
+/**
+ * Replay mode (plans/xorgate-device-simulator, Phase 2): the real agent fed
+ * from a recorded trace + clip. Built before `source` so the stream guard and
+ * the recording manager can reach it; events are journaled once the state
+ * store exists (the first ones go to the console only).
+ */
+let storeForEvents: StateStore | null = null;
+function replayEvent(level: "info" | "warn", msg: string): void {
+  const t = Date.now();
+  console[level === "warn" ? "warn" : "log"](`[agent] ${msg}`);
+  storeForEvents?.event(level, msg, t);
+  storeForEvents?.flush(t, true);
+}
+const replay: ReplaySource | null =
+  config.mode === "replay"
+    ? createReplaySource({
+        config: config.replay,
+        settings: () => loadSettings().simulation,
+        media: config.media.enabled ? createMediaCollector(config.media) : null,
+        onEvent: replayEvent,
+      })
+    : null;
+if (replay) {
+  // Bridged pipeline files for every stream the scenario provides: the KVS
+  // master reads the capture daemon's shm socket (the exact .gst `xorgate
+  // pipeline bridge` renders on a CM5); the `.camera` identity is a placeholder
+  // — the capture HEAD comes from the replay source, not from libcamera.
+  mkdirSync(config.media.pipelineDir, { recursive: true });
+  for (const stream of replay.scenario().manifest.streams) {
+    const gst = pipelineFileFor(config.media.pipelineDir, stream.streamKey);
+    if (!existsSync(gst)) {
+      writeFileSync(gst, `${bridgedKvsPipeline(shmSocketPathForStream(stream.streamKey))}\n`);
+    }
+    const cam = cameraFileFor(config.media.pipelineDir, stream.streamKey);
+    if (!existsSync(cam)) writeFileSync(cam, `replay:${stream.streamKey}\n`);
+  }
+}
 
 // Real mode enables every self-detecting collector; each one stays inert when
 // its hardware is absent, so the worker is healthy with or without it:
@@ -233,7 +282,9 @@ const source: {
         },
         config.media,
       )
-    : (() => {
+    : replay
+      ? replay
+      : (() => {
         const next = createSimulator();
         // Device-simulator plan (Phase 0 spike): a sim run that opts in with
         // XORGATE_SIM_MEDIA supervises the KVS masters exactly like real mode,
@@ -318,6 +369,7 @@ const initial: StateSnapshot = {
 };
 const store = new StateStore(initial);
 store.flush(now0, true); // publish "connecting" immediately for status/monitor
+storeForEvents = store;
 
 /**
  * Segment-upload plumbing (offline recording plan, Phase 2). The kvs.json
@@ -356,7 +408,11 @@ function buildUploadOptions(): RecordingUploadOptions | undefined {
 // Shared time-provenance tracker: the recording manager stamps sessions and
 // sidecars from it, and the offline clock stepper (Phase 4) feeds GPS/NITZ
 // steps into it so post-step segments carry the honest "gps"/"nitz" value.
-const timeSource = createTimeSourceTracker();
+// Replay mode: the container clock IS the NTP-synced host's, and there is no
+// timedatectl to ask — report `ntp` outright (README §3.4 host-touching paths).
+const timeSource = replay
+  ? createTimeSourceTracker(60_000, async () => "ntp" as const)
+  : createTimeSourceTracker();
 
 // Reconcile pipelines against the hardware block BEFORE anything reads them:
 // the recording manager's camera set and the media masters both consume the
@@ -395,7 +451,21 @@ const recording = new RecordingManager({
     // Per-camera capacity (Phase 6): a camera turned off in settings keeps no
     // pipeline at all — its live master is held down alongside its capture.
     setDisabledCameras: (streamKeys) => source.setDisabledStreams?.(streamKeys),
+    // Replay mode: the capture head plays the scenario clip, PLAYING/EOS drive
+    // the lap clock, EOF is a clean lap end, and the respawn waits out the gap.
+    ...(replay
+      ? {
+          sourceHead: (cam) => replay.sourceHead(cam),
+          onPlaying: (streamKey, wallMs) => replay.onPlaying(streamKey, wallMs),
+          onEnded: (streamKey, clean) => replay.onEnded(streamKey, clean),
+          eosIsClean: true,
+          respawnHoldMs: (streamKey) => replay.respawnHoldMs(streamKey),
+        }
+      : {}),
   },
+  // Replay mode: no PMIC budget or GNSS receiver to consult — the boot defer
+  // and the GPS/LTE gate would only arm, time out and fail open 90 s later.
+  forceBootPolicyOff: replay !== null,
   sampleGroups: () => source.sampleGroups(),
   // ~1 Hz power reading for the shed policy — the system collector's cached
   // sampler, so the recorder and the shedder share one vcgencmd stream.
@@ -415,6 +485,38 @@ const recording = new RecordingManager({
     store.flush(t, true);
   },
 });
+// Replay mode: lap boundaries reach the recording manager through this seam
+// (end the lap cleanly, rotate the telemetry session), and the first boot
+// seeds the catalog's past sessions into the recordings tree BEFORE start()
+// so the initial uploader kick drains them (README §3.4 first-boot seeding).
+if (replay) {
+  replay.attachHost({
+    cycleVideo: () => recording.cycleVideo(),
+    rotateTelemetrySession: (why) => recording.rotateTelemetrySession(why),
+  });
+  if (!config.offline) {
+    try {
+      const res = seedOnce({
+        catalog: replay.catalog(),
+        loadScenario: (id) => loadScenario(config.replay.assetsDir, id),
+        recordingsRoot: recordingsRoot(),
+        home: runtimeHome(),
+        deviceId: config.deviceId,
+        bootId: readBootId(),
+        onEvent: replayEvent,
+      });
+      if (res.seeded) {
+        replayEvent(
+          "info",
+          `replay seed: ${res.plan!.sessions.length} session pair(s) staged for upload (delta ${Math.round(res.plan!.deltaMs / 86_400_000)} d)`,
+        );
+      }
+    } catch (err) {
+      replayEvent("warn", `replay seed failed: ${(err as Error).message}`);
+    }
+  }
+}
+
 // Awaited: the bounded (≤2 s) time-source probe inside start() must land
 // before the first capture spawn so first sessions aren't stamped "unsynced".
 await recording.start();
@@ -484,8 +586,15 @@ const led = new LedManager({
   // Pin map from the hardware block (cm4-support): a model that declares no
   // status LED gets an inert driver (never drives pins blind on an unknown
   // carrier); a declared map replaces the hardcoded Argus CM5 default. No
-  // block = the hardcoded default, exactly as before.
-  ...(hardwareBlock
+  // block = the hardcoded default, exactly as before. Replay mode: no pins
+  // anywhere in a container — inert, whatever the model declares.
+  ...(replay
+    ? {
+        driver: new LedDriver({
+          probe: async () => ({ ok: false, reason: "replay mode (container)" }),
+        }),
+      }
+    : hardwareBlock
     ? {
         driver: hardwareBlock.statusLed
           ? new LedDriver({
@@ -763,6 +872,9 @@ function handleConfigMessage(payload: Buffer): void {
     // Called on the skipped path too, so the apply machinery's cadence is
     // byte-identical to pre-Phase-3 (it is a no-op re-read when nothing moved).
     recording.reapply();
+    // ... and the `simulation` namespace (replay mode): a changed scenario
+    // ends the current lap in place — same cadence as `recording`.
+    replay?.reapply();
     // ... and the same for `cameraMount`: reconcile the boot config against
     // whatever settings.json now holds. Not awaited — an apply path may never
     // block on a subprocess (design.md §7) — and idempotent, so the skipped
@@ -872,6 +984,16 @@ async function handleCommandMessage(payload: Buffer): Promise<void> {
     return;
   }
 
+  // Replay mode: `update` is refused before anything says "accepted" — the
+  // image is managed by the host, not the updater (device-simulator plan).
+  if (replay && cmd.command === "update") {
+    console.warn(`[agent] update command rejected (${cmd.requestId}): managed by host image`);
+    store.event("warn", "update command rejected: managed by host image", now);
+    store.flush(now, true);
+    await publishCommandAck({ ...cmd, status: "rejected", reason: "managed by host image" });
+    return;
+  }
+
   console.log(`[agent] ${cmd.command} command accepted (${cmd.requestId})`);
   store.event("info", `${cmd.command} command accepted`, now);
   store.flush(now, true);
@@ -899,6 +1021,22 @@ async function handleCommandMessage(payload: Buffer): Promise<void> {
     // daemon has had time to honour the flag, so the re-probed values land.
     configSync.request("boot");
     setTimeout(() => configSync.request("boot"), REFRESH_REPROBE_REPORT_MS).unref();
+    return;
+  }
+
+  // Replay mode (device-simulator plan): this process IS the container, so
+  // reboot/power_off become exit codes for the host (see REPLAY_EXIT_CODES),
+  // through the normal shutdown (offline status, KVS teardown, finalized
+  // segments) — the same signal path a systemd stop drives on hardware.
+  // `update` is refused: the image is managed by the host, not the updater.
+  if (replay && cmd.command !== "update") {
+    await publishCommandAck({ ...cmd, status: "accepted" });
+    const code = containerExitCode(cmd.command);
+    const t = Date.now();
+    console.log(`[agent] ${cmd.command}: exiting with code ${code} (replay container)`);
+    store.event("info", `${cmd.command}: container exit ${code}`, t);
+    store.flush(t, true);
+    shutdown(`${cmd.command} command`, code);
     return;
   }
 
@@ -1092,7 +1230,7 @@ setInterval(
   10_000,
 ).unref();
 
-function shutdown(sig: string): void {
+function shutdown(sig: string, exitCode = 0): void {
   if (shuttingDown) return;
   shuttingDown = true;
   const now = Date.now();
@@ -1122,9 +1260,9 @@ function shutdown(sig: string): void {
     config.statusTopic,
     JSON.stringify({ v: 1, deviceId: config.deviceId, ts: now, online: false }),
     { qos: 0 },
-    () => client.end(false, {}, () => process.exit(0)),
+    () => client.end(false, {}, () => process.exit(exitCode)),
   );
-  setTimeout(() => process.exit(0), 2000).unref();
+  setTimeout(() => process.exit(exitCode), 2000).unref();
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));

@@ -1,0 +1,35 @@
+# One hand-run device simulation (plans/xorgate-device-simulator, Phase 2).
+# The sim host (Phase 4) runs many of these from the API; this file is the
+# single-container recipe for a developer or the bench.
+#
+#   cd device/xorgate-device-agent/sim
+#   IOT_DATA_ENDPOINT=<iot data endpoint> \
+#   XORGATE_UPLOAD_BUCKET=<core bucket, dev devices only> \
+#   SIM_CREDS=/path/to/creds SIM_ASSETS=/path/to/demo-assets/v1 SIM_STATE=/path/to/state \
+#   docker compose -f docker-compose.sim.yml up -d --build
+#
+# Never run a container under a real device's id — the MQTT clientId is the
+# device id, and a second client kicks the real one off the broker.
+services:
+  sim:
+    image: ${SIM_IMAGE:-xorgate-sim:dev}
+    build:
+      # Context = device/ (the image needs both repos: the agent and the
+      # xorgate-kvs-webrtc fork it builds for this architecture).
+      context: ../..
+      dockerfile: xorgate-device-agent/sim/Dockerfile
+    container_name: ${SIM_NAME:-xorgate-sim}
+    # reboot → exit 0 → restarted at once; power_off → exit 3 → restarted into
+    # the entrypoint's parked sleep (see sim/entrypoint.sh); `docker stop` → stays down.
+    restart: unless-stopped
+    network_mode: bridge
+    shm_size: 256m
+    environment:
+      IOT_DATA_ENDPOINT: ${IOT_DATA_ENDPOINT:?IOT_DATA_ENDPOINT is required}
+      XORGATE_UPLOAD_BUCKET: ${XORGATE_UPLOAD_BUCKET:-}
+      SCENARIO: ${SCENARIO:-}
+      AWS_KVS_LOG_LEVEL: ${AWS_KVS_LOG_LEVEL:-3}
+    volumes:
+      - ${SIM_CREDS:-./creds}:/creds:ro
+      - ${SIM_ASSETS:-./build/demo-assets/v1}:/assets/v1:ro
+      - ${SIM_STATE:-./state}:/state

@@ -74,6 +74,17 @@ export interface MediaConfig {
   caCertPath: string;
 }
 
+/** Replay-mode inputs (device-simulator plan, Phase 2); see `agent/replay.ts`. */
+export interface ReplayConfig {
+  /** Root of the scenario asset pack: `<assetsDir>/catalog.json`, `<assetsDir>/<scenarioId>/…`. */
+  assetsDir: string;
+  /**
+   * Scenario to replay until the cloud's `simulation.scenarioId` arrives (or
+   * when it never does: a hand-run container). null = the catalog's first entry.
+   */
+  defaultScenarioId: string | null;
+}
+
 export interface AgentConfig {
   deviceId: string;
   endpoint: string;
@@ -116,6 +127,8 @@ export interface AgentConfig {
    * message carries a changed block. Absent file = legacy behavior.
    */
   hardwarePath: string;
+  /** Replay-mode inputs; present in every mode, read only by the replay source. */
+  replay: ReplayConfig;
 }
 
 /** Flags that take no value. Everything else consumes the following token. */
@@ -198,8 +211,8 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
   if (!Number.isFinite(mqttKeepaliveSec) || mqttKeepaliveSec <= 0) {
     throw new Error(`MQTT_KEEPALIVE_SEC must be a positive number, got ${mqttKeepaliveSec}`);
   }
-  if (mode !== "sim" && mode !== "real") {
-    throw new Error(`MODE must be "sim" or "real", got "${mode}"`);
+  if (mode !== "sim" && mode !== "real" && mode !== "replay") {
+    throw new Error(`MODE must be "sim", "real" or "replay", got "${mode}"`);
   }
 
   let creds: CredBundle | null = null;
@@ -254,6 +267,15 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     get("hardware", "HARDWARE_MANIFEST", "/etc/xorgate/hardware.json")!,
   );
 
+  // Replay mode (device-simulator plan, Phase 2): where the scenario asset
+  // pack is mounted and which scenario to start with before the cloud's
+  // `simulation` namespace has arrived. Resolved for every mode (cheap, pure
+  // path math); only the replay source reads it.
+  const replay: ReplayConfig = {
+    assetsDir: resolve(get("replay-assets", "XORGATE_REPLAY_ASSETS", "/assets/v1")!),
+    defaultScenarioId: get("replay-scenario", "XORGATE_REPLAY_SCENARIO") ?? null,
+  };
+
   return {
     deviceId,
     endpoint,
@@ -274,5 +296,6 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AgentConfig 
     creds,
     media,
     hardwarePath,
+    replay,
   };
 }

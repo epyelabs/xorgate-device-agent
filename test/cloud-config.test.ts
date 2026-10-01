@@ -300,3 +300,24 @@ describe("applyCloudConfig", () => {
     expect(parseCloudConfig(JSON.stringify({ v: 1, timeSync: [] }))).toEqual({});
   });
 });
+
+describe("simulation namespace (device-simulator Phase 2)", () => {
+  it("parses, clamps and drops like its siblings; empty object clears", () => {
+    expect(parseCloudConfig(JSON.stringify({ v: 1, simulation: { scenarioId: "city-2026-09-27", loop: false, gapSeconds: 5000 } }))?.simulation)
+      .toEqual({ scenarioId: "city-2026-09-27", loop: false, gapSeconds: 3600 });
+    expect(parseCloudConfig(JSON.stringify({ v: 1, simulation: { scenarioId: "../etc", loop: "yes" } }))?.simulation).toBeNull();
+    expect(parseCloudConfig(JSON.stringify({ v: 1, simulation: {} }))?.simulation).toBeNull();
+    expect(parseCloudConfig(JSON.stringify({ v: 1 }))?.simulation).toBeUndefined();
+  });
+  it("replaces the whole namespace, clears on null, leaves it alone when absent", () => {
+    saveSettings({ mode: "replay", simulation: { scenarioId: "a-1", gapSeconds: 10 } });
+    expect(applyCloudConfig({ simulation: { scenarioId: "b-2" } })).toEqual({ changed: true });
+    expect(loadSettings().simulation).toEqual({ scenarioId: "b-2" });
+    expect(applyCloudConfig({ simulation: { scenarioId: "b-2" } })).toEqual({ changed: false });
+    expect(applyCloudConfig({ recording: { telemetry: { enabled: true } } })).toEqual({ changed: true });
+    expect(loadSettings().simulation).toEqual({ scenarioId: "b-2" });
+    expect(applyCloudConfig({ simulation: null })).toEqual({ changed: true });
+    expect(loadSettings().simulation).toBeUndefined();
+    expect(loadSettings().mode).toBe("replay");
+  });
+});

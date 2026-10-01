@@ -51,7 +51,7 @@ export function parsePidRecord(text: string): PidRecord | null {
     pid: r.pid,
     startedAt: r.startedAt,
     deviceId: r.deviceId,
-    mode: r.mode === "real" ? "real" : "sim",
+    mode: r.mode === "real" ? "real" : r.mode === "replay" ? "replay" : "sim",
     rateHz: typeof r.rateHz === "number" ? r.rateHz : 1,
     offline: r.offline === true,
     worker: typeof r.worker === "string" ? r.worker : "",

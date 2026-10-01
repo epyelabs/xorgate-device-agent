@@ -1,10 +1,28 @@
 import { describe, expect, it } from "vitest";
-import contract from "./config-contract.json";
+import generated from "./config-contract.json";
+import additions from "./config-contract.additions.json";
 import { RECORDING_DEFAULTS } from "../src/recording/config.js";
 import { TIME_SYNC_DEFAULTS } from "../src/agent/clock-step.js";
 import { videoPresetNames, DEFAULT_VIDEO_PRESET } from "../src/recording/video-presets.js";
-import { parseRecordingSettings, parseTimeSyncSettings } from "../src/daemon/settings.js";
+import {
+  parseRecordingSettings,
+  parseSimulationSettings,
+  parseTimeSyncSettings,
+} from "../src/daemon/settings.js";
 import { CONFIG_APPLY_CLASSES } from "../src/agent/config-sync.js";
+
+/**
+ * `config-contract.additions.json` (device-simulator plan, Phase 2) carries
+ * namespaces this agent applies BEFORE the backend's generated artifact knows
+ * them — a copy of what `contract:generate` is expected to emit, merged over
+ * the generated file here and nowhere else. The guard below fails the moment
+ * the generated file catches up, so the addition cannot linger: delete it from
+ * the additions file (or the file itself) when that happens.
+ */
+const contract = {
+  ...generated,
+  namespaces: { ...generated.namespaces, ...additions.namespaces },
+};
 
 /**
  * Contract test against `config-contract.json` — the artifact the CLOUD's
@@ -86,8 +104,31 @@ describe("config contract: the agent matches the cloud registry", () => {
       "imuMount",
       "lteRecovery",
       "recording",
+      "simulation",
       "timeSync",
     ]);
+  });
+
+  it("the additions file only carries namespaces the generated contract lacks", () => {
+    // When the backend regenerates config-contract.json with one of these,
+    // the addition is redundant and MUST be removed (the two could otherwise
+    // drift apart silently, with this test comparing against the stale copy).
+    for (const key of Object.keys(additions.namespaces)) {
+      expect(
+        Object.prototype.hasOwnProperty.call(generated.namespaces, key),
+        `config-contract.json now carries "${key}" — remove it from config-contract.additions.json`,
+      ).toBe(false);
+    }
+  });
+
+  it("simulation bounds survive the device parser (and the default is the parked loop)", () => {
+    const sim = contract.namespaces.simulation;
+    expect(sim.applyClass).toBe("agent-poll");
+    expect(parseSimulationSettings(sim.defaults)).toEqual(sim.defaults);
+    const gap = (sim.jsonSchema as JsonSchema).properties?.gapSeconds as JsonSchema;
+    for (const v of [gap.minimum as number, gap.maximum as number]) {
+      expect(parseSimulationSettings({ gapSeconds: v })).toEqual({ gapSeconds: v });
+    }
   });
 
   it("RECORDING_DEFAULTS match the published defaults", () => {

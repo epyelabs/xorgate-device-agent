@@ -1,0 +1,37 @@
+{
+  "$comment": "TEMPORARY (plans/xorgate-device-simulator, Phase 2). Namespaces the agent already applies that the backend's generated `config-contract.json` does not carry yet, written here EXACTLY as `npm run contract:generate` in backend/xorgate-core-service is expected to emit them once Agent B registers the namespace. The contract test merges this file over the generated artifact, and asserts that none of these keys is ALREADY in the generated file — so the moment B's regenerate lands, this test fails with 'remove the addition' and this file is deleted. Never add a namespace here that the worker does not apply.",
+  "namespaces": {
+    "simulation": {
+      "applyClass": "agent-poll",
+      "kind": "object",
+      "description": "Device-simulator scenario selection (`simulation` namespace). Accepted only for devices created as simulated; a simulated device replays the catalog scenario `scenarioId` from `demo-assets/v1/`, parks for `gapSeconds` between laps, and loops while `loop` is true. Applied live by the replay source (5 s settings poll, and forced on every cloud config message); a changed scenarioId ends the current lap in place.",
+      "defaults": {
+        "scenarioId": "city-2026-09-27",
+        "loop": true,
+        "gapSeconds": 30
+      },
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "scenarioId": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "description": "Catalog id of the scenario to replay (demo-assets/v1/<scenarioId>/)."
+          },
+          "loop": {
+            "type": "boolean",
+            "description": "Replay the scenario again after the parked gap; false parks at the end of the lap until changed."
+          },
+          "gapSeconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600,
+            "description": "Parked pause between laps, seconds."
+          }
+        },
+        "required": ["scenarioId", "loop", "gapSeconds"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

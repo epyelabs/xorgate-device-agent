@@ -185,3 +185,12 @@ describe("executeCommand", () => {
     expect(res.stderr).toContain("password is required");
   });
 });
+
+describe("replay container exit codes (device-simulator Phase 2)", async () => {
+  const { containerExitCode, REPLAY_EXIT_CODES } = await import("../src/agent/commands.js");
+  it("reboot restarts (0), power_off parks (3) — the host reads these", () => {
+    expect(containerExitCode("reboot")).toBe(0);
+    expect(containerExitCode("power_off")).toBe(3);
+    expect(REPLAY_EXIT_CODES).toEqual({ reboot: 0, power_off: 3 });
+  });
+});

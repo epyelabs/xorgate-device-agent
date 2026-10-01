@@ -142,6 +142,11 @@ export const CONFIG_APPLY_CLASSES: Readonly<Record<string, ApplyClass>> = {
   // for the next boot (the namespace's status carries that — the agent never
   // reboots by itself).
   cameraMount: "agent-poll",
+  // Device-simulator scenario (plans/xorgate-device-simulator): the replay
+  // source re-reads it on its 5 s poll and after every cloud message, like
+  // `recording`. Only simulated devices are ever sent it; on real hardware it
+  // is parsed, persisted and reported, and nothing acts on it.
+  simulation: "agent-poll",
 };
 
 /** Namespace keys in publish order (matches the cloud registry's order). */
@@ -592,6 +597,9 @@ export function buildEffective(
   if (settings.recording !== undefined) out.recording = settings.recording;
   if (settings.lteRecovery !== undefined) out.lteRecovery = settings.lteRecovery;
   if (settings.timeSync !== undefined) out.timeSync = settings.timeSync;
+  // `simulation` is held exactly as delivered: the replay source applies it
+  // in place within one poll, and there is no hardware to disagree with it.
+  if (settings.simulation !== undefined) out.simulation = settings.simulation;
   // `cellular` follows the namespace convention (absent = defaults = "don't
   // touch"), with `apn` overridden by the modem's APPLIED value — mirroring
   // gnssAntBias, because a report that echoes the requested APN cannot tell

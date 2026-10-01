@@ -1479,6 +1479,11 @@ describe("RecordingManager liveBlock contract (Phase 2)", () => {
 
 describe("VideoCaptureSupervisor replay hooks (device-simulator Phase 2)", () => {
   const timeSource = (): TimeSource => "ntp";
+  /** Poll (≤ 2 s) instead of a fixed delay: the respawn rides a timer the suite's load can push around. */
+  const until = async (cond: () => boolean): Promise<void> => {
+    for (let i = 0; i < 100 && !cond(); i += 1) await delay(20);
+    expect(cond()).toBe(true);
+  };
   const cams = [{ streamKey: "cam0", cameraName: "replay" }];
 
   /** Fake spawner that also exposes the stdout handler so a test can "print" gst lines. */
@@ -1561,8 +1566,7 @@ describe("VideoCaptureSupervisor replay hooks (device-simulator Phase 2)", () =>
     expect(JSON.parse(readFileSync(join(dir, "00000.json"), "utf8")).finalized).toBe(true);
     expect(sup.status()[0].state).toBe("retrying");
     expect(spawner.spawns).toHaveLength(1);
-    await delay(50);
-    expect(spawner.spawns).toHaveLength(2);
+    await until(() => spawner.spawns.length === 2);
     expect(sup.status()[0].sessionId).not.toBe(first);
     sup.stop();
   });
@@ -1597,8 +1601,7 @@ describe("VideoCaptureSupervisor replay hooks (device-simulator Phase 2)", () =>
     sup.start();
     spawner.spawns[0].stdout?.("Got EOS from element \"pipeline0\".");
     spawner.spawns[0].exit(1);
-    await delay(20);
-    expect(sup.status()[0].state).toBe("stopped");
+    await until(() => sup.status()[0].state === "stopped");
     expect(spawner.spawns).toHaveLength(1);
     hold = 0;
     sup.cycle("cam0");
@@ -1620,10 +1623,9 @@ describe("VideoCaptureSupervisor replay hooks (device-simulator Phase 2)", () =>
     writeFileSync(join(home, "video", "cam0", first, "00000.mp4"), "x");
     sup.cycleAll();
     expect(spawner.spawns[0].stopped).toBe("SIGINT");
-    await delay(20);
+    await until(() => spawner.spawns.length === 2);
     expect(ended).toEqual([true]);
     expect(JSON.parse(readFileSync(join(home, "video", "cam0", first, "00000.json"), "utf8")).finalized).toBe(true);
-    expect(spawner.spawns).toHaveLength(2);
     expect(sup.status()[0].sessionId).not.toBe(first);
     sup.stop();
   });

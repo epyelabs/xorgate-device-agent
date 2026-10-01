@@ -24,6 +24,8 @@ xorgate <command> [agent flags]
              ↵/→ open); Connection/Daemon in the header; start/stop/restart from inside
   set        Persist a setting and apply it — `set mode <sim|real>` or
              `set media <on|off>` (--no-restart to persist without restarting)
+  sms        Read the modem's stored SMS, newest first, without marking them read
+             (`sms [--limit N] [--json]`, N 1..50; bench tool, prints text)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest build, install it, and restart the service (sudo;
              on-device only — --tag <version> pins a build, --from <url> the bucket)
@@ -456,6 +458,37 @@ The deeper reference — AT flows, hardware quirks (XTRA/HTP/GSA gotchas),
 device verification + TTFF measurement procedure, telemetry interpretation,
 and antenna selection — is in
 [`docs/gnss-bringup.md`](docs/gnss-bringup.md).
+
+## SMS inbox (`read_sms` command, `xorgate sms`)
+
+The cloud's `read_sms` command (plans/device-sms-inbox) and the local
+`xorgate sms [--limit N] [--json]` share one reader
+(`src/hardware/sms-modem.ts` + the pure PDU decoder `src/hardware/sms-pdu.ts`).
+It reads every stored message from **both** stores (SIM `SM` and modem `ME`;
+the newest are usually on the SIM, the oldest in a full `ME`), joins
+concatenated parts, sorts newest first, then cuts to N (default 10, max 50).
+The result goes to `xorgate/devices/{id}/sms` (QoS 1, one message per
+`requestId`); the config report advertises `effective.agent.capabilities:
+["sms.read"]`.
+
+**Why `/dev/ttyUSB3`.** The LTE daemon owns `ttyUSB2` (interface 04) with no
+lock, so a second writer there would interleave with its probes. The SIM7600
+exposes an independent AT parser on interface 05 (the PPP "modem" port), which
+nothing uses because data rides RNDIS `usb0`. The reader finds it **by
+identity** (the `ttyUSB*` whose `bInterfaceNumber` is `05` under USB vendor
+`1e0e`; override with `XORGATE_SMS_PORT`), checks it is a character device
+(never creates it), and never writes to `ttyUSB2`.
+
+**Non-destructive.** Reads use `AT+CMGRO` (SIMCom "read only"), so unread
+messages stay unread; `CMGR`/`CMGL` (which mark them read) and `CMGD` are never
+sent. `CMGF` and `CPMS` mem1 are read first and restored afterwards. Limits:
+3 s per AT command, 20 s per sweep (then `partial: true`), one sweep at a time
+(concurrent requests join it, a repeat within 5 s reuses it), and a lock file
+in `XORGATE_HOME` keeps `xorgate sms` and the agent from interleaving.
+
+**Privacy.** Message text and sender numbers are never logged; the agent logs
+`read_sms <requestId>: status=… total=… sent=… unread=… durationMs=…` only.
+`sim`/`replay` modes answer from a fixed synthetic inbox (no modem needed).
 
 ## Media runtime (KVS WebRTC, `MODE=real`)
 

@@ -18,6 +18,7 @@ import { setCommand } from "./commands/set.js";
 import { pipelineCommand } from "./commands/pipeline.js";
 import { recordingCommand } from "./commands/recording.js";
 import { ledCommand } from "./commands/led.js";
+import { smsCommand } from "./commands/sms.js";
 import { formatBuildInfo } from "./lib/build-info.js";
 
 // `0.2.0 (a1b2c3d, dev)` for the banner; `-v` prints the same string so a field
@@ -34,6 +35,7 @@ const VALUE_FLAGS = new Set([
   "--ca",
   "--tag",
   "--from",
+  "--limit",
 ]);
 
 const argv = process.argv.slice(2);
@@ -94,6 +96,9 @@ async function main(): Promise<void> {
     case "led":
       await ledCommand(rest);
       break;
+    case "sms":
+      await smsCommand(rest);
+      break;
     case "monitor": // deprecated alias for `manage`, kept working for one release
     case "manage": {
       if (cmd === "monitor") console.error("[xorgate] 'monitor' is deprecated; use 'manage'");
@@ -133,6 +138,8 @@ Commands:
   led        RGB status LED: 'led <colour> [pattern]', 'led off', or 'led test' to
              walk the whole status ladder printing each label. The agent drives it
              automatically; these are for bench work. Inert off-device.
+  sms        Read the modem's stored SMS, newest first, without marking them read:
+             'sms [--limit N] [--json]' (N 1..50, default 10). Bench tool; prints text.
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)

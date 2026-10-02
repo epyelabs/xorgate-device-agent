@@ -12,7 +12,7 @@
     "niagara-2026-09-25",
     "highway-2026-09-20",
     "urban-2026-09-18",
-    "parked-2026-09-17"
+    "neighbourhood-2026-09-27"
   ],
   "scenarios": [
     {
@@ -104,24 +104,25 @@
       }
     },
     {
-      "id": "parked-2026-09-17",
-      "title": "Parked (stationary)",
-      "description": "Ten minutes stationary at the home base: a fixed GPS position and a static elevated camera view over a residential neighbourhood.",
+      "id": "neighbourhood-2026-09-27",
+      "title": "Short neighbourhood drive",
+      "description": "9-minute sunny afternoon drive from Toronto West along arterial roads past high-rises and through residential streets, ending in a restaurant parking lot; never faster than about 60 km/h.",
       "source": {
         "deviceId": "8061fbd7-e5ef-44aa-aff4-18d62244a514",
         "streamKey": "cam0",
-        "mediaSessionId": "01a0b15e-81ea-7afb-ae45-6cc97db244ce",
+        "mediaSessionId": "01a0e45d-50eb-77e0-9750-e637a46ffc5d",
         "telemetrySessionIds": [
-          "01a08b4a-bb58-74ef-ac83-5fdd2751b143"
+          "01a0da16-34d7-7aaa-b76d-8516552522e3",
+          "01a0e465-6c2f-7547-bc47-9752ed6c5264"
         ]
       },
       "privacy": {
         "decision": "as-is",
-        "reviewedAt": "2026-10-01",
-        "reviewedBy": "agent A (device-simulator Phase 1)",
-        "legiblePlates": false,
+        "reviewedAt": "2026-10-02",
+        "reviewedBy": "agent (device-simulator scenario swap, replaces parked-2026-09-17)",
+        "legiblePlates": true,
         "identifiableFaces": false,
-        "notes": "Reviewed 2 frames/fragment (19 frames). Static elevated view over a residential neighbourhood toward the skyline; no vehicles or people close enough to identify. No plates, no faces."
+        "notes": "Reviewed 2 frames/fragment (19 frames) at 640px + two full-res crops. Plates on cars stopped ahead at lights (a white Infiniti) and on a parked Mercedes SUV in the lot at the end (fragments 8-9, legible at 1280x720). A family (2 adults, 3 children) crossing at a crosswalk in fragment 6 is small and not identifiable at 1:1. Shipped as-is per the user's Q11 decision (2026-10-01)."
       }
     }
   ]

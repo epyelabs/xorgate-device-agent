@@ -140,6 +140,7 @@ Commands:
              automatically; these are for bench work. Inert off-device.
   sms        Read the modem's stored SMS, newest first, without marking them read:
              'sms [--limit N] [--json]' (N 1..50, default 10). Bench tool; prints text.
+             'sms clear [--yes]' deletes ALL stored SMS (SIM + modem); counts only.
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)

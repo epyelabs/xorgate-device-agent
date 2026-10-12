@@ -1,5 +1,6 @@
 /**
  * `xorgate sms [--limit N] [--json]` — read the modem's stored SMS locally.
+ * `xorgate sms clear [--yes]` — delete them all (device-sms-clear plan).
  *
  * The same reader the agent's `read_sms` command uses (device-sms-inbox plan
  * §2.4), for bench work: non-destructive (`AT+CMGRO`, unread stays unread),
@@ -7,9 +8,10 @@
  * the agent's lock file, so it never interleaves with a cloud-triggered sweep.
  *
  * This is a local operator tool and DOES print senders and text to the
- * terminal. Nothing here goes to journald.
+ * terminal. Nothing here goes to journald. `clear` prints counts only.
  */
 import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { runtimeHome } from "../daemon/runtime.js";
 import {
   buildSmsPayload,
@@ -17,6 +19,66 @@ import {
   resolveSmsPort,
   SmsReader,
 } from "../hardware/sms-modem.js";
+
+function readerForCli(): SmsReader {
+  return new SmsReader({ lockPath: join(runtimeHome(), "sms-reader.lock") });
+}
+
+function storesLine(storage: Record<string, { used: number; total: number }>): string {
+  return (
+    Object.entries(storage)
+      .map(([k, v]) => `${k} ${v.used}/${v.total}`)
+      .join(", ") || "no stores"
+  );
+}
+
+async function confirm(question: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return /^y(es)?$/i.test((await rl.question(question)).trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * `xorgate sms clear [--yes]`: AT+CMGD=0,4 on SM then ME, then a sweep to
+ * show the stores are empty. Irreversible, so it needs `--yes` or an
+ * interactive y/N; without a TTY and without `--yes` it refuses.
+ */
+async function smsClearCommand(rest: string[]): Promise<void> {
+  if (rest.includes("--help") || rest.includes("-h")) {
+    console.log(`Usage: xorgate sms clear [--yes]
+
+Delete EVERY stored SMS on the SIM7600 (SIM store SM, then modem store ME)
+with AT+CMGD=0,4, then re-read the stores to show they are empty. Use it when
+a full store (e.g. ME 23/23) stops new messages arriving. Irreversible.
+Asks for confirmation unless --yes is given. Prints counts only.`);
+    return;
+  }
+  if (!rest.includes("--yes") && !rest.includes("-y")) {
+    if (!process.stdin.isTTY) {
+      console.error("sms clear: refusing without --yes (no terminal to confirm on)");
+      process.exitCode = 1;
+      return;
+    }
+    if (!(await confirm("Delete ALL stored SMS on this modem (SIM and modem storage)? [y/N] "))) {
+      console.log("sms clear: cancelled");
+      return;
+    }
+  }
+  const sweep = await readerForCli().clear();
+  const payload = buildSmsPayload(sweep, { deviceId: "local", requestId: "cli", limit: 1, action: "clear" });
+  const cleared =
+    Object.entries(payload.cleared ?? {})
+      .map(([k, v]) => `${k} ${v}`)
+      .join(", ") || "nothing";
+  console.log(
+    `sms clear: ${payload.status}${payload.error ? ` (${payload.error})` : ""} · cleared ${cleared} · ` +
+      `now ${storesLine(payload.storage)} · ${payload.durationMs} ms`,
+  );
+  if (payload.status !== "ok") process.exitCode = 1;
+}
 
 function flagValue(rest: string[], name: string): string | undefined {
   const i = rest.indexOf(name);
@@ -31,12 +93,15 @@ function oneLine(s: string, max: number): string {
 }
 
 export async function smsCommand(rest: string[]): Promise<void> {
+  if (rest[0] === "clear") return smsClearCommand(rest.slice(1));
   if (rest.includes("--help") || rest.includes("-h")) {
     console.log(`Usage: xorgate sms [--limit N] [--json]
+       xorgate sms clear [--yes]
 
 Read the SIM7600's stored SMS (SIM + modem storage), newest first, without
 marking anything read. N is 1..50 (default 10). --json prints the exact
 payload the agent publishes for a cloud read_sms request.
+'clear' deletes every stored SMS (see 'xorgate sms clear --help').
 Port: the SIMCom interface-05 tty (override with XORGATE_SMS_PORT).`);
     return;
   }
@@ -44,8 +109,7 @@ Port: the SIMCom interface-05 tty (override with XORGATE_SMS_PORT).`);
   const limit = clampSmsLimit(raw === undefined ? undefined : Number(raw));
   const json = rest.includes("--json");
 
-  const reader = new SmsReader({ lockPath: join(runtimeHome(), "sms-reader.lock") });
-  const sweep = await reader.read();
+  const sweep = await readerForCli().read();
   const payload = buildSmsPayload(sweep, { deviceId: "local", requestId: "cli", limit });
 
   if (json) {
@@ -55,12 +119,9 @@ Port: the SIMCom interface-05 tty (override with XORGATE_SMS_PORT).`);
   }
 
   const port = resolveSmsPort() ?? "(none)";
-  const stores = Object.entries(payload.storage)
-    .map(([k, v]) => `${k} ${v.used}/${v.total}`)
-    .join(", ");
   console.log(
     `sms: ${payload.status}${payload.error ? ` (${payload.error})` : ""} · port ${port} · ` +
-      `${stores || "no stores"} · ${payload.total} message(s)` +
+      `${storesLine(payload.storage)} · ${payload.total} message(s)` +
       `${payload.skipped ? `, ${payload.skipped} skipped` : ""}` +
       `${payload.partial ? " · PARTIAL (budget ran out)" : ""} · ${payload.durationMs} ms`,
   );

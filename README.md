@@ -25,7 +25,8 @@ xorgate <command> [agent flags]
   set        Persist a setting and apply it — `set mode <sim|real>` or
              `set media <on|off>` (--no-restart to persist without restarting)
   sms        Read the modem's stored SMS, newest first, without marking them read
-             (`sms [--limit N] [--json]`, N 1..50; bench tool, prints text)
+             (`sms [--limit N] [--json]`, N 1..50; bench tool, prints text);
+             `sms clear [--yes]` deletes them all (counts only)
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest build, install it, and restart the service (sudo;
              on-device only — --tag <version> pins a build, --from <url> the bucket)
@@ -469,7 +470,7 @@ the newest are usually on the SIM, the oldest in a full `ME`), joins
 concatenated parts, sorts newest first, then cuts to N (default 10, max 50).
 The result goes to `xorgate/devices/{id}/sms` (QoS 1, one message per
 `requestId`); the config report advertises `effective.agent.capabilities:
-["sms.read"]`.
+["sms.read", "sms.clear"]`.
 
 **Why `/dev/ttyUSB3`.** The LTE daemon owns `ttyUSB2` (interface 04) with no
 lock, so a second writer there would interleave with its probes. The SIM7600
@@ -480,15 +481,29 @@ identity** (the `ttyUSB*` whose `bInterfaceNumber` is `05` under USB vendor
 (never creates it), and never writes to `ttyUSB2`.
 
 **Non-destructive.** Reads use `AT+CMGRO` (SIMCom "read only"), so unread
-messages stay unread; `CMGR`/`CMGL` (which mark them read) and `CMGD` are never
-sent. `CMGF` and `CPMS` mem1 are read first and restored afterwards. Limits:
+messages stay unread; `CMGR`/`CMGL` (which mark them read) are never sent, and
+`CMGD` only by an explicit clear (below). `CMGF` and `CPMS` mem1 are read first and restored afterwards. Limits:
 3 s per AT command, 20 s per sweep (then `partial: true`), one sweep at a time
 (concurrent requests join it, a repeat within 5 s reuses it), and a lock file
 in `XORGATE_HOME` keeps `xorgate sms` and the agent from interleaving.
 
+**Clear all (`clear_sms`, `xorgate sms clear [--yes]`).** The one destructive
+operation (plans/device-sms-clear), for a full store (e.g. `ME 23/23`), which
+makes the SIM7600 refuse new SMS. Same port, lock and single-flight guard:
+`AT+CPMS="SM"` + `AT+CMGD=0,4`, then the same for `ME` (25 s per delete, a
+store already at 0 is skipped), mem1 restored in `finally`, then a normal
+sweep on the same port. The reply is a normal sms payload with
+`action: "clear"` and `cleared: { SM, ME }` (counts before the delete); a
+failed delete gives `status: "error"`, `error: "delete ME failed (…)"`. Reads
+now carry `action: "read"`. A clear never joins an in-flight read and drops
+the cached read; capability `sms.clear`. The CLI needs `--yes` or a y/N
+answer and prints counts only.
+
 **Privacy.** Message text and sender numbers are never logged; the agent logs
-`read_sms <requestId>: status=… total=… sent=… unread=… durationMs=…` only.
-`sim`/`replay` modes answer from a fixed synthetic inbox (no modem needed).
+`read_sms <requestId>: status=… total=… sent=… unread=… durationMs=…` only
+(`clear_sms` adds `cleared=SM:n,ME:n`).
+`sim`/`replay` modes answer from a fixed synthetic inbox (no modem needed); a
+`clear_sms` empties it until the process restarts.
 
 ## Media runtime (KVS WebRTC, `MODE=real`)
 

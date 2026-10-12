@@ -6,9 +6,9 @@
  *
  * Payload shape:
  *   { "v": 1, "requestId": <uuid>,
- *     "command": "reboot"|"power_off"|"refresh"|"update"|"read_sms",
+ *     "command": "reboot"|"power_off"|"refresh"|"update"|"read_sms"|"clear_sms",
  *     "ts": <epoch ms issued>, "expiresAt": <epoch ms>,
- *     "args"?: { "limit": 1..50 } }        // read_sms only; ignored elsewhere
+ *     "args"?: { "limit": 1..50 } }        // read_sms/clear_sms only; ignored elsewhere
  *
  * This is deliberately NOT the config plane (see plans/two-way-sync-config).
  * Config is desired state and is retained so an offline device converges on
@@ -59,8 +59,15 @@ import { clampSmsLimit } from "../hardware/sms-modem.js";
  * worker sweeps the modem's stored SMS over the spare AT port and publishes
  * the newest `args.limit` on `xorgate/devices/{id}/sms`. In-process like
  * `refresh`, never via `executeCommand`.
+ *
+ * `clear_sms` (device-sms-clear plan) is its destructive sibling: the same
+ * reader deletes every stored SMS (`AT+CMGD=0,4` on SM, then ME), sweeps, and
+ * replies on the same topic with `action: "clear"` and the `cleared` counts.
+ * `args.limit` sizes that follow-up sweep. In-process, never via sudo. The
+ * cloud gates it to owner/admin; the ledger stops a QoS-1 redelivery from
+ * clearing a second time (which would eat messages that arrived since).
  */
-export type DeviceCommandName = "reboot" | "power_off" | "refresh" | "update" | "read_sms";
+export type DeviceCommandName = "reboot" | "power_off" | "refresh" | "update" | "read_sms" | "clear_sms";
 
 const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>([
   "reboot",
@@ -68,6 +75,7 @@ const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>([
   "refresh",
   "update",
   "read_sms",
+  "clear_sms",
 ]);
 
 /**
@@ -91,7 +99,8 @@ export interface DeviceCommand {
   /** Epoch ms after which the device must refuse it. Already TTL-clamped. */
   expiresAt: number;
   /**
-   * Command parameters. Present only for `read_sms` (contract §1): `limit` is
+   * Command parameters. Present only for `read_sms` and `clear_sms`
+   * (contract §1; device-sms-clear contract §1): `limit` is
    * already clamped to 1..50, defaulting to 10 when missing or invalid.
    * Every other command ignores `args` entirely.
    */
@@ -143,7 +152,7 @@ export function parseCommand(payload: Buffer | string): DeviceCommand | null {
     ts: o.ts,
     expiresAt: Math.min(o.expiresAt, o.ts + MAX_TTL_MS),
   };
-  if (cmd.command === "read_sms") {
+  if (cmd.command === "read_sms" || cmd.command === "clear_sms") {
     const args = o.args && typeof o.args === "object" ? (o.args as Record<string, unknown>) : {};
     cmd.args = { limit: clampSmsLimit(args.limit) };
   }
@@ -230,7 +239,7 @@ export function executeCommand(
   command: DeviceCommandName,
   runner: (cmd: string, args: string[]) => Promise<RunResult> = run,
 ): Promise<RunResult> {
-  if (command === "refresh" || command === "read_sms") {
+  if (command === "refresh" || command === "read_sms" || command === "clear_sms") {
     // Never reaches sudo: the worker handles refresh in-process. Guarded here
     // so a future caller cannot accidentally route it into systemctl.
     return Promise.resolve<RunResult>({

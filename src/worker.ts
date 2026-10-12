@@ -33,8 +33,10 @@ import { createReplaySource, loadScenario, type ReplaySource } from "./agent/rep
 import {
   buildSmsPayload,
   clampSmsLimit,
-  fixtureSmsSweep,
+  fixtureSmsClear,
+  fixtureSmsRead,
   SmsReader,
+  type SmsAction,
   type SmsSweep,
 } from "./hardware/sms-modem.js";
 import { seedOnce } from "./agent/replay-seed.js";
@@ -909,29 +911,48 @@ const REFRESH_REPROBE_REPORT_MS = 45_000;
 let lastRefreshAt = 0;
 
 /**
- * `read_sms` (device-sms-inbox plan). One reader per process: concurrent
- * requests join the running sweep and a request within 5 s of the last one
- * reuses its result, so a hammered button costs one modem round per 5 s.
- * The lock file keeps `xorgate sms` on the box from interleaving with us.
+ * `read_sms` (device-sms-inbox plan) and `clear_sms` (device-sms-clear plan).
+ * One reader per process: concurrent reads join the running sweep and a read
+ * within 5 s of the last one reuses its result, so a hammered button costs
+ * one modem round per 5 s. A clear never joins a read and drops the cached
+ * read. The lock file keeps `xorgate sms` on the box from interleaving with us.
  */
 const smsReader = new SmsReader({ lockPath: join(runtimeHome(), "sms-reader.lock") });
 
 /**
- * Sweep (or, off real hardware, answer from the fixture) and publish this
- * request's result. Logs counts/status/duration only — never a number or a
- * message body (contract §6).
+ * Sweep or clear (or, off real hardware, answer from the fixture) and publish
+ * this request's result. Logs counts/status/duration only — never a number or
+ * a message body (contract §6; `cleared` counts are fine per clear §6).
  */
-async function runSmsRead(cmd: { requestId: string; args?: { limit: number } }): Promise<void> {
+async function runSms(
+  cmd: { requestId: string; command: "read_sms" | "clear_sms"; args?: { limit: number } },
+): Promise<void> {
   const limit = clampSmsLimit(cmd.args?.limit);
+  const action: SmsAction = cmd.command === "clear_sms" ? "clear" : "read";
   // Only `real` touches the modem. `sim` and `replay` run on dev boxes and in
   // simulator containers with no SIM7600, so they answer from a fixed inbox
-  // and cloud dev E2E works without hardware.
+  // (emptied by a clear) and cloud dev E2E works without hardware.
+  const real = config.mode === "real";
   const sweep: SmsSweep =
-    config.mode === "real" ? await smsReader.read() : fixtureSmsSweep(Date.now());
-  const payload = buildSmsPayload(sweep, { deviceId: config.deviceId, requestId: cmd.requestId, limit });
+    action === "clear"
+      ? real
+        ? await smsReader.clear()
+        : fixtureSmsClear(Date.now())
+      : real
+        ? await smsReader.read()
+        : fixtureSmsRead(Date.now());
+  const payload = buildSmsPayload(sweep, {
+    deviceId: config.deviceId,
+    requestId: cmd.requestId,
+    limit,
+    action,
+  });
   const unread = payload.messages.filter((m) => m.unread).length;
+  const cleared = payload.cleared
+    ? ` cleared=${Object.entries(payload.cleared).map(([k, v]) => `${k}:${v}`).join(",") || "none"}`
+    : "";
   const line =
-    `read_sms ${cmd.requestId}: status=${payload.status} total=${payload.total} ` +
+    `${cmd.command} ${cmd.requestId}: status=${payload.status}${cleared} total=${payload.total} ` +
     `sent=${payload.messages.length} unread=${unread} skipped=${payload.skipped} ` +
     `partial=${payload.partial} durationMs=${payload.durationMs}` +
     (payload.status === "ok" ? "" : ` error=${payload.error}`);
@@ -940,7 +961,7 @@ async function runSmsRead(cmd: { requestId: string; args?: { limit: number } }):
   store.event(payload.status === "ok" ? "info" : "warn", line, t);
   store.flush(t, true);
   client.publish(config.smsTopic, JSON.stringify(payload), { qos: 1 }, (err) => {
-    if (err) console.warn(`[agent] read_sms ${cmd.requestId}: publish failed: ${err.message}`);
+    if (err) console.warn(`[agent] ${cmd.command} ${cmd.requestId}: publish failed: ${err.message}`);
   });
 }
 
@@ -1071,12 +1092,17 @@ async function handleCommandMessage(payload: Buffer): Promise<void> {
   // rate: the reader's 5 s reuse window absorbs repeats, and every request
   // still gets its own reply on the sms topic. Same in replay mode (fixture),
   // so it never reaches the container-exit branch below.
-  if (cmd.command === "read_sms") {
+  //
+  // `clear_sms` takes the same path (ack, then run, reply on the sms topic).
+  // Concurrent clears join one delete; the ledger above already stopped a
+  // redelivered clear from deleting messages that arrived since.
+  if (cmd.command === "read_sms" || cmd.command === "clear_sms") {
+    const command = cmd.command;
     await publishCommandAck({ ...cmd, status: "accepted" });
-    void runSmsRead(cmd).catch((err: Error) => {
+    void runSms({ ...cmd, command }).catch((err: Error) => {
       const t = Date.now();
-      console.error(`[agent] read_sms ${cmd.requestId} crashed: ${err.message}`);
-      store.event("warn", `read_sms crashed: ${err.message}`, t);
+      console.error(`[agent] ${command} ${cmd.requestId} crashed: ${err.message}`);
+      store.event("warn", `${command} crashed: ${err.message}`, t);
       store.flush(t, true);
     });
     return;

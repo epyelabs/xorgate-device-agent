@@ -41,6 +41,14 @@ describe("parseCommand", () => {
     expect(parseCommand(msg({ command: "refresh" }))?.command).toBe("refresh");
     expect(parseCommand(msg({ command: "update" }))?.command).toBe("update");
     expect(parseCommand(msg({ command: "read_sms" }))?.command).toBe("read_sms");
+    expect(parseCommand(msg({ command: "clear_sms" }))?.command).toBe("clear_sms");
+  });
+
+  it("clear_sms carries a clamped limit for its follow-up sweep, like read_sms", () => {
+    const limit = (args: unknown) => parseCommand(msg({ command: "clear_sms", args }))?.args?.limit;
+    expect(limit({ limit: 25 })).toBe(25);
+    expect(limit({ limit: 500 })).toBe(50);
+    expect(limit(undefined)).toBe(10);
   });
 
   it("read_sms carries a clamped limit; missing/invalid args default to 10", () => {
@@ -200,7 +208,7 @@ describe("executeCommand", () => {
       calls.push([cmd, args]);
       return okResult;
     };
-    for (const c of ["refresh", "read_sms"] as const) {
+    for (const c of ["refresh", "read_sms", "clear_sms"] as const) {
       const res = await executeCommand(c, runner);
       expect(res.failed).toBe(true);
     }

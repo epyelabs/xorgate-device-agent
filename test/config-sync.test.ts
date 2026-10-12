@@ -1090,6 +1090,7 @@ describe("reported-only agent state", () => {
       const agent = buildEffective({}, NO_MODEM, mode).agent as { capabilities: unknown };
       expect(Array.isArray(agent.capabilities)).toBe(true);
       expect(agent.capabilities).toContain("sms.read");
+      expect(agent.capabilities).toContain("sms.clear");
     }
   });
 });

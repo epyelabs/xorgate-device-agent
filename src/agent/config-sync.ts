@@ -589,10 +589,12 @@ export interface ReportHints {
  * than a request that times out. Static per build; also true in sim/replay
  * mode, which answer from fixtures.
  *
- *   sms.read  the `read_sms` command + `xorgate/devices/{id}/sms` result
- *             (device-sms-inbox contract §3)
+ *   sms.read   the `read_sms` command + `xorgate/devices/{id}/sms` result
+ *              (device-sms-inbox contract §3)
+ *   sms.clear  the `clear_sms` command (delete all stored SMS, then sweep)
+ *              (device-sms-clear contract §3)
  */
-export const AGENT_CAPABILITIES: readonly string[] = ["sms.read"];
+export const AGENT_CAPABILITIES: readonly string[] = ["sms.read", "sms.clear"];
 
 export function buildEffective(
   settings: AgentSettings,

@@ -8,12 +8,16 @@
  * "modem" port), which nothing uses because data rides RNDIS `usb0`. So this
  * module resolves THAT port by USB identity and never touches ttyUSB2.
  *
- * Non-destructive by construction:
+ * Reads are non-destructive by construction:
  *   - reads use `AT+CMGRO` (SIMCom "read only"), which leaves REC UNREAD as is;
  *     `AT+CMGR`/`AT+CMGL` would flip messages to REC READ, so they are never
- *     sent. Nothing is deleted or written to the SIM.
+ *     sent. A read deletes nothing and writes nothing to the SIM.
  *   - the only settings touched are `CMGF` (per channel on SIMCom) and `CPMS`
  *     mem1; both are read first and restored in `finally`.
+ *
+ * The one destructive operation is the explicit clear (`clear_sms`,
+ * plans/device-sms-clear): `AT+CMGD=0,4` per store, then a normal sweep. It
+ * runs only through `SmsReader.clear()` / `clearTransport()`, never from a read.
  *
  * Privacy (contract §6): this module never logs. Callers log counts/status only.
  */
@@ -50,6 +54,11 @@ export interface SmsSweep {
   partial: boolean;
   /** All messages, newest first. */
   messages: SmsMessage[];
+  /**
+   * Clear only (device-sms-clear contract §2): messages present in each store
+   * right before its delete. A store the modem does not have is absent.
+   */
+  cleared?: Partial<Record<SmsStorage, number>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +255,16 @@ export class AtSession {
     }
   }
 
-  /** Send `cmd` and wait for its final result code. Rejects with AtTimeoutError. */
-  async command(cmd: string, prefix: string | null = null, withPdu = false): Promise<AtResponse> {
+  /**
+   * Send `cmd` and wait for its final result code. Rejects with AtTimeoutError
+   * after `timeoutMs` (default: the session's), e.g. longer for a slow CMGD.
+   */
+  async command(
+    cmd: string,
+    prefix: string | null = null,
+    withPdu = false,
+    timeoutMs: number = this.timeoutMs,
+  ): Promise<AtResponse> {
     if (this.pending) throw new Error("AT command already in flight");
     let timer: NodeJS.Timeout | undefined;
     const done = new Promise<AtResponse>((resolve, reject) => {
@@ -255,7 +272,7 @@ export class AtSession {
       timer = setTimeout(() => {
         this.pending = null;
         reject(new AtTimeoutError(`timeout on ${cmd.split("=")[0]}`));
-      }, this.timeoutMs);
+      }, timeoutMs);
     });
     try {
       await this.transport.write(`${cmd}\r`);
@@ -417,6 +434,116 @@ export async function sweepTransport(
 }
 
 // ---------------------------------------------------------------------------
+// The clear (plans/device-sms-clear)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-store delete timeout. `AT+CMGD=0,4` erases flash/SIM records one by
+ * one; a full ME (23) or SIM (40) store can take several seconds, so the 3 s
+ * read timeout would cut a delete that is still working.
+ */
+export const SMS_DELETE_TIMEOUT_MS = 25_000;
+
+export interface ClearOptions {
+  /** Per-command timeout for everything but the delete (plan: 3 s). */
+  commandTimeoutMs?: number;
+  /** Timeout for each `AT+CMGD=0,4` (default SMS_DELETE_TIMEOUT_MS). */
+  deleteTimeoutMs?: number;
+}
+
+export interface ClearOutcome {
+  /** Messages present in each store right before its delete. */
+  cleared: Partial<Record<SmsStorage, number>>;
+  /** Null when every store that had messages answered CMGD with OK. */
+  deleteError: string | null;
+}
+
+/**
+ * Delete every message in SM, then ME, over an open transport. Does not
+ * close it and does not sweep (the caller runs `sweepTransport` next on the
+ * same transport, so the reply proves the stores are empty).
+ *
+ * Throws SmsReadError ONLY before anything was deleted (no answer, no SIM,
+ * unreadable CPMS?), which maps to the contract's "nothing was deleted"
+ * statuses. Once deleting starts, a failing store is recorded in
+ * `deleteError` (naming the store) and the next store is still tried; a
+ * timed-out delete stops the phase, since a late OK could otherwise be taken
+ * as the answer to the next command.
+ *
+ * A store already known to be empty is not selected or deleted (cleared 0).
+ * `CMGD` with delflag 4 works in text and PDU mode alike, so CMGF is never
+ * changed here; CPMS mem1 is restored in `finally` even when a delete fails.
+ */
+export async function clearTransport(transport: AtTransport, opts: ClearOptions = {}): Promise<ClearOutcome> {
+  const at = new AtSession(transport, opts.commandTimeoutMs ?? 3000);
+  const deleteTimeout = opts.deleteTimeoutMs ?? SMS_DELETE_TIMEOUT_MS;
+
+  try {
+    await at.command("ATE0");
+  } catch (err) {
+    if (err instanceof AtTimeoutError) throw new SmsReadError("modem_busy", "no response on sms port");
+    throw err;
+  }
+  const cpms = await at.command("AT+CPMS?", "+CPMS:");
+  if (!cpms.ok) {
+    if (isNoSim(cpms.final)) throw new SmsReadError("no_sim", "sim not ready");
+    throw new SmsReadError("error", `CPMS? failed: ${cpms.final}`);
+  }
+  const triples = parseCpmsQuery(cpms.lines[0] ?? "");
+  if (triples.length === 0) throw new SmsReadError("error", "unparseable CPMS? answer");
+  const origMem1 = triples[0]!.mem;
+  const known: Partial<Record<SmsStorage, StoreCount>> = {};
+  for (const t of triples) {
+    if (t.mem === "SM" || t.mem === "ME") known[t.mem] = { used: t.used, total: t.total };
+  }
+
+  const cleared: Partial<Record<SmsStorage, number>> = {};
+  const failures: string[] = [];
+  let mem1Changed = false;
+  try {
+    for (const mem of SWEEP_STORES) {
+      if (known[mem]?.used === 0) {
+        cleared[mem] = 0;
+        continue;
+      }
+      let sel: AtResponse;
+      try {
+        sel = await at.command(`AT+CPMS="${mem}"`, "+CPMS:");
+      } catch (err) {
+        if (!(err instanceof AtTimeoutError)) throw err;
+        mem1Changed = true; // it may have switched before going quiet
+        failures.push(`delete ${mem} failed (select timeout)`);
+        break;
+      }
+      mem1Changed = true;
+      if (!sel.ok) {
+        // SM missing on a SIM-less modem: nothing there to clear.
+        if (mem === "SM" && isNoSim(sel.final)) continue;
+        failures.push(`delete ${mem} failed (select: ${sel.final})`);
+        continue;
+      }
+      const counts = parseCpmsSet(sel.lines[0] ?? "") ?? known[mem];
+      cleared[mem] = counts?.used ?? 0;
+      // An unparseable select answer gives no count: delete anyway, it is
+      // what the operator asked for and CMGD on an empty store is harmless.
+      if (counts && counts.used === 0) continue;
+      let del: AtResponse;
+      try {
+        del = await at.command("AT+CMGD=0,4", null, false, deleteTimeout);
+      } catch (err) {
+        if (!(err instanceof AtTimeoutError)) throw err;
+        failures.push(`delete ${mem} failed (timeout)`);
+        break;
+      }
+      if (!del.ok) failures.push(`delete ${mem} failed (${del.final})`);
+    }
+  } finally {
+    if (mem1Changed) await at.command(`AT+CPMS="${origMem1}"`, "+CPMS:").catch(() => undefined);
+  }
+  return { cleared, deleteError: failures.length > 0 ? failures.join("; ") : null };
+}
+
+// ---------------------------------------------------------------------------
 // Reader: single in-flight sweep + reuse window
 // ---------------------------------------------------------------------------
 
@@ -476,48 +603,107 @@ export interface SmsReaderDeps {
   openTransport?: (path: string) => Promise<AtTransport>;
   now?: () => number;
   sweep?: SweepOptions;
+  clear?: ClearOptions;
   reuseWindowMs?: number;
 }
 
+type SmsOp = "read" | "clear";
+type OpResult = Partial<SmsSweep> & Pick<SmsSweep, "status" | "error">;
+
 /**
- * One sweep at a time per process: concurrent callers join the running sweep,
- * and a caller within `reuseWindowMs` of the last finish gets that result
- * instead of a fresh modem round (the plan's "one sweep per 5 s" rate limit).
+ * One modem operation at a time per process (plus the cross-process lock).
+ *
+ * Reads: concurrent callers join the running read, and a caller within
+ * `reuseWindowMs` of the last read's finish gets that result instead of a
+ * fresh modem round (the plan's "one sweep per 5 s" rate limit).
+ *
+ * Clears: concurrent clears join the running (or queued) clear, same effect.
+ * A clear never joins a running READ (its result predates the delete): it
+ * queues behind the read and runs next. A read arriving while a clear is
+ * running or queued waits for it and then sweeps afresh. A clear drops the
+ * cached read (when requested and again when it starts), so nothing from
+ * before the delete is ever served again.
  */
 export class SmsReader {
-  private inflight: Promise<SmsSweep> | null = null;
+  private inflight: { op: SmsOp; p: Promise<SmsSweep> } | null = null;
   private last: SmsSweep | null = null;
 
   constructor(private readonly deps: SmsReaderDeps = {}) {}
 
   read(): Promise<SmsSweep> {
-    if (this.inflight) return this.inflight;
+    const cur = this.inflight;
+    if (cur?.op === "read") return cur.p;
+    // A clear is running or queued: wait for it, then sweep afresh.
+    if (cur) return cur.p.then(() => this.read());
     const now = this.deps.now ?? Date.now;
     const window = this.deps.reuseWindowMs ?? SMS_REUSE_WINDOW_MS;
     if (this.last && now() - this.last.finishedAt < window) return Promise.resolve(this.last);
-    this.inflight = this.runSweep().finally(() => {
-      this.inflight = null;
-    });
-    return this.inflight;
+    return this.track("read", this.runOp("read", (t) => this.sweepBody(t)));
   }
 
-  private async runSweep(): Promise<SmsSweep> {
+  /** Delete every stored message (SM, then ME), then sweep. Destructive. */
+  clear(): Promise<SmsSweep> {
+    const cur = this.inflight;
+    if (cur?.op === "clear") return cur.p;
+    this.last = null;
+    // Queued behind a running read, the clear becomes the in-flight tail at
+    // once, so a read requested meanwhile waits for it instead of joining
+    // the (pre-clear) read.
+    const run = (): Promise<SmsSweep> => {
+      this.last = null; // the read we waited for may have just cached itself
+      return this.runOp("clear", (t) => this.clearBody(t));
+    };
+    return this.track("clear", cur ? cur.p.then(run) : run());
+  }
+
+  private track(op: SmsOp, run: Promise<SmsSweep>): Promise<SmsSweep> {
+    const p: Promise<SmsSweep> = run.finally(() => {
+      if (this.inflight?.p === p) this.inflight = null;
+    });
+    this.inflight = { op, p };
+    return p;
+  }
+
+  private async sweepBody(t: AtTransport): Promise<OpResult> {
+    const r = await sweepTransport(t, { now: this.deps.now, ...this.deps.sweep });
+    return { status: "ok", error: null, ...r };
+  }
+
+  /**
+   * Delete, then sweep on the same transport and lock. Once a delete may have
+   * happened, every failure is `error` (contract §2: no_modem/no_sim/
+   * modem_busy mean nothing was deleted), and a failed delete wins over a
+   * clean sweep: the reply still carries the post-delete storage counts.
+   */
+  private async clearBody(t: AtTransport): Promise<OpResult> {
+    const { cleared, deleteError } = await clearTransport(t, this.deps.clear);
+    try {
+      const r = await sweepTransport(t, { now: this.deps.now, ...this.deps.sweep });
+      return { ...r, status: deleteError ? "error" : "ok", error: deleteError, cleared };
+    } catch (err) {
+      const why = err instanceof Error ? err.message.slice(0, 120) : "unknown";
+      return { status: "error", error: deleteError ?? `post-clear read failed: ${why}`, cleared };
+    }
+  }
+
+  private async runOp(op: SmsOp, body: (t: AtTransport) => Promise<OpResult>): Promise<SmsSweep> {
     const now = this.deps.now ?? Date.now;
     const start = now();
-    const finish = (
-      r: Partial<SmsSweep> & Pick<SmsSweep, "status" | "error">,
-    ): SmsSweep => {
+    const finish = (r: OpResult): SmsSweep => {
       const end = now();
       const sweep: SmsSweep = {
         storage: {},
         skipped: 0,
         partial: false,
         messages: [],
+        ...(op === "clear" ? { cleared: {} } : {}),
         ...r,
         finishedAt: end,
         durationMs: end - start,
       };
-      this.last = sweep;
+      // Only reads feed the reuse window; a clear's result is never replayed
+      // as the answer to a later read.
+      if (op === "read") this.last = sweep;
       return sweep;
     };
     const port = (this.deps.resolvePort ?? resolveSmsPort)();
@@ -527,8 +713,7 @@ export class SmsReader {
     let transport: AtTransport | null = null;
     try {
       transport = await (this.deps.openTransport ?? openSerialTransport)(port);
-      const r = await sweepTransport(transport, { now, ...this.deps.sweep });
-      return finish({ status: "ok", error: null, ...r });
+      return finish(await body(transport));
     } catch (err) {
       if (err instanceof SmsReadError) return finish({ status: err.status, error: err.message });
       if (err instanceof AtTimeoutError) return finish({ status: "error", error: err.message });
@@ -553,11 +738,15 @@ export function clampSmsLimit(v: unknown): number {
   return Math.min(SMS_LIMIT_MAX, Math.max(1, Math.trunc(v)));
 }
 
+export type SmsAction = "read" | "clear";
+
 export interface SmsResultPayload {
   v: 1;
   deviceId: string;
   requestId: string;
   ts: number;
+  /** device-sms-clear contract §2; absent means "read" for older agents. */
+  action: SmsAction;
   status: SmsReadStatus;
   error: string | null;
   durationMs: number;
@@ -566,6 +755,8 @@ export interface SmsResultPayload {
   skipped: number;
   partial: boolean;
   messages: SmsMessage[];
+  /** Clear only: messages present in each store before its delete. */
+  cleared?: Partial<Record<SmsStorage, number>>;
 }
 
 /**
@@ -577,10 +768,15 @@ export interface SmsResultPayload {
  */
 export const SMS_PAYLOAD_MAX_BYTES = 120 * 1024;
 
-export function buildSmsPayload(
-  sweep: SmsSweep,
-  req: { deviceId: string; requestId: string; limit: number },
-): SmsResultPayload {
+export interface SmsPayloadRequest {
+  deviceId: string;
+  requestId: string;
+  limit: number;
+  /** Default "read". */
+  action?: SmsAction;
+}
+
+export function buildSmsPayload(sweep: SmsSweep, req: SmsPayloadRequest): SmsResultPayload {
   const p = buildUncapped(sweep, req);
   let size = Buffer.byteLength(JSON.stringify(p));
   while (size > SMS_PAYLOAD_MAX_BYTES && p.messages.length > 0) {
@@ -591,16 +787,15 @@ export function buildSmsPayload(
   return p;
 }
 
-function buildUncapped(
-  sweep: SmsSweep,
-  req: { deviceId: string; requestId: string; limit: number },
-): SmsResultPayload {
+function buildUncapped(sweep: SmsSweep, req: SmsPayloadRequest): SmsResultPayload {
   const ok = sweep.status === "ok";
+  const action = req.action ?? "read";
   return {
     v: 1,
     deviceId: req.deviceId,
     requestId: req.requestId,
     ts: sweep.finishedAt,
+    action,
     status: sweep.status,
     error: ok ? null : sweep.error ?? sweep.status,
     durationMs: sweep.durationMs,
@@ -609,6 +804,7 @@ function buildUncapped(
     skipped: sweep.skipped,
     partial: sweep.partial,
     messages: ok ? sweep.messages.slice(0, clampSmsLimit(req.limit)) : [],
+    ...(action === "clear" ? { cleared: sweep.cleared ?? {} } : {}),
   };
 }
 
@@ -689,4 +885,47 @@ export function fixtureSmsSweep(now: number = Date.now()): SmsSweep {
     partial: false,
     messages,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Fixture inbox state for sim/replay (device-sms-clear)
+// ---------------------------------------------------------------------------
+
+/**
+ * Module-level: a `clear_sms` empties the fixture inbox for the rest of this
+ * process, so cloud E2E in sim/replay sees the same "clear, then empty list"
+ * flow as hardware. A restart (or `resetFixtureSmsInbox`) refills it.
+ */
+let fixtureInboxCleared = false;
+
+const FIXTURE_TOTALS = { SM: 40, ME: 23 } as const;
+
+function emptyFixture(now: number): SmsSweep {
+  return {
+    status: "ok",
+    error: null,
+    finishedAt: now,
+    durationMs: 0,
+    storage: { SM: { used: 0, total: FIXTURE_TOTALS.SM }, ME: { used: 0, total: FIXTURE_TOTALS.ME } },
+    skipped: 0,
+    partial: false,
+    messages: [],
+  };
+}
+
+/** What a read answers off hardware: the fixture inbox, or empty after a clear. */
+export function fixtureSmsRead(now: number = Date.now()): SmsSweep {
+  return fixtureInboxCleared ? emptyFixture(now) : fixtureSmsSweep(now);
+}
+
+/** A clear off hardware: reports the fixture's counts, then empties it. */
+export function fixtureSmsClear(now: number = Date.now()): SmsSweep {
+  const before = fixtureSmsRead(now).storage;
+  fixtureInboxCleared = true;
+  return { ...emptyFixture(now), cleared: { SM: before.SM?.used ?? 0, ME: before.ME?.used ?? 0 } };
+}
+
+/** Tests only: refill the fixture inbox. */
+export function resetFixtureSmsInbox(): void {
+  fixtureInboxCleared = false;
 }

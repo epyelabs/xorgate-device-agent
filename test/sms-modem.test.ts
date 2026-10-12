@@ -6,7 +6,11 @@ import {
   AtSession,
   buildSmsPayload,
   clampSmsLimit,
+  clearTransport,
+  fixtureSmsClear,
+  fixtureSmsRead,
   fixtureSmsSweep,
+  resetFixtureSmsInbox,
   parseCpmsQuery,
   resolveSmsPort,
   SmsReader,
@@ -37,6 +41,8 @@ interface FakeOpts {
   hang?: (cmd: string) => boolean;
   /** Called per command, e.g. to advance a fake clock. */
   onCommand?: (cmd: string) => void;
+  /** Answer `AT+CMGD=0,4` on this store with this final instead of deleting. */
+  cmgdError?: Partial<Record<SmsStorage, string>>;
 }
 
 /** A scripted SIM7600 on the far side of an AtTransport. */
@@ -45,6 +51,8 @@ class FakeModem implements AtTransport {
   cmgf: number;
   mem1: string;
   closed = false;
+  /** Store selected (mem1) at each `AT+CMGD`, in order. */
+  deletes: string[] = [];
   private cb: (line: string) => void = () => {};
   private readonly stores: NonNullable<FakeOpts["stores"]>;
 
@@ -95,6 +103,15 @@ class FakeModem implements AtTransport {
       const slot = this.stores[this.mem1 as SmsStorage]?.slots[Number(m[1])];
       if (slot) out.push(`+CMGRO: ${slot.stat},"",${slot.length}`, slot.pdu, "OK");
       else out.push("ERROR");
+    } else if (cmd === "AT+CMGD=0,4") {
+      this.deletes.push(this.mem1);
+      const err = this.o.cmgdError?.[this.mem1 as SmsStorage];
+      if (err) out.push(err);
+      else {
+        const st = this.stores[this.mem1 as SmsStorage];
+        if (st) st.slots = {};
+        out.push("OK");
+      }
     } else out.push("ERROR");
     queueMicrotask(() => {
       for (const l of out) this.cb(l);
@@ -271,6 +288,178 @@ describe("SmsReader", () => {
   });
 });
 
+describe("clearTransport", () => {
+  it("deletes SM then ME, reports what was there, and restores mem1 without touching CMGF", async () => {
+    const fake = new FakeModem({ stores: benchStores(), cmgf: 1, mem1: "SR" });
+    const r = await clearTransport(fake);
+    expect(r).toEqual({ cleared: { SM: 7, ME: 23 }, deleteError: null });
+    expect(fake.deletes).toEqual(["SM", "ME"]);
+    const writes = fake.log.filter((c) => /^AT\+(CPMS="|CMGD)/.test(c));
+    expect(writes).toEqual(['AT+CPMS="SM"', "AT+CMGD=0,4", 'AT+CPMS="ME"', "AT+CMGD=0,4", 'AT+CPMS="SR"']);
+    expect(fake.mem1).toBe("SR");
+    expect(fake.cmgf).toBe(1);
+    expect(fake.log.some((c) => c.startsWith("AT+CMGF="))).toBe(false);
+  });
+
+  it("restores mem1 when a delete fails, names the store, and still clears the other one", async () => {
+    const fake = new FakeModem({ stores: benchStores(), mem1: "ME", cmgdError: { SM: "+CMS ERROR: 500" } });
+    const r = await clearTransport(fake);
+    expect(r.deleteError).toBe("delete SM failed (+CMS ERROR: 500)");
+    expect(r.cleared).toEqual({ SM: 7, ME: 23 });
+    expect(fake.deletes).toEqual(["SM", "ME"]);
+    expect(fake.log.at(-1)).toBe('AT+CPMS="ME"');
+    expect(fake.mem1).toBe("ME");
+  });
+
+  it("stops after a delete that times out, and still restores mem1", async () => {
+    const fake = new FakeModem({ stores: benchStores(), hang: (c) => c === "AT+CMGD=0,4" });
+    const r = await clearTransport(fake, { commandTimeoutMs: 30, deleteTimeoutMs: 40 });
+    expect(r.deleteError).toBe("delete SM failed (timeout)");
+    expect(fake.log).not.toContain('AT+CPMS="ME"');
+    expect(fake.log.at(-1)).toBe('AT+CPMS="SR"');
+    expect(fake.mem1).toBe("SR");
+  });
+
+  it("skips an empty store (cleared 0, no CMGD), known from CPMS? or from the select", async () => {
+    // SM is mem1 and empty: known from CPMS?, never selected.
+    const a = new FakeModem({ stores: { SM: { total: 40, slots: {} }, ME: benchStores().ME }, mem1: "SM" });
+    expect(await clearTransport(a)).toEqual({ cleared: { SM: 0, ME: 23 }, deleteError: null });
+    expect(a.deletes).toEqual(["ME"]);
+    expect(a.log.filter((c) => c === 'AT+CPMS="SM"')).toEqual(['AT+CPMS="SM"']); // only the restore
+    // SM unknown from CPMS? (mem1 SR): selected, found empty, not deleted.
+    const b = new FakeModem({ stores: { SM: { total: 40, slots: {} }, ME: { total: 23, slots: {} } } });
+    expect(await clearTransport(b)).toEqual({ cleared: { SM: 0, ME: 0 }, deleteError: null });
+    expect(b.deletes).toEqual([]);
+    expect(b.mem1).toBe("SR");
+  });
+
+  it("throws the read statuses before anything is deleted", async () => {
+    const silent = new FakeModem({ silent: true });
+    await expect(clearTransport(silent, { commandTimeoutMs: 30 })).rejects.toMatchObject({ status: "modem_busy" });
+    const noSim = new FakeModem({ stores: benchStores(), cpmsError: "+CMS ERROR: 310" });
+    await expect(clearTransport(noSim)).rejects.toMatchObject({ status: "no_sim" });
+    expect(noSim.deletes).toEqual([]);
+  });
+});
+
+describe("SmsReader.clear", () => {
+  /** One modem whose stores persist across opens (each op opens the port anew). */
+  function bench(o: Omit<FakeOpts, "stores"> = {}) {
+    const stores = benchStores();
+    const opened: FakeModem[] = [];
+    let t = 1_000_000;
+    const reader = new SmsReader({
+      resolvePort: () => "/dev/fake",
+      openTransport: async () => {
+        const f = new FakeModem({ ...o, stores });
+        opened.push(f);
+        return f;
+      },
+      now: () => t,
+    });
+    return { reader, opened, tick: (ms: number) => (t += ms) };
+  }
+
+  it("clears, then sweeps on the same port: ok, cleared counts, empty post-clear storage", async () => {
+    const { reader, opened } = bench();
+    const sweep = await reader.clear();
+    expect(opened).toHaveLength(1);
+    expect(opened[0]!.closed).toBe(true);
+    expect(sweep).toMatchObject({ status: "ok", error: null, cleared: { SM: 7, ME: 23 }, messages: [] });
+    expect(sweep.storage).toEqual({ SM: { used: 0, total: 40 }, ME: { used: 0, total: 23 } });
+    const p = buildSmsPayload(sweep, { deviceId: "d", requestId: "r", limit: 10, action: "clear" });
+    expect(p).toMatchObject({ action: "clear", status: "ok", cleared: { SM: 7, ME: 23 }, total: 0, messages: [] });
+  });
+
+  it("reports error naming the store, with what was there and the state after", async () => {
+    const { reader } = bench({ cmgdError: { ME: "+CMS ERROR: 321" } });
+    const sweep = await reader.clear();
+    expect(sweep.status).toBe("error");
+    expect(sweep.error).toBe("delete ME failed (+CMS ERROR: 321)");
+    expect(sweep.cleared).toEqual({ SM: 7, ME: 23 });
+    expect(sweep.storage).toEqual({ SM: { used: 0, total: 40 }, ME: { used: 23, total: 23 } });
+    const p = buildSmsPayload(sweep, { deviceId: "d", requestId: "r", limit: 10, action: "clear" });
+    expect(p).toMatchObject({ status: "error", error: "delete ME failed (+CMS ERROR: 321)", total: 0, messages: [] });
+    expect(p.partial).toBe(false);
+  });
+
+  it("maps a no-SIM modem to no_sim with nothing deleted", async () => {
+    const { reader, opened } = bench({ cpmsError: "+CMS ERROR: 310" });
+    const sweep = await reader.clear();
+    expect(sweep).toMatchObject({ status: "no_sim", cleared: {} });
+    expect(opened[0]!.deletes).toEqual([]);
+  });
+
+  it("drops the cached read: a read right after a clear sweeps afresh", async () => {
+    const { reader, opened, tick } = bench();
+    const before = await reader.read();
+    expect(before.messages).toHaveLength(30);
+    tick(1000);
+    await reader.clear();
+    tick(1000); // still inside the 5 s window of `before`
+    const after = await reader.read();
+    expect(after).not.toBe(before);
+    expect(after.messages).toEqual([]);
+    expect(opened).toHaveLength(3);
+  });
+
+  it("never joins an in-flight read; a read during a clear waits and sweeps afresh", async () => {
+    const { reader, opened } = bench();
+    const read1 = reader.read();
+    const clear = reader.clear();
+    const clear2 = reader.clear(); // joins the clear, not the read
+    const read2 = reader.read(); // waits for the clear
+    const [r1, c, c2, r2] = await Promise.all([read1, clear, clear2, read2]);
+    expect(r1.messages).toHaveLength(30);
+    expect(c).toBe(c2);
+    expect(c.cleared).toEqual({ SM: 7, ME: 23 });
+    expect(r2).not.toBe(c);
+    expect(r2.cleared).toBeUndefined();
+    expect(r2.messages).toEqual([]);
+    expect(opened).toHaveLength(3); // read, clear, read
+    expect(opened.map((f) => f.deletes.length)).toEqual([0, 2, 0]);
+    // The reuse window now serves the post-clear read, never read1.
+    expect(await reader.read()).toBe(r2);
+  });
+
+  it("reports modem_busy when another process holds the lock, and opens nothing", async () => {
+    const home = tempHome();
+    try {
+      const lock = join(home, "sms.lock");
+      writeFileSync(lock, String(process.pid));
+      let opens = 0;
+      const r = await new SmsReader({
+        lockPath: lock,
+        resolvePort: () => "/dev/x",
+        openTransport: async () => {
+          opens++;
+          return new FakeModem({ stores: benchStores() });
+        },
+      }).clear();
+      expect(r.status).toBe("modem_busy");
+      expect(opens).toBe(0);
+    } finally {
+      cleanup(home);
+    }
+  });
+});
+
+describe("fixture inbox (sim/replay)", () => {
+  afterEach(() => resetFixtureSmsInbox());
+
+  it("a clear reports the fixture counts, then reads come back empty", () => {
+    expect(fixtureSmsRead(0).messages).toHaveLength(4);
+    const c = fixtureSmsClear(0);
+    expect(c).toMatchObject({ status: "ok", cleared: { SM: 3, ME: 2 }, messages: [] });
+    const r = fixtureSmsRead(0);
+    expect(r.messages).toEqual([]);
+    expect(r.storage).toEqual({ SM: { used: 0, total: 40 }, ME: { used: 0, total: 23 } });
+    expect(fixtureSmsClear(0).cleared).toEqual({ SM: 0, ME: 0 });
+    resetFixtureSmsInbox();
+    expect(fixtureSmsRead(0).messages).toHaveLength(4);
+  });
+});
+
 describe("acquireSmsLock", () => {
   let home: string;
   beforeEach(() => {
@@ -334,7 +523,8 @@ describe("buildSmsPayload", () => {
   it("cuts to the limit per request and reports the full total", () => {
     const sweep = fixtureSmsSweep(Date.UTC(2026, 9, 1));
     const p = buildSmsPayload(sweep, { deviceId: "d", requestId: "r", limit: 2 });
-    expect(p).toMatchObject({ v: 1, deviceId: "d", requestId: "r", status: "ok", error: null, total: 4, partial: false });
+    expect(p).toMatchObject({ v: 1, deviceId: "d", requestId: "r", action: "read", status: "ok", error: null, total: 4, partial: false });
+    expect(p).not.toHaveProperty("cleared");
     expect(p.messages).toHaveLength(2);
     expect(p.messages[0]!.unread).toBe(true);
     expect(buildSmsPayload(sweep, { deviceId: "d", requestId: "r", limit: 999 }).messages).toHaveLength(4);

@@ -22,20 +22,32 @@ Discovery stopped
 Device 10:21:3E:4F:33:65 OBDII
 Device AA:AA:AA:AA:AA:01 Living Room TV
 Device 00:1D:A5:68:98:8B V-LINK
+Device CC:CC:CC:CC:CC:01 Bonded But Absent
 """
 
 
 class ParseTranscriptTests(unittest.TestCase):
-    def test_named_devices_sorted_by_rssi_unnamed_dropped(self):
+    def test_named_devices_sorted_by_rssi_unnamed_and_unseen_dropped(self):
+        # AA:AA...:01 was never seen during discovery and only appears in the
+        # cached `devices` listing: not a candidate. Same for CC:CC...:01 (the
+        # bench's bonded-but-absent adapter case).
         out = parse_transcript(TRANSCRIPT)
         self.assertEqual(
             out,
             [
                 {"mac": "10:21:3E:4F:33:65", "name": "OBDII", "rssi": -55},
                 {"mac": "00:1D:A5:68:98:8B", "name": "V-LINK", "rssi": -71},
-                {"mac": "AA:AA:AA:AA:AA:01", "name": "Living Room TV", "rssi": None},
             ],
         )
+
+    def test_seen_via_chg_only_with_cached_name(self):
+        # A cached device that IS in range shows up as [CHG] lines only; its
+        # name comes from the `devices` listing.
+        text = ("[CHG] Device 10:21:3E:4F:33:65 RSSI: -60\n"
+                "[bluetooth]# devices\n"
+                "Device 10:21:3E:4F:33:65 OBDII\n")
+        self.assertEqual(parse_transcript(text),
+                         [{"mac": "10:21:3E:4F:33:65", "name": "OBDII", "rssi": -60}])
 
     def test_empty_and_garbage(self):
         self.assertEqual(parse_transcript(""), [])

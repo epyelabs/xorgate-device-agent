@@ -30,15 +30,24 @@ def _mac_like_name(mac, name):
 
 def parse_transcript(text):
     """Pure: bluetoothctl output -> [{mac, name, rssi}], unnamed dropped,
-    rssi None when never reported, sorted strongest first (None last)."""
+    rssi None when never reported, sorted strongest first (None last).
+
+    A candidate must have been SEEN during the discovery window (a `[NEW]` or
+    `[CHG] Device` line): the trailing `devices` listing also prints BlueZ's
+    cache, including a bonded adapter that is nowhere near (bench finding),
+    so that listing only ever supplies names."""
     names = {}
     rssi = {}
+    seen = set()
     for raw in text.splitlines():
         line = strip_ansi(raw).strip()
         m = _NEW.search(line)
         if m:
             mac, name = m.group(1).upper(), m.group(2).strip()
             names.setdefault(mac, name)
+            seen.add(mac)
+        elif line.startswith("[") and _MAC_IN_LINE.search(line) and "Device" in line:
+            seen.add(_MAC_IN_LINE.search(line).group(1).upper())
         m = _NAME.search(line)
         if m:
             names[m.group(1).upper()] = m.group(2).strip()
@@ -50,7 +59,7 @@ def parse_transcript(text):
             names.setdefault(m.group(1).upper(), m.group(2).strip())
     out = []
     for mac, name in names.items():
-        if _mac_like_name(mac, name):
+        if mac not in seen or _mac_like_name(mac, name):
             continue
         out.append({"mac": mac, "name": name[:64], "rssi": rssi.get(mac)})
     out.sort(key=lambda c: (c["rssi"] is None, -(c["rssi"] or 0), c["mac"]))

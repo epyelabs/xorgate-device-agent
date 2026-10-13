@@ -85,6 +85,9 @@ class Session:
         self._connect_fail_since = None
         self._backoff_n = 0
         self._ecu_backoff_n = 0
+        # True once the shutdown close has run: later signals are ignored
+        # (the agent SIGINTs us and systemd SIGTERMs the cgroup ~100 ms apart).
+        self.closed = False
         self.stop_requested = False
 
     # ---------------------------------------------------------- utilities
@@ -150,6 +153,7 @@ class Session:
                     self._after_voltage(exc)
         except Shutdown:
             self._close("shutdown")
+            self.closed = True
             self.status("stopped", 0, "signal")
             self.emit_audit()
             return 0

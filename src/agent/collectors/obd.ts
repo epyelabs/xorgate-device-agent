@@ -143,6 +143,20 @@ export function boundInventory(
   return Object.fromEntries(entries.slice(0, max));
 }
 
+/**
+ * Pure: does this status change warrant a fresh config report? The report's
+ * `effective.obd` is a snapshot read at publish time, so without a trigger
+ * the cloud would keep the boot-time `connecting / link 0` until the hourly
+ * heartbeat (WP3 bench finding). A link move (0/1/2) or a park/exit is the
+ * signal; the chatty connect/backoff cycle on a missing adapter is not.
+ */
+export function obdReportDue(prev: ObdStatus | null, next: ObdStatus | null): boolean {
+  if (!prev || !next) return prev !== next;
+  if (prev.link !== next.link) return true;
+  const terminal = (s: string): boolean => s === "parked" || s === "exited";
+  return terminal(prev.state) !== terminal(next.state);
+}
+
 /** Requests per second between two audit snapshots — pure, exported for tests. */
 export function requestRate(prev: AuditSnapshot | null, cur: AuditSnapshot | null): number | null {
   if (!cur || typeof cur.counters.requests !== "number") return null;

@@ -98,6 +98,18 @@ class EmulatorLifecycleTests(unittest.TestCase):
         self.assertEqual(kinds[-1], "close")
         self.assertEqual(kinds.count("io"), c["requests"])
 
+    def test_late_sigterm_during_shutdown_still_exits_zero(self):
+        # Bench finding (WP3): the agent SIGINTs the helper and systemd SIGTERMs
+        # the whole cgroup ~100 ms later; the late signal used to raise a second
+        # Shutdown while the final status line was being written (traceback, exit 1).
+        code, lines, err = self._run("taos-2022", 6.0,
+                                     stop_signal=[signal.SIGINT] + [signal.SIGTERM] * 30)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Traceback", err)
+        states = [l["state"] for l in _by_type(lines, "status")]
+        self.assertEqual(states[-1], "stopped")
+        self.assertEqual(lines[-1]["type"], "audit")
+
     def test_sigint_also_exits_zero_with_atz(self):
         code, lines, err = self._run("taos-2022", 6.0, stop_signal=signal.SIGINT,
                                      until=lambda ls: len(_by_type(ls, "sample")) >= 1)

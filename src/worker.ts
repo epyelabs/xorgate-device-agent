@@ -48,7 +48,7 @@ import { connect } from "./agent/mqtt.js";
 import { TelemetryScope, type ScopeChange } from "./agent/telemetry-scope.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector, type GroupSample } from "./agent/collectors/index.js";
-import type { ObdEffectiveReport } from "./agent/collectors/obd.js";
+import { obdReportDue, type ObdEffectiveReport } from "./agent/collectors/obd.js";
 import { createMediaCollector } from "./agent/collectors/media.js";
 import { loadManifest, persistUploadBucket } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
@@ -172,6 +172,8 @@ let cameraMountState: CameraMountState | null = null;
  * would be a temporal-dead-zone throw on the startup path.
  */
 let requestConfigReport: ((origin: "boot") => void) | null = null;
+/** Last OBD status seen by the publish tick (report-trigger edge detector). */
+let lastObdStatus: ObdStatus | null = null;
 
 async function reconcileCameraMountNow(): Promise<void> {
   if (config.mode !== "real") return;
@@ -1288,7 +1290,12 @@ client.on("connect", () => {
       store.setLatest(payload);
       // OBD collector health for `xorgate status` / the monitor (obd2 P1);
       // a snapshot read from the collector, never a spawn.
-      store.setObd(source.obdStatus?.() ?? null);
+      const obdNow = source.obdStatus?.() ?? null;
+      // A link move or a park/exit re-publishes the config report so the
+      // cloud's `effective.obd` follows the helper (debounced in ConfigSync).
+      if (obdReportDue(lastObdStatus, obdNow)) requestConfigReport?.("boot");
+      lastObdStatus = obdNow;
+      store.setObd(obdNow);
       // The backoff re-probe lives on this tick rather than its own timer: it
       // only ever matters while we are publishing, and this is the publish.
       const reprobe = telemetryScope.noteTick(ts);

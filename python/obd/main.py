@@ -35,6 +35,18 @@ def parse_args(argv):
     return ap.parse_args(argv)
 
 
+def make_signal_handler(session):
+    """SIGINT/SIGTERM -> Shutdown, except once the session has run its
+    shutdown close: the agent SIGINTs the helper and systemd then SIGTERMs
+    the whole cgroup ~100 ms later, and that late signal must not turn the
+    final status/audit lines into a traceback (bench finding, WP3)."""
+    def on_signal(signum, _frame):
+        if session.closed:
+            return
+        raise Shutdown(signum)
+    return on_signal
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.adapter:
@@ -59,9 +71,7 @@ def main(argv=None):
 
     session = Session(args, audit, emit)
 
-    def on_signal(signum, _frame):
-        raise Shutdown(signum)
-
+    on_signal = make_signal_handler(session)
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 

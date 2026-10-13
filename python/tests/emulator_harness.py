@@ -152,7 +152,13 @@ def run_helper(args, seconds, python=None, stop_signal=signal.SIGTERM, until=Non
             break
         time.sleep(0.1)
     if proc.poll() is None:
-        proc.send_signal(stop_signal)
+        signals = list(stop_signal) if isinstance(stop_signal, (list, tuple)) else [stop_signal]
+        for i, sig in enumerate(signals):
+            if i:
+                time.sleep(0.1)
+            if proc.poll() is not None:
+                break
+            proc.send_signal(sig)
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:

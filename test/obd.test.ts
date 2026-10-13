@@ -12,6 +12,7 @@ import {
   boundInventory,
   createObdCollector,
   MAX_INVENTORY_KEYS,
+  obdReportDue,
   requestRate,
   type ObdEventLevel,
 } from "../src/agent/collectors/obd.js";
@@ -571,5 +572,25 @@ describe("obdStatusLine", () => {
     expect(obdStatusLine({ ...base, state: "connecting", link: 0, reqPerSec: null, voltage: null })).toBe(
       "obd        connecting  link 0  — req/s  err 0  forbidden 0  — V",
     );
+  });
+});
+
+describe("obdReportDue (WP3: effective.obd follows the helper)", () => {
+  const st = (link: 0 | 1 | 2, state = "live"): ObdStatus =>
+    ({ state, link, reqPerSec: null, errors: 0, forbidden: 0, voltage: null, detail: null, since: 0, helperVersion: null }) as ObdStatus;
+  it("fires on a link move and when the collector appears/disappears, not on a same-link state churn", () => {
+    expect(obdReportDue(null, null)).toBe(false);
+    expect(obdReportDue(null, st(0, "connecting"))).toBe(true);
+    expect(obdReportDue(st(0, "connecting"), null)).toBe(true);
+    expect(obdReportDue(st(0, "connecting"), st(0, "adapter_not_found"))).toBe(false);
+    expect(obdReportDue(st(0, "adapter_not_found"), st(0, "backoff"))).toBe(false);
+    expect(obdReportDue(st(1, "probing"), st(2, "live"))).toBe(true);
+    expect(obdReportDue(st(2, "live"), st(1, "ecu_silent"))).toBe(true);
+  });
+  it("fires when the supervisor parks or gives up, and when it resumes", () => {
+    expect(obdReportDue(st(0, "retrying"), st(0, "parked"))).toBe(true);
+    expect(obdReportDue(st(0, "parked"), st(0, "parked"))).toBe(false);
+    expect(obdReportDue(st(0, "parked"), st(0, "starting"))).toBe(true);
+    expect(obdReportDue(st(0, "retrying"), st(0, "exited"))).toBe(true);
   });
 });

@@ -12,7 +12,7 @@
  * read it. This file must NOT import ink/React — keep the detached process lean.
  */
 import { loadConfig } from "./agent/config.js";
-import { applyCloudConfig, parseCloudMessage } from "./agent/cloud-config.js";
+import { applyCloudConfig, parseCloudMessage, type CloudConfig } from "./agent/cloud-config.js";
 import { ConfigSync, ensureConfigSyncBaseline } from "./agent/config-sync.js";
 import { reconcileCameraMount, type CameraMountState } from "./hardware/boot-config.js";
 import { migrateMediaEnabled } from "./daemon/settings-migrate.js";
@@ -895,13 +895,27 @@ function handleConfigMessage(payload: Buffer): void {
   // stops that. `rev` absent/0 means a pre-Phase-2 backend — apply
   // unconditionally, exactly as before.
   const shouldApply = configSync.shouldApply(parsed.rev);
+  // Upgrade exception (obd2 P3 bench finding): an already-applied document can
+  // carry a namespace the PREVIOUS build did not know and therefore never
+  // persisted. Adopt exactly those keys; everything else stays rev-guarded.
+  const adopt = shouldApply ? [] : configSync.unheldNamespaces(parsed);
   let applied = false;
   try {
-    if (shouldApply) {
-      const { changed } = applyCloudConfig(parsed);
+    if (shouldApply || adopt.length > 0) {
+      const subset = shouldApply
+        ? parsed
+        : (Object.fromEntries(
+            adopt.map((key) => [key, (parsed as unknown as Record<string, unknown>)[key]]),
+          ) as CloudConfig);
+      if (!shouldApply) {
+        console.log(
+          `[agent] cloud config rev ${parsed.rev} already applied, but it carries namespace(s) this build never held: ${adopt.join(", ")} — adopting`,
+        );
+      }
+      const { changed } = applyCloudConfig(subset);
       applied = true;
       if (changed) {
-        const summary = JSON.stringify(parsed);
+        const summary = JSON.stringify(subset);
         console.log(`[agent] cloud config applied: ${summary}`);
         store.event("info", `cloud config applied: ${summary}`, now);
         store.flush(now, true);

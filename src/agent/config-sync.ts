@@ -321,6 +321,32 @@ export function diffNamespaces(
 }
 
 /**
+ * Namespaces a desired document carries that this device has NEVER held:
+ * absent from settings.json AND absent from the sync baseline. Only an agent
+ * UPGRADE produces that combination: the previous build did not know the key,
+ * so its tolerant parser dropped it and it still stamped the rev as applied —
+ * after which the rev guard would skip the retained document forever (found
+ * live on the bench: the P1 agent had applied rev 51 of a document carrying
+ * `obd`, and the P3 build booted to `not_configured`). A namespace deleted
+ * locally never looks like this: the watcher reports it as a local change,
+ * the cloud folds the delete in, and the document stops carrying the key.
+ * Never fires before a baseline exists (a fresh install applies everything
+ * anyway). `null` (the cloud's revert marker) is not "carried".
+ */
+export function unheldNamespaces(
+  parsed: CloudConfig,
+  settings: AgentSettings,
+  baseline: Record<string, unknown> | undefined,
+): string[] {
+  if (!baseline) return [];
+  const doc = parsed as unknown as Record<string, unknown>;
+  const held = settings as unknown as Record<string, unknown>;
+  return CONFIG_NAMESPACE_KEYS.filter(
+    (key) => doc[key] !== undefined && doc[key] !== null && held[key] === undefined && baseline[key] === undefined,
+  );
+}
+
+/**
  * Give the sync file a namespace baseline if it has none, from settings.json as
  * it stands right now.
  *
@@ -1400,6 +1426,17 @@ export class ConfigSync {
   /** Should the worker apply a retained document carrying this `rev`? */
   shouldApply(rev: number | undefined): boolean {
     return shouldApplyRev(rev, this.state.lastAppliedRev);
+  }
+
+  /**
+   * The upgrade exception to the rev guard (see `unheldNamespaces`): the keys
+   * of an already-applied document this build understands but the device has
+   * never held. The worker applies exactly those, nothing else.
+   */
+  unheldNamespaces(parsed: CloudConfig): string[] {
+    const read = this.readSettings();
+    if (!read.ok) return [];
+    return unheldNamespaces(parsed, read.settings, this.state.namespaces);
   }
 
   /**

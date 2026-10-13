@@ -10,6 +10,7 @@ import {
   configSyncPath,
   diffNamespaces,
   ensureConfigSyncBaseline,
+  unheldNamespaces,
   loadConfigSyncState,
   namespacesOf,
   parseSimTelemetry,
@@ -1269,5 +1270,29 @@ describe("status.obd (obd2-bluetooth-integration P3)", () => {
       state: "applied",
       at: 7,
     });
+  });
+});
+
+describe("unheldNamespaces (the upgrade exception to the rev guard, obd2 P3)", () => {
+  const obd = { enabled: true, adapterMac: "10:21:3E:4F:33:65" };
+  it("names a namespace the document carries that neither settings.json nor the baseline hold", () => {
+    expect(unheldNamespaces({ rev: 51, obd, gnssAntBias: true }, { mode: "real", gnssAntBias: true }, { gnssAntBias: true })).toEqual(["obd"]);
+  });
+  it("is silent when the device holds it, when the baseline knew it (a local delete), when the doc clears it, or before a baseline exists", () => {
+    expect(unheldNamespaces({ rev: 51, obd }, { obd }, {})).toEqual([]);
+    expect(unheldNamespaces({ rev: 51, obd }, {}, { obd })).toEqual([]);
+    expect(unheldNamespaces({ rev: 51, obd: null }, {}, {})).toEqual([]);
+    expect(unheldNamespaces({ rev: 51, obd }, {}, undefined)).toEqual([]);
+    expect(unheldNamespaces({ rev: 51 }, {}, {})).toEqual([]);
+  });
+  it("ConfigSync.unheldNamespaces reads settings.json and the persisted baseline", () => {
+    saveSettings({ mode: "real" });
+    const sync = new ConfigSync({ deviceId: "d", topic: "t", publish: () => {}, statePath: join(home, "config-sync.json") });
+    expect(sync.unheldNamespaces({ rev: 51, obd })).toEqual([]); // no baseline yet
+    ensureConfigSyncBaseline(join(home, "config-sync.json"));
+    const sync2 = new ConfigSync({ deviceId: "d", topic: "t", publish: () => {}, statePath: join(home, "config-sync.json") });
+    expect(sync2.unheldNamespaces({ rev: 51, obd })).toEqual(["obd"]);
+    saveSettings({ mode: "real", obd });
+    expect(sync2.unheldNamespaces({ rev: 51, obd })).toEqual([]);
   });
 });

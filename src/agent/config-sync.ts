@@ -47,9 +47,11 @@ import { loadBuildInfo } from "../lib/build-info.js";
 import { runtimeHome } from "../daemon/runtime.js";
 import {
   loadSettings,
+  OBD_DEFAULTS,
   readSettingsFile,
   settingsPath,
   type AgentSettings,
+  type ObdSettings,
   type SettingsReadResult,
 } from "../daemon/settings.js";
 import {
@@ -148,6 +150,10 @@ export const CONFIG_APPLY_CLASSES: Readonly<Record<string, ApplyClass>> = {
   // `recording`. Only simulated devices are ever sent it; on real hardware it
   // is parsed, persisted and reported, and nothing acts on it.
   simulation: "agent-poll",
+  // Vehicle OBD-II adapter (obd2-bluetooth-integration P3): the OBD collector
+  // re-reads settings.json each tick and after every cloud message, and
+  // restarts its helper when the adapter/PIN/rate/fields/power source move.
+  obd: "agent-poll",
 };
 
 /** Namespace keys in publish order (matches the cloud registry's order). */
@@ -594,8 +600,11 @@ export interface ReportHints {
  *              (device-sms-inbox contract §3)
  *   sms.clear  the `clear_sms` command (delete all stored SMS, then sweep)
  *              (device-sms-clear contract §3)
+ *   obd.scan   the `obd_scan` command → `effective.obd.scan` (obd2 P3)
+ *   obd.forget the `obd_forget` command (obd2 P3). Both still need the
+ *              model's `peripherals.obd`; the cloud gates on that, not here.
  */
-export const AGENT_CAPABILITIES: readonly string[] = ["sms.read", "sms.clear"];
+export const AGENT_CAPABILITIES: readonly string[] = ["sms.read", "sms.clear", "obd.scan", "obd.forget"];
 
 export function buildEffective(
   settings: AgentSettings,
@@ -655,12 +664,15 @@ export function buildEffective(
   // reads for "what APN is this device actually on" (configured or not), and
   // its ABSENCE is how the cloud spots a device with no rollback net.
   if (modem.apn !== undefined) out.apn = modem.apn;
-  // `obd` (obd2-bluetooth-integration P1, plan 7.5) is reported-only like
-  // `sim`/`uplink`: the collector's state, link, the helper's vehicle profile
-  // and its audit counters/inventory/last stop. Present only on devices whose
-  // hardware block declares the peripheral; never a config namespace (P3 adds
-  // the `obd` settings namespace separately), so no `status` entry, no
-  // contract entry, no fold-back into `devices.config`.
+  // `obd` (obd2-bluetooth-integration P1 + P3, plan 7.5): the collector's
+  // report, which carries the `obd` namespace AS RESOLVED by the collector
+  // (defaults filled, env-seam values when settings.json holds nothing) plus
+  // the reported-only runtime half (state, link, vehicle profile, audit,
+  // scan candidates). Present only on devices whose hardware block declares
+  // the peripheral: a device holding the namespace with no collector reports
+  // nothing here and gets a `rejected` verdict (obdStatus). The local-edit
+  // fold-back reads settings.json, never this block, so the runtime half can
+  // never leak into `devices.config`.
   // RUST-PORT: config-report seam — same key, same shape (docs/PORTING-obd.md).
   if (obd) out.obd = obd;
   return out;
@@ -793,6 +805,7 @@ export function buildStatus(
   at: number,
   hints: ReportHints = {},
   cameraMount?: CameraMountState | null,
+  settings?: AgentSettings,
 ): Record<string, NamespaceStatus> {
   const out: Record<string, NamespaceStatus> = {};
   if (desired === null) return out;
@@ -809,8 +822,11 @@ export function buildStatus(
       // the device is back on defaults: that is the revert SUCCEEDING. Calling
       // it "rejected", as the all-invalid case below does, would put a red
       // badge on a change that worked exactly as asked.
+      // `effective.obd` is the collector's report and exists whether or not
+      // the namespace is held, so for obd "still holding" means settings.json.
+      const stillHeld = key === "obd" ? settings?.obd !== undefined : effective[key] !== undefined;
       out[key] =
-        effective[key] === undefined
+        !stillHeld
           ? { state: "applied", at }
           : {
               state: "adjusted",
@@ -851,6 +867,19 @@ export function buildStatus(
       // cannot express, and it is the state this namespace spends most of its
       // life in.
       out[key] = cameraMountStatus(cameraMount, at);
+      continue;
+    }
+
+    if (key === "obd") {
+      // The collector resolves the namespace itself (settings → helper argv),
+      // so the verdict compares what it RESOLVED against what the cloud asked
+      // for, and says so when the device cannot act on it at all.
+      out[key] = obdStatus(
+        parsed as ObdSettings,
+        settings?.obd,
+        (effective.obd as ObdEffectiveReport | undefined) ?? null,
+        at,
+      );
       continue;
     }
 
@@ -932,6 +961,77 @@ function cameraMountStatus(state: CameraMountState | null | undefined, at: numbe
     };
   }
   return { state: "applied", at };
+}
+
+/** The six `obd` namespace keys, as the report and the contract spell them. */
+const OBD_NAMESPACE_KEYS = Object.keys(OBD_DEFAULTS) as (keyof ObdSettings)[];
+
+/**
+ * The `obd` namespace's verdict (obd2-bluetooth-integration P3).
+ *
+ *  - no collector report          -> rejected: the hardware block declares no
+ *                                    `peripherals.obd`, nothing reads the key
+ *  - settings.json differs        -> adjusted (local edit / not held yet)
+ *  - collector not caught up      -> adjusted (it polls every second)
+ *  - otherwise                    -> applied, with a detail when the runtime
+ *                                    state says the setting is in force but
+ *                                    not yet doing anything useful (adapter
+ *                                    absent, forgotten, helper parked)
+ *
+ * Absent desired fields mean "device default" (the contract), so the
+ * comparison fills them in before looking at what the collector resolved.
+ */
+function obdStatus(
+  desired: ObdSettings,
+  held: ObdSettings | undefined,
+  report: ObdEffectiveReport | null,
+  at: number,
+): NamespaceStatus {
+  if (report === null) {
+    return {
+      state: "rejected",
+      at,
+      reason:
+        "obd: this device's hardware block declares no OBD peripheral (peripherals.obd) — " +
+        "the namespace is saved but nothing on the device reads it",
+    };
+  }
+  if (!deepEqual(held, desired)) {
+    return {
+      state: "adjusted",
+      at,
+      detail:
+        held === undefined
+          ? "saved, but the device is not holding this namespace yet"
+          : "the device is holding a different value (changed locally?)",
+    };
+  }
+  const want: Required<ObdSettings> = { ...OBD_DEFAULTS, ...desired };
+  const have: Partial<ObdSettings> = {};
+  for (const key of OBD_NAMESPACE_KEYS) (have as Record<string, unknown>)[key] = report[key];
+  if (!deepEqual(have, want)) {
+    return {
+      state: "adjusted",
+      at,
+      detail:
+        report.source === "env"
+          ? "saved; the OBD collector is still on the env seam (XORGATE_OBD_*) and picks the namespace up on its next tick"
+          : "saved; the OBD collector applies it on its next tick (about a second)",
+    };
+  }
+  let detail: string | undefined;
+  if (want.enabled && want.adapterMac !== null) {
+    if (report.status === "not_configured") {
+      detail = `in force, but the device forgot adapter ${want.adapterMac} (obd_forget) — clear or change the adapter to pair again`;
+    } else if (report.status === "adapter_not_found" || report.status === "backoff") {
+      detail = "in force, but the adapter is not reachable right now (unplugged, out of range or not powered)";
+    } else if (report.status === "parked") {
+      detail = "in force, but the helper is parked after repeated failures (see the device events)";
+    }
+  } else if (want.enabled) {
+    detail = "in force; no adapter configured, so nothing is polled (link 0)";
+  }
+  return detail ? { state: "applied", at, detail } : { state: "applied", at };
 }
 
 /**
@@ -1093,6 +1193,7 @@ export function buildConfigReport(input: ReportInput): ConfigReport {
       input.ts,
       input.hints,
       input.cameraMount,
+      input.settings,
     ),
   };
   // Only a local report carries `changed`; on any other origin the cloud is the

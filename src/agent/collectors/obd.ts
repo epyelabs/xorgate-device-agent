@@ -2,17 +2,23 @@ import type { Collector } from "./index.js";
 import type { StreamHandle } from "../../lib/exec.js";
 import type { MetricLeaf, ObdStatus } from "../telemetry.js";
 import {
-  isObdConfigured,
   OBD_EXIT,
-  readObdEnvConfig,
+  OBD_SCAN_SECONDS,
+  removeObdBond,
+  resolveObdConfig,
+  scanObdAdapters,
   streamObdData,
   type ObdAuditCounters,
-  type ObdHelperConfig,
   type ObdLink,
   type ObdMessage,
   type ObdProfile,
+  type ObdResolvedConfig,
+  type ObdScanCandidate,
+  type ObdScanner,
   type ObdSpawn,
+  type ObdUnbonder,
 } from "../../hardware/obd.js";
+import { loadSettings, type ObdSettings } from "../../daemon/settings.js";
 
 /**
  * OBD2 collector (obd2-bluetooth-integration P1, plan D4/D7) — supervises the
@@ -33,6 +39,19 @@ import {
  * than 5 s old, is a finite number, and is never null — a stale helper, a
  * silent ECU or an unsupported PID all mean "leaf absent", never "leaf null".
  *
+ * Settings (P3): the `obd` namespace in settings.json is the source of truth
+ * (`resolveObdConfig`, with the P1 env seam as fallback when the namespace is
+ * absent). It is re-read on every tick (`agent-poll`) and on `reapply()` after
+ * a cloud config message; a changed adapter/PIN/rate/fields/power source
+ * SIGINTs the helper and respawns it with the new argv, `enabled:false` or no
+ * adapter stops it and reports `disabled` / `not_configured` with link 0.
+ * Every one of those is an activity event once per transition, never per tick.
+ *
+ * Commands (P3): `scan()` runs a 25 s BlueZ discovery (never pairs) and parks
+ * the candidates in `effective.obd.scan`; `forget()` stops the helper, drops
+ * the bond and holds `not_configured` until the namespace changes (the
+ * console pairs the command with `PATCH {obd: null}`).
+ *
  * RUST-PORT: collector seam. The port's obd collector is this file's state
  * machine (docs/PORTING-obd.md, "State machine") over the same helper lines;
  * the supervision constants below are the contract, not an implementation
@@ -46,6 +65,10 @@ const MAX_QUICK_FAILURES = 3;
 const PARKED_RETRY_MS = 60_000; // 3 quick failures, or exit 6
 const PROTOCOL_PARK_MS = 600_000; // exit 4: the car's protocol will not change in a minute
 const SAMPLE_FRESH_MS = 5_000;
+/** settings.json is re-read at most this often from the tick path (reapply() forces it). */
+const SETTINGS_POLL_MS = 1_000;
+/** While the adapter stays absent, re-warn at most this often (WP3 nit: ~8 s of feed noise). */
+export const ADAPTER_ABSENT_REWARN_MS = 600_000;
 /** Bound on `effective.obd.audit.inventory` (the distinct-command table). */
 export const MAX_INVENTORY_KEYS = 200;
 
@@ -72,7 +95,8 @@ export const OBD_FIELD_UNITS: Readonly<Record<string, string>> = {
 
 /** Supervisor-side states, beyond the helper's own (hardware/obd.ts). */
 export type ObdCollectorState =
-  | "unconfigured"
+  | "disabled"
+  | "not_configured"
   | "starting"
   | "retrying"
   | "parked"
@@ -85,10 +109,27 @@ export type ObdCollectorState =
   | "backoff"
   | "adapter_not_found";
 
-/** `effective.obd` in the config report (contract 2). */
-export interface ObdEffectiveReport {
+/** Result of an `obd_scan`, as `effective.obd.scan` carries it. */
+export interface ObdScanResult {
+  /** Epoch ms the scan finished. */
+  ts: number;
+  candidates: ObdScanCandidate[];
+  /** Present when the scan helper failed (candidates then empty). */
+  error?: string;
+}
+
+/**
+ * `effective.obd` in the config report (contract 2 + P3). The six namespace
+ * fields are the `obd` settings AS THE COLLECTOR RESOLVED THEM (defaults
+ * filled; the env seam's values when `source` is "env"), which is what the
+ * cloud compares against its desired document (config-sync `obdStatus`);
+ * everything else is reported-only runtime state.
+ */
+export interface ObdEffectiveReport extends Required<ObdSettings> {
   status: ObdCollectorState;
   link: ObdLink;
+  /** Where the six namespace fields came from. */
+  source: "settings" | "env";
   adapter: { mac: string | null; serial?: string };
   profile?: ObdProfile;
   audit?: {
@@ -96,6 +137,7 @@ export interface ObdEffectiveReport {
     inventory: Record<string, number>;
     last_stop: { ts?: number; reason?: string } | null;
   };
+  scan?: ObdScanResult;
   helper_version?: string;
   allowlist_sha256?: string;
 }
@@ -105,8 +147,14 @@ export type ObdEventLevel = "info" | "warn" | "error";
 export interface ObdCollectorOptions {
   /** Environment to read XORGATE_OBD_* from (default process.env). */
   env?: NodeJS.ProcessEnv;
+  /** The `obd` settings namespace (default: settings.json's). Test seam. */
+  settings?: () => ObdSettings | undefined;
   /** Helper spawner (default: the real/mock stream in hardware/obd.ts). Test seam. */
   spawn?: ObdSpawn;
+  /** Bluetooth discovery (default: python/obd_scan.py). Test seam. */
+  scanner?: ObdScanner;
+  /** Bond removal (default: `bluetoothctl remove`). Test seam. */
+  unbond?: ObdUnbonder;
   /** Activity-event sink (the worker passes store.event). */
   onEvent?: (level: ObdEventLevel, msg: string) => void;
   /** Wall clock, ms (freshness + state timestamps). Test seam. */
@@ -122,6 +170,15 @@ export interface ObdCollector extends Collector {
   report(): ObdEffectiveReport;
   /** SIGINT the helper (it ATZs and closes) and cancel pending restarts. */
   stop(): void;
+  /** Re-read the settings namespace NOW (the worker calls it after a cloud config message). */
+  reapply(): void;
+  /** `obd_scan`: discover nearby adapters; the result lands in `report().scan`. Never pairs. */
+  scan(): Promise<ObdScanResult>;
+  /**
+   * `obd_forget`: stop the helper, drop the bond, forget the vehicle profile
+   * and last stop, and hold `not_configured` until the namespace changes.
+   */
+  forget(): Promise<{ mac: string | null }>;
 }
 
 interface AuditSnapshot {
@@ -157,6 +214,21 @@ export function obdReportDue(prev: ObdStatus | null, next: ObdStatus | null): bo
   return terminal(prev.state) !== terminal(next.state);
 }
 
+/** One line for `xorgate obd status`: protocol · responders · supported/total fields · powertrain. */
+export function profileSummary(profile: ObdProfile | null): string | null {
+  if (!profile) return null;
+  const supported = profile.supported_fields ?? [];
+  const total = supported.length + (profile.unsupported_fields ?? []).length;
+  const parts = [
+    profile.protocol?.dp ?? profile.protocol?.dpn ?? "protocol ?",
+    `ECUs ${(profile.responders ?? []).join(",") || "none"}`,
+    `${supported.length}/${total} fields`,
+    profile.powertrain ?? "unknown",
+  ];
+  if (profile.adapter?.ati) parts.push(profile.adapter.ati);
+  return parts.join(" · ");
+}
+
 /** Requests per second between two audit snapshots — pure, exported for tests. */
 export function requestRate(prev: AuditSnapshot | null, cur: AuditSnapshot | null): number | null {
   if (!cur || typeof cur.counters.requests !== "number") return null;
@@ -172,16 +244,26 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
   const now = opts.now ?? Date.now;
   const mono = opts.mono ?? (() => process.hrtime.bigint());
   const spawnHelper = opts.spawn ?? streamObdData;
-  const cfg: ObdHelperConfig = readObdEnvConfig(opts.env ?? process.env);
-  const configured = isObdConfigured(cfg);
+  const scanner = opts.scanner ?? scanObdAdapters;
+  const unbond = opts.unbond ?? removeObdBond;
+  const env = opts.env ?? process.env;
+  const readSettings = opts.settings ?? (() => loadSettings().obd);
 
   let started = false;
   let stopped = false;
-  let state: ObdCollectorState = configured ? "starting" : "unconfigured";
+  let state: ObdCollectorState = "starting";
   let since = now();
   let detail: string | null = null;
   let link: ObdLink = 0;
-  let warnedUnconfigured = false;
+
+  /** What settings (or the env seam) say we should be doing. */
+  let resolved: ObdResolvedConfig = resolveObdConfig(undefined, { XORGATE_OBD_SERIAL: "" });
+  let resolvedKey = "";
+  let settingsReadAt = -Infinity;
+  /** `obd_forget` latch: this MAC is treated as not configured until the namespace moves. */
+  let forgottenMac: string | null = null;
+  /** A reconfigure SIGINTed the helper; respawn as soon as it exits (no backoff). */
+  let restartPending = false;
 
   let handle: StreamHandle | null = null;
   let startedAt = 0;
@@ -199,6 +281,10 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
   let prevAudit: AuditSnapshot | null = null;
   /** Last `error` line (or stderr) from the current helper run, for the exit event. */
   let lastError: string | null = null;
+  /** Open "adapter absent" episode (dedup of the adapter_not_found event). */
+  let absent: { since: number; lastWarnAt: number } | null = null;
+  let scan: ObdScanResult | null = null;
+  let scanInFlight: Promise<ObdScanResult> | null = null;
 
   function event(level: ObdEventLevel, msg: string): void {
     (level === "info" ? console.log : level === "warn" ? console.warn : console.error)(`[obd] ${msg}`);
@@ -226,6 +312,87 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
     restartTimer = null;
   }
 
+  function describe(r: ObdResolvedConfig): string {
+    const h = r.helper;
+    return `${h.serial ? `serial ${h.serial}` : `adapter ${h.adapter}`}, ${h.pollHz} Hz, ${
+      h.fields ? h.fields.length + " fields" : "all fields"
+    }, ${h.powerSource} power, from ${r.source}`;
+  }
+
+  /** Go to an off state (disabled / not_configured), stopping the helper if it runs. */
+  function goOff(off: "disabled" | "not_configured", why: string, level: ObdEventLevel): void {
+    clearTimers();
+    restartPending = false;
+    sample = null;
+    absent = null;
+    const changed = setState(off, null);
+    setLink(0);
+    if (handle) handle.stop("SIGINT"); // onExit sees !resolved.run and stays off
+    if (changed) event(level, why);
+  }
+
+  /**
+   * Re-resolve the namespace (settings first, env fallback) and act on a
+   * change: stop, start, or restart the helper. The `forgottenMac` latch
+   * turns the adapter `obd_forget` removed into "not configured" until the
+   * operator (or the console's `PATCH {obd:null}`) changes the namespace.
+   *
+   * RUST-PORT: settings-apply seam (docs/PORTING-obd.md §6).
+   */
+  function applySettings(force: boolean): void {
+    if (stopped) return;
+    const t = now();
+    if (!force && t - settingsReadAt < SETTINGS_POLL_MS) return;
+    settingsReadAt = t;
+    let next: ObdResolvedConfig;
+    try {
+      next = resolveObdConfig(readSettings(), env);
+    } catch (err) {
+      console.warn(`[obd] settings read failed: ${(err as Error).message}`);
+      return;
+    }
+    if (forgottenMac !== null && next.helper.adapter !== forgottenMac) forgottenMac = null;
+    if (forgottenMac !== null && next.run && !next.helper.serial) {
+      next = { ...next, run: false, off: "not_configured" };
+    }
+    const key = JSON.stringify({ run: next.run, off: next.off, helper: next.helper });
+    const first = resolvedKey === "";
+    if (key === resolvedKey) return;
+    const wasRunning = resolved.run;
+    resolved = next;
+    resolvedKey = key;
+
+    if (!next.run) {
+      goOff(
+        next.off ?? "not_configured",
+        next.off === "disabled"
+          ? "disabled by settings (obd.enabled=false); helper stopped, link 0"
+          : forgottenMac !== null
+            ? `adapter ${forgottenMac} forgotten; waiting for new obd settings (link 0)`
+            : `adapter not configured (set obd.adapterMac or XORGATE_OBD_ADAPTER); link 0`,
+        next.off === "disabled" ? "info" : "warn",
+      );
+      return;
+    }
+    absent = null;
+    if (handle) {
+      // A live helper: SIGINT it (ATZ + close) and respawn with the new argv
+      // the moment it exits. No backoff — the operator asked for this.
+      restartPending = true;
+      clearTimers();
+      event("info", `settings changed (${describe(next)}); restarting helper`);
+      setState("starting", null);
+      handle.stop("SIGINT");
+      return;
+    }
+    clearTimers();
+    quickFailures = 0;
+    backoffMs = BASE_BACKOFF_MS;
+    if (!first || wasRunning) event("info", `starting helper (${describe(next)})`);
+    else console.log(`[obd] starting helper (${describe(next)})`);
+    spawn();
+  }
+
   function onMessage(msg: ObdMessage): void {
     switch (msg.type) {
       case "ready":
@@ -244,10 +411,33 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
         const d = msg.detail ? ` (${msg.detail})` : "";
         // Transitions that matter get an activity event; the chatty ones
         // (connecting/pairing/probing/backoff) stay in the log.
+        if (msg.state === "adapter_not_found") {
+          // Once per absence episode, then at most every 10 min: the helper
+          // cycles connect → adapter_not_found → backoff every few seconds
+          // while the dongle is unplugged, and each cycle is a transition.
+          const t = now();
+          if (!absent) {
+            absent = { since: t, lastWarnAt: t };
+            event("warn", `adapter not found${d}`);
+          } else if (t - absent.lastWarnAt >= ADAPTER_ABSENT_REWARN_MS) {
+            absent.lastWarnAt = t;
+            event("warn", `adapter still not found after ${Math.round((t - absent.since) / 60_000)} min${d}`);
+          } else {
+            console.log(`[obd] adapter_not_found${d}`);
+          }
+          return;
+        }
+        if (
+          absent &&
+          (msg.state === "pairing" || msg.state === "probing" || msg.state === "live" || msg.state === "ecu_silent")
+        ) {
+          const mins = Math.round((now() - absent.since) / 60_000);
+          absent = null;
+          event("info", `adapter found again after ${mins} min`);
+        }
         if (msg.state === "live") event("info", `live, ECU answering${d}`);
         else if (msg.state === "ecu_silent") event("info", `ECU silent, polling stopped${d}`);
         else if (msg.state === "stopped") event("warn", `helper stopped${d}`);
-        else if (msg.state === "adapter_not_found") event("warn", `adapter not found${d}`);
         else console.log(`[obd] ${msg.state}${d}`);
         return;
       }
@@ -286,11 +476,11 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
   }
 
   function spawn(): void {
-    if (stopped || !configured) return;
+    if (stopped || !resolved.run) return;
     lastError = null;
     startedAt = now();
-    setState(state === "parked" || state === "retrying" ? "connecting" : state);
-    handle = spawnHelper(cfg, {
+    setState("connecting", null);
+    handle = spawnHelper(resolved.helper, {
       onMessage,
       onStderr: (line) => {
         console.error(`[obd] python: ${line}`);
@@ -327,6 +517,20 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
     if (stopped) {
       setState("stopped", null);
       setLink(0);
+      return;
+    }
+    if (!resolved.run) {
+      // We asked it to stop (disabled / not configured / forgotten): stay off.
+      setState(resolved.off ?? "not_configured", null);
+      setLink(0);
+      return;
+    }
+    if (restartPending) {
+      // Reconfigure: fresh argv, fresh backoff, right now.
+      restartPending = false;
+      quickFailures = 0;
+      backoffMs = BASE_BACKOFF_MS;
+      spawn();
       return;
     }
     const ranMs = now() - startedAt;
@@ -380,21 +584,11 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
     }, delayMs);
   }
 
-  function start(): void {
+  /** Lazy start on the first read, then a settings poll on every read. */
+  function tick(): void {
+    const first = !started;
     started = true;
-    if (!configured) {
-      if (!warnedUnconfigured) {
-        warnedUnconfigured = true;
-        console.warn(
-          "[obd] adapter not configured (set XORGATE_OBD_ADAPTER=<MAC> or XORGATE_OBD_SERIAL=/dev/pts/N) — publishing obd.link=0",
-        );
-      }
-      return;
-    }
-    console.log(
-      `[obd] starting helper (${cfg.serial ? `serial ${cfg.serial}` : `adapter ${cfg.adapter}`}, ${cfg.pollHz} Hz, ${cfg.powerSource} power)`,
-    );
-    spawn();
+    applySettings(first);
   }
 
   function currentLink(): ObdLink {
@@ -426,14 +620,27 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
     return typeof v === "number" ? v : null;
   }
 
+  function reqPerSec(): number | null {
+    if (!handle) return null; // nothing is polling; the last run's rate is history, not status
+    const measured = requestRate(prevAudit, audit);
+    if (measured !== null) return measured;
+    // Seed from the probe's measured rate until two audit lines exist (WP3
+    // nit: the line read "—" for the first ~2 min of every session).
+    const seed = profile?.rate_req_s;
+    if (handle && typeof seed === "number" && Number.isFinite(seed) && seed >= 0) {
+      return Math.round(seed * 10) / 10;
+    }
+    return null;
+  }
+
   return {
     group: "obd",
     async read() {
-      if (!started) start();
+      tick();
       return mapLatest();
     },
     async sample() {
-      if (!started) start();
+      tick();
       return { fields: mapLatest(), updatedMono: changedMono };
     },
     status(): ObdStatus {
@@ -441,7 +648,7 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
       return {
         state,
         link: currentLink(),
-        reqPerSec: requestRate(prevAudit, audit),
+        reqPerSec: reqPerSec(),
         errors:
           (c.err_adapter ?? 0) + (c.err_protocol ?? 0) + (c.err_identity ?? 0) + (c.err_voltage ?? 0),
         forbidden: (c.forbidden_attempts ?? 0) + (c.budget_violations ?? 0),
@@ -449,14 +656,20 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
         detail,
         since,
         helperVersion,
+        adapter: resolved.helper.serial ?? resolved.helper.adapter,
+        profile: profileSummary(profile),
       };
     },
     // RUST-PORT: config-report seam — this object is `effective.obd` verbatim.
     report(): ObdEffectiveReport {
+      const h = resolved.helper;
       const out: ObdEffectiveReport = {
+        ...resolved.settings,
+        fields: [...resolved.settings.fields],
         status: state,
         link: currentLink(),
-        adapter: { mac: cfg.adapter, ...(cfg.serial ? { serial: cfg.serial } : {}) },
+        source: resolved.source,
+        adapter: { mac: h.adapter, ...(h.serial ? { serial: h.serial } : {}) },
       };
       if (profile) out.profile = profile;
       if (audit) {
@@ -466,9 +679,54 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
           last_stop: audit.last_stop,
         };
       }
+      if (scan) out.scan = scan;
       if (helperVersion) out.helper_version = helperVersion;
       if (allowlistSha) out.allowlist_sha256 = allowlistSha;
       return out;
+    },
+    reapply(): void {
+      if (!started) return; // the first read starts it anyway
+      applySettings(true);
+    },
+    scan(): Promise<ObdScanResult> {
+      if (scanInFlight) return scanInFlight; // a second request joins the running discovery
+      scanInFlight = (async () => {
+        event("info", `scanning for Bluetooth adapters (${OBD_SCAN_SECONDS} s, never pairs)`);
+        try {
+          const candidates = await scanner(OBD_SCAN_SECONDS);
+          scan = { ts: now(), candidates };
+          event("info", `scan done: ${candidates.length} named device(s)`);
+        } catch (err) {
+          const msg = (err as Error).message;
+          scan = { ts: now(), candidates: [], error: msg };
+          event("warn", `scan failed: ${msg}`);
+        } finally {
+          scanInFlight = null;
+        }
+        return scan;
+      })();
+      return scanInFlight;
+    },
+    async forget(): Promise<{ mac: string | null }> {
+      const mac = resolved.helper.adapter;
+      forgottenMac = mac;
+      profile = null;
+      if (audit) audit = { ...audit, last_stop: null };
+      resolved = { ...resolved, run: false, off: "not_configured" };
+      resolvedKey = JSON.stringify({ run: false, off: "not_configured", helper: resolved.helper });
+      goOff(
+        "not_configured",
+        mac ? `adapter ${mac} forgotten; helper stopped, bond removed, waiting for new obd settings` : "forget: no adapter was configured",
+        "info",
+      );
+      if (mac) {
+        try {
+          await unbond(mac);
+        } catch (err) {
+          event("warn", `forget: bond removal failed for ${mac}: ${(err as Error).message}`);
+        }
+      }
+      return { mac };
     },
     stop(): void {
       if (stopped) return;

@@ -326,6 +326,91 @@ export function parseSimulationSettings(v: unknown): SimulationSettings | undefi
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * Vehicle OBD-II adapter settings (obd2-bluetooth-integration, D3/D6, P3) —
+ * the `obd` namespace in settings.json. Which ELM327 Bluetooth adapter the
+ * device reads its vehicle through, and how. Delivered by the cloud only to
+ * devices whose model declares `peripherals.obd`; written locally by
+ * `xorgate set obd.*`. Applied LIVE by the OBD collector, which re-reads this
+ * file each tick (`agent-poll`) and restarts the helper when the adapter, PIN,
+ * poll rate, fields or power source change; `enabled: false` is the kill
+ * switch (helper stopped, `obd.link 0`). Every field is optional; defaults are
+ * `OBD_DEFAULTS` (pinned to the cloud contract by test/config-contract.test.ts).
+ * ABSENT namespace = the P1 env seam (`XORGATE_OBD_*`) still applies, for
+ * dev/offline boxes; see README "OBD peripheral".
+ *
+ * RUST-PORT: settings seam — same shape, same defaults, same tolerant parse.
+ */
+export interface ObdSettings {
+  /** Polling kill switch (default false). */
+  enabled?: boolean;
+  /** Adapter MAC `AA:BB:CC:DD:EE:FF`, stored uppercase; null = no adapter. */
+  adapterMac?: string | null;
+  /** Legacy pairing PIN, 4 to 6 digits (default "1234"). */
+  pin?: string;
+  /** Poll cycles per second, 0.2..2 (default 1). */
+  pollHz?: number;
+  /** Fields to poll; empty (default) = every field the model declares. */
+  fields?: string[];
+  /** Battery policy: ignition-switched 12 V (default) or constant/hardwired. */
+  powerSource?: ObdPowerSource;
+}
+
+export type ObdPowerSource = "switched" | "constant";
+
+/** Device defaults when the namespace (or a field) is absent — the cloud contract's. */
+export const OBD_DEFAULTS: Required<ObdSettings> = {
+  enabled: false,
+  adapterMac: null,
+  pin: "1234",
+  pollHz: 1,
+  fields: [],
+  powerSource: "switched",
+};
+
+/** Closed alphabets: both strings are interpolated into bluetoothctl input on the device. */
+export const OBD_MAC_RE = /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/;
+export const OBD_PIN_RE = /^[0-9]{4,6}$/;
+export const OBD_POLL_HZ_MIN = 0.2;
+export const OBD_POLL_HZ_MAX = 2;
+/** Field names are helper identifiers; unknown names are ignored by the helper with a log. */
+const OBD_FIELD_RE = /^[a-z_][a-z0-9_]*$/;
+
+/**
+ * Validate an untrusted `obd` value. Forgiving like its siblings on the
+ * numbers (`pollHz` is clamped) and STRICT on the two strings that reach
+ * bluetoothctl: a malformed MAC or PIN is DROPPED, never repaired — the
+ * collector then runs with the previous value (or the default), and the
+ * config report says `adjusted`. `adapterMac: null` is kept as null (an
+ * explicit "no adapter"). Returns undefined when nothing valid remains.
+ */
+export function parseObdSettings(v: unknown): ObdSettings | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const src = v as Record<string, unknown>;
+  const out: ObdSettings = {};
+  if (typeof src.enabled === "boolean") out.enabled = src.enabled;
+  if (src.adapterMac === null) out.adapterMac = null;
+  else if (typeof src.adapterMac === "string") {
+    const mac = src.adapterMac.trim().toUpperCase();
+    if (OBD_MAC_RE.test(mac)) out.adapterMac = mac;
+  }
+  if (typeof src.pin === "string" && OBD_PIN_RE.test(src.pin)) out.pin = src.pin;
+  if (typeof src.pollHz === "number" && Number.isFinite(src.pollHz)) {
+    out.pollHz = Math.min(OBD_POLL_HZ_MAX, Math.max(OBD_POLL_HZ_MIN, src.pollHz));
+  }
+  if (Array.isArray(src.fields)) {
+    const fields: string[] = [];
+    for (const f of src.fields) {
+      if (typeof f === "string" && OBD_FIELD_RE.test(f) && !fields.includes(f)) fields.push(f);
+    }
+    out.fields = fields;
+  }
+  if (src.powerSource === "switched" || src.powerSource === "constant") {
+    out.powerSource = src.powerSource;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface AgentSettings {
   mode?: RunMode;
   /*
@@ -389,6 +474,12 @@ export interface AgentSettings {
    * like every other namespace so loadSettings' allowlist rewrite keeps it.
    */
   simulation?: SimulationSettings;
+  /**
+   * Vehicle OBD-II adapter (see ObdSettings). Set from the web device settings
+   * page (retained MQTT config -> worker) or `xorgate set obd.*`; read LIVE by
+   * the OBD collector each tick. Absent = the P1 env seam / device defaults.
+   */
+  obd?: ObdSettings;
 }
 
 /** Clamp `rateHz` to what the collectors can produce (IMU caps at 20 Hz). */
@@ -633,6 +724,8 @@ function parseSettingsObject(obj: Record<string, unknown>): AgentSettings {
   if (cameraMount) out.cameraMount = cameraMount;
   const simulation = parseSimulationSettings((obj as { simulation?: unknown }).simulation);
   if (simulation) out.simulation = simulation;
+  const obd = parseObdSettings((obj as { obd?: unknown }).obd);
+  if (obd) out.obd = obd;
   return out;
 }
 

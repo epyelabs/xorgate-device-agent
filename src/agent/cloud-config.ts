@@ -14,6 +14,7 @@
  *     "recording": { telemetry, video, upload, retention },
  *     "lteRecovery": { gpsFixResetPolicy, deadZoneProfile },
  *     "timeSync": { offlineSources, stepThresholdSecs, maxStepsPerBoot },
+ *     "obd": { enabled, adapterMac, pin, pollHz, fields, powerSource },
  *     "ts": <epoch ms> }
  * Future cloud-configurable knobs slot in as additional keys.
  *
@@ -43,6 +44,7 @@ import {
   parseCameraMountSettings,
   parseCellularSettings,
   parseLteRecoverySettings,
+  parseObdSettings,
   parseRecordingSettings,
   parseSimulationSettings,
   parseTimeSyncSettings,
@@ -51,6 +53,7 @@ import {
   type CameraMountSettings,
   type CellularSettings,
   type LteRecoverySettings,
+  type ObdSettings,
   type RecordingSettings,
   type SimulationSettings,
   type TimeSyncSettings,
@@ -129,6 +132,16 @@ export interface CloudConfig {
    * received it would persist a key nothing reads.
    */
   simulation?: SimulationSettings | null;
+  /**
+   * Vehicle OBD-II adapter (obd2-bluetooth-integration P3). Same
+   * replace-whole-namespace semantics: null = carried but nothing valid →
+   * remove the local key (the collector falls back to the env seam / defaults,
+   * i.e. stops the helper); absent = never cloud-configured, leave local
+   * settings alone. The cloud only sends it to devices whose model declares
+   * `peripherals.obd`. The collector re-reads settings.json each tick, so a
+   * changed adapter restarts the helper with no agent restart.
+   */
+  obd?: ObdSettings | null;
   /**
    * Segment-upload S3 bucket (Phase 6.2 backfill for devices fielded before
    * Phase 2 provisioning). Persisted into kvs.json — NOT settings.json — by
@@ -264,6 +277,10 @@ function parseNamespaces(obj: Record<string, unknown>): CloudConfig {
   if (simulation && typeof simulation === "object" && !Array.isArray(simulation)) {
     out.simulation = parseSimulationSettings(simulation) ?? null;
   }
+  const obd = (obj as { obd?: unknown }).obd;
+  if (obd && typeof obd === "object" && !Array.isArray(obd)) {
+    out.obd = parseObdSettings(obd) ?? null;
+  }
   const hardware = (obj as { hardware?: unknown }).hardware;
   if (hardware && typeof hardware === "object" && !Array.isArray(hardware)) {
     out.hardware = parseHardwareBlock(hardware);
@@ -379,8 +396,19 @@ export function applyCloudConfig(
       simulationChange = target ? "set" : "clear";
     }
   }
+  // ... and for the obd namespace. Clearing removes the local key, which the
+  // collector reads as "defaults" (enabled false → helper stopped) unless the
+  // P1 env seam is set on a dev box.
+  let obdChange: "set" | "clear" | undefined;
+  if (config.obd !== undefined) {
+    const target = config.obd ?? undefined;
+    if (JSON.stringify(target) !== JSON.stringify(current.obd)) {
+      obdChange = target ? "set" : "clear";
+    }
+  }
   if (
     Object.keys(next).length === 0 &&
+    obdChange === undefined &&
     imuMountChange === undefined &&
     recordingChange === undefined &&
     lteRecoveryChange === undefined &&
@@ -406,6 +434,8 @@ export function applyCloudConfig(
   else if (cameraMountChange === "clear") delete merged.cameraMount;
   if (simulationChange === "set") merged.simulation = config.simulation as SimulationSettings;
   else if (simulationChange === "clear") delete merged.simulation;
+  if (obdChange === "set") merged.obd = config.obd as ObdSettings;
+  else if (obdChange === "clear") delete merged.obd;
   saveSettings(merged, path);
   return { changed: true };
 }

@@ -6,7 +6,7 @@
  *
  * Payload shape:
  *   { "v": 1, "requestId": <uuid>,
- *     "command": "reboot"|"power_off"|"refresh"|"update"|"read_sms"|"clear_sms",
+ *     "command": "reboot"|"power_off"|"refresh"|"update"|"read_sms"|"clear_sms"|"obd_scan"|"obd_forget",
  *     "ts": <epoch ms issued>, "expiresAt": <epoch ms>,
  *     "args"?: { "limit": 1..50 } }        // read_sms/clear_sms only; ignored elsewhere
  *
@@ -67,7 +67,24 @@ import { clampSmsLimit } from "../hardware/sms-modem.js";
  * cloud gates it to owner/admin; the ledger stops a QoS-1 redelivery from
  * clearing a second time (which would eat messages that arrived since).
  */
-export type DeviceCommandName = "reboot" | "power_off" | "refresh" | "update" | "read_sms" | "clear_sms";
+/**
+ * `obd_scan` / `obd_forget` (obd2-bluetooth-integration P3) are the OBD
+ * collector's two one-shots, in-process like `read_sms`: a scan runs a 25 s
+ * Bluetooth discovery (never pairs) and re-publishes the config report with
+ * `effective.obd.scan`; a forget stops the helper, drops the adapter's bond
+ * and reports `not_configured` (the console pairs it with `PATCH {obd:null}`).
+ * The cloud gates both on the model's `peripherals.obd` and rate-limits the
+ * scan (60 s); a device without the collector rejects them on the ack.
+ */
+export type DeviceCommandName =
+  | "reboot"
+  | "power_off"
+  | "refresh"
+  | "update"
+  | "read_sms"
+  | "clear_sms"
+  | "obd_scan"
+  | "obd_forget";
 
 const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>([
   "reboot",
@@ -76,6 +93,8 @@ const COMMANDS: ReadonlySet<string> = new Set<DeviceCommandName>([
   "update",
   "read_sms",
   "clear_sms",
+  "obd_scan",
+  "obd_forget",
 ]);
 
 /**
@@ -239,7 +258,13 @@ export function executeCommand(
   command: DeviceCommandName,
   runner: (cmd: string, args: string[]) => Promise<RunResult> = run,
 ): Promise<RunResult> {
-  if (command === "refresh" || command === "read_sms" || command === "clear_sms") {
+  if (
+    command === "refresh" ||
+    command === "read_sms" ||
+    command === "clear_sms" ||
+    command === "obd_scan" ||
+    command === "obd_forget"
+  ) {
     // Never reaches sudo: the worker handles refresh in-process. Guarded here
     // so a future caller cannot accidentally route it into systemctl.
     return Promise.resolve<RunResult>({

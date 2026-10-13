@@ -125,13 +125,64 @@ namespace, no `status` entry in the report.
 | dtc_count | 01 A & 0x7F | — |
 | link | — | 0 none, 1 adapter only, 2 ECU answering |
 
-## 5. Env (phase 1) and the `xorgate status` line
+## 5. Env (phase 1, now the fallback) and the `xorgate status` line
 
 `XORGATE_OBD_ADAPTER` (MAC, required unless serial), `XORGATE_OBD_SERIAL`
 (overrides), `XORGATE_OBD_PIN` (1234), `XORGATE_OBD_POLL_HZ` (1, max 20),
 `XORGATE_OBD_FIELDS` (csv), `XORGATE_OBD_POWER_SOURCE` (switched|constant).
-A malformed MAC counts as not configured.
+A malformed MAC counts as not configured. Since P3 these apply ONLY when
+settings.json holds no `obd` namespace (section 6); `XORGATE_OBD_SERIAL`
+still overrides the adapter in both cases.
 
 Status line, exact format (`test/obd.test.ts`, `obdStatusLine`):
-`obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V`; unknown
-rate/voltage print as `—`.
+`obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V  adapter 10:21:3E:4F:33:65`;
+unknown rate/voltage print as `—`, the `adapter` column is omitted when none is
+configured. req/s = Δrequests/Δts between the last two audit lines, seeded from
+`profile.rate_req_s` until two exist, null while no helper runs.
+
+## 6. The `obd` settings namespace and the commands (P3)
+
+Namespace (cloud contract `test/config-contract.json`, apply class `agent-poll`;
+parser `parseObdSettings` + `OBD_DEFAULTS` in `src/daemon/settings.ts`, marker
+`RUST-PORT: settings seam`): `{ enabled: false, adapterMac: null, pin: "1234",
+pollHz: 1 (clamp 0.2..2), fields: [] (= all), powerSource: "switched" }`, every
+field optional, replace-whole-namespace from the cloud (`src/agent/cloud-config.ts`),
+`null` clears it. Malformed MAC/PIN are DROPPED, never repaired (they reach
+bluetoothctl).
+
+Resolution (`resolveObdConfig` in `src/hardware/obd.ts`, marker `RUST-PORT:
+settings → helper-config seam`): namespace present → `run = enabled &&
+(adapterMac || serial)`, `off` = `disabled` | `not_configured`; absent → the env
+seam. The collector (`applySettings`, marker `RUST-PORT: settings-apply seam`)
+re-resolves every second and on `reapply()` (after a cloud message), and compares
+`{run, off, helper argv}`: unchanged → nothing; `run` false → SIGINT the helper,
+state `off`, link 0, sample dropped, one event; `run` true with a helper alive →
+SIGINT + respawn on exit with the new argv (no backoff; state `starting`); no
+helper → spawn now (pending retry/park timers cancelled). `forget()` latches the
+current MAC: the same MAC resolves to `not_configured` until the namespace moves.
+
+New collector states: `disabled`, `not_configured` (replaces `unconfigured`).
+Event dedup: `adapter_not_found` warns once per absence episode, then every
+`ADAPTER_ABSENT_REWARN_MS` (10 min); an episode closes on pairing/probing/live/
+ecu_silent (one "adapter found again" info) or on a reconfigure, not on a helper
+exit.
+
+`effective.obd` = `{ ...resolved namespace (6 keys), status, link, source:
+"settings"|"env", adapter:{mac[,serial]}, profile?, audit?, scan?: { ts,
+candidates: [{mac,name,rssi}], error? }, helper_version?, allowlist_sha256? }`.
+`status.obd` verdict (`obdStatus` in `src/agent/config-sync.ts`): no collector →
+rejected; settings.json ≠ desired → adjusted; resolved namespace ≠ desired
+(defaults filled) → adjusted ("next tick" / "env seam"); else applied, with a
+detail for adapter_not_found/backoff, parked, forgotten (`not_configured` with a
+MAC), or enabled without an adapter. The `{}` revert checks settings.json, not
+`effective.obd` (which always exists with a collector).
+
+Commands (`src/agent/commands.ts` names `obd_scan`, `obd_forget`; in-process in
+the worker, ack `accepted` then run, `rejected: no OBD peripheral` without the
+collector): scan = `python/obd_scan.py --seconds 25` → one JSON array line,
+normalized by `normalizeScanCandidates` (uppercase MAC, dedup, unnamed/MAC-named
+dropped, rssi desc with null last, cap 20) → `report().scan` → config report
+re-requested; concurrent scans join. forget = stop helper, `bluetoothctl remove
+<MAC>` ("not available" = success), profile and audit.last_stop cleared, event,
+report re-requested. Python: `python/obd/scan.py` (`parse_transcript` is pure,
+`python/tests/test_scan.py`).

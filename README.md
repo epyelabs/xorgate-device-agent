@@ -172,8 +172,9 @@ Other env: `XORGATE_HOME` (runtime dir, default `~/.xorgate`),
 `XORGATE_STOP_TIMEOUT_MS` (graceful-stop timeout before SIGKILL, default 5000),
 `XORGATE_PYTHON_DIR` (override the `python/` helper dir; defaults to the package root).
 
-OBD2 env (see the **OBD peripheral** section below): `XORGATE_OBD_ADAPTER`,
-`XORGATE_OBD_SERIAL`, `XORGATE_OBD_PIN`, `XORGATE_OBD_POLL_HZ`, `XORGATE_OBD_FIELDS`,
+OBD2 env (see the **OBD peripheral** section below): `XORGATE_OBD_SERIAL` (emulator
+override) and, only as a fallback when settings.json holds no `obd` namespace,
+`XORGATE_OBD_ADAPTER`, `XORGATE_OBD_PIN`, `XORGATE_OBD_POLL_HZ`, `XORGATE_OBD_FIELDS`,
 `XORGATE_OBD_POWER_SOURCE`.
 
 Media-runtime env (see the **Media runtime (KVS WebRTC)** section below):
@@ -363,23 +364,66 @@ under `$XORGATE_HOME/obd/audit/`; the collector only supervises it (2 s backoff,
 30 s cap, 3 quick failures park 60 s; exit 6 = helper software bug, parked with
 an `error` event; exit 4 = protocol refused, parked 10 min).
 
-Phase 1 takes the adapter from the agent's environment (`agent.env`; the cloud
-`obd` settings namespace is a later phase):
+The adapter is a per-vehicle **setting**: the `obd` namespace in settings.json
+(cloud contract `test/config-contract.json`, delivered on the retained config topic
+only to devices whose model declares `peripherals.obd`; local writer `xorgate set
+obd.*`). Fields and defaults: `enabled` false (the kill switch), `adapterMac` null
+(`AA:BB:CC:DD:EE:FF`, stored uppercase; never paired by name), `pin` `"1234"`,
+`pollHz` 1 (0.2..2), `fields` `[]` (= every declared field), `powerSource`
+`"switched"` (`constant` turns the battery policy on). Apply class `agent-poll`: the
+collector re-reads the file every second and after each cloud message; a changed
+adapter/PIN/rate/fields/power source SIGINTs the helper (ATZ, close) and respawns it
+with the new argv, `enabled: false` stops it (`status: disabled`, `link 0`), a null
+adapter reports `not_configured`. Each of those is one activity event per transition.
+The config report echoes the namespace as the collector resolved it under
+`effective.obd` (plus the runtime half below) and `status.obd` says
+applied / adjusted / rejected like every other namespace (rejected = the hardware
+block declares no OBD peripheral, so nothing reads the key).
+
+Precedence:
+
+1. settings.json `obd` present: it is the truth; `XORGATE_OBD_ADAPTER/_PIN/_POLL_HZ/
+   _FIELDS/_POWER_SOURCE` are ignored.
+2. `obd` absent (dev/offline box, or `PATCH {obd: null}`): the env seam below applies
+   exactly as in Phase 1 (`XORGATE_OBD_ADAPTER` set = run).
+3. `XORGATE_OBD_SERIAL=/dev/pts/N` (emulator) overrides the adapter in both cases
+   (the helper talks to the pty; `enabled: false` still stops it).
 
 | Env                        | Default    | Notes                                                                 |
 | -------------------------- | ---------- | --------------------------------------------------------------------- |
-| `XORGATE_OBD_ADAPTER`      | —          | Adapter MAC `AA:BB:CC:DD:EE:FF`. Unset = collector publishes `link 0` and logs "adapter not configured" once. |
 | `XORGATE_OBD_SERIAL`       | —          | Emulator pty (`/dev/pts/N`); overrides the adapter.                   |
-| `XORGATE_OBD_PIN`          | `1234`     | Legacy pairing PIN (SSP adapters ignore it).                          |
-| `XORGATE_OBD_POLL_HZ`      | `1`        | Poll cycle (hard cap 20 req/s inside the helper).                     |
-| `XORGATE_OBD_FIELDS`       | all        | CSV of field names to poll.                                           |
-| `XORGATE_OBD_POWER_SOURCE` | `switched` | `switched` (ignition-switched 12 V) or `constant` (battery policy on). |
+| `XORGATE_OBD_ADAPTER`      | —          | Fallback adapter MAC when the namespace is absent. Unset = `not_configured`, `link 0`. |
+| `XORGATE_OBD_PIN`          | `1234`     | Fallback legacy pairing PIN (SSP adapters ignore it).                 |
+| `XORGATE_OBD_POLL_HZ`      | `1`        | Fallback poll cycle (hard cap 20 req/s inside the helper).            |
+| `XORGATE_OBD_FIELDS`       | all        | Fallback CSV of field names to poll.                                  |
+| `XORGATE_OBD_POWER_SOURCE` | `switched` | Fallback `switched` (ignition-switched 12 V) or `constant`.           |
+
+Commands (`xorgate/devices/{id}/command`, acked on `.../command/response` like the
+others, TTL + replay ledger): `obd_scan` runs a 25 s BlueZ discovery via the stdlib
+`python/obd_scan.py` (never pairs; the Pi is forced non-pairable/non-discoverable
+before and after) and re-publishes the config report with `effective.obd.scan =
+{ ts, candidates: [{ mac, name, rssi }] }` (strongest first, unnamed BLE randoms
+dropped, max 20); `obd_forget` stops the helper, runs `bluetoothctl remove <MAC>`,
+clears the vehicle profile and the audit `last_stop`, and holds `not_configured`
+until the namespace changes (the console pairs it with `PATCH {obd: null}`; the
+latch is in memory, so an agent restart with the same namespace pairs again).
+A device without the peripheral acks both `rejected: no OBD peripheral`.
+
+CLI: `xorgate set obd.enabled on|off`, `obd.adapter <MAC>|none`, `obd.pin <digits>`,
+`obd.poll-hz <0.2-2>`, `obd.fields <csv|all>`, `obd.power-source switched|constant`
+(same precedence as the other `set` keys: the cloud's next retained delivery
+overwrites a local edit, and the local edit is reported back as a local change);
+`xorgate obd scan [--seconds N] [--json]` prints the candidate table; `xorgate obd
+status` prints the obd status line plus the last vehicle profile summary.
 
 Where it shows: `xorgate status` prints
-`obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V`; the monitor has
-an **OBD** module; the config report carries a reported-only `effective.obd`
-(state, link, adapter MAC, the helper's vehicle profile, audit counters, the
-distinct-command inventory capped at 200 keys, last stop, helper version and
+`obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V  adapter 10:21:3E:4F:33:65`
+(req/s is seeded from the probe's measured rate until two audit lines exist; the
+`adapter_not_found` event is raised once per absence, then at most every 10 min);
+the monitor has an **OBD** module; the config report's `effective.obd` carries the
+resolved namespace plus the runtime half (state, link, `source` settings|env,
+adapter, the helper's vehicle profile, audit counters, the distinct-command
+inventory capped at 200 keys, last stop, scan candidates, helper version and
 allowlist hash). `forbidden` must stay 0: a non-zero value is a software bug,
 not a vehicle problem.
 

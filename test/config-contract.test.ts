@@ -4,6 +4,8 @@ import { RECORDING_DEFAULTS } from "../src/recording/config.js";
 import { TIME_SYNC_DEFAULTS } from "../src/agent/clock-step.js";
 import { videoPresetNames, DEFAULT_VIDEO_PRESET } from "../src/recording/video-presets.js";
 import {
+  OBD_DEFAULTS,
+  parseObdSettings,
   parseRecordingSettings,
   parseSimulationSettings,
   parseTimeSyncSettings,
@@ -91,6 +93,7 @@ describe("config contract: the agent matches the cloud registry", () => {
       "gnssAntBias",
       "imuMount",
       "lteRecovery",
+      "obd",
       "recording",
       "simulation",
       "timeSync",
@@ -105,6 +108,26 @@ describe("config contract: the agent matches the cloud registry", () => {
     for (const v of [gap.minimum as number, gap.maximum as number]) {
       expect(parseSimulationSettings({ gapSeconds: v })).toEqual({ gapSeconds: v });
     }
+  });
+
+  it("obd: OBD_DEFAULTS match the published defaults, bounds survive the parser, MAC normalizes like the cloud", () => {
+    const obd = contract.namespaces.obd;
+    expect(obd.applyClass).toBe("agent-poll");
+    expect(OBD_DEFAULTS).toEqual(obd.defaults);
+    // The defaults round-trip (the cloud's "revert" value is one the device holds verbatim).
+    expect(parseObdSettings(obd.defaults)).toEqual(obd.defaults);
+    const hz = (obd.jsonSchema as JsonSchema).properties?.pollHz as JsonSchema;
+    for (const v of [hz.minimum as number, hz.maximum as number]) {
+      expect(parseObdSettings({ pollHz: v })).toEqual({ pollHz: v });
+    }
+    // The cloud stores the MAC uppercase; a lowercase one it accepts on the
+    // wire must still land as the same value here.
+    expect(parseObdSettings({ adapterMac: "10:21:3e:4f:33:65" })).toEqual({
+      adapterMac: "10:21:3E:4F:33:65",
+    });
+    expect(parseObdSettings({ adapterMac: null })).toEqual({ adapterMac: null });
+    const pin = (obd.jsonSchema as JsonSchema).properties?.pin as JsonSchema & { pattern?: string };
+    expect(pin.pattern).toBe("^[0-9]{4,6}$");
   });
 
   it("RECORDING_DEFAULTS match the published defaults", () => {

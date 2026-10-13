@@ -30,6 +30,16 @@ const msg = (over: Record<string, unknown> = {}): string =>
   });
 
 describe("parseCommand", () => {
+  it("parses obd_scan / obd_forget (P3) with no args", () => {
+    expect(parseCommand(msg({ command: "obd_scan" }))?.command).toBe("obd_scan");
+    expect(parseCommand(msg({ command: "obd_forget", args: { limit: 3 } }))).toEqual({
+      requestId: "req-1",
+      command: "obd_forget",
+      ts: T0,
+      expiresAt: T0 + 60_000,
+    });
+  });
+
   it("parses both v1 commands", () => {
     expect(parseCommand(Buffer.from(msg()))).toEqual({
       requestId: "req-1",
@@ -208,7 +218,7 @@ describe("executeCommand", () => {
       calls.push([cmd, args]);
       return okResult;
     };
-    for (const c of ["refresh", "read_sms", "clear_sms"] as const) {
+    for (const c of ["refresh", "read_sms", "clear_sms", "obd_scan", "obd_forget"] as const) {
       const res = await executeCommand(c, runner);
       expect(res.failed).toBe(true);
     }

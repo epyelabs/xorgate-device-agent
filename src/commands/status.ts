@@ -123,7 +123,8 @@ function print(st: DaemonStatus, now: number): void {
 
 /**
  * The `obd` status line (obd2 P1, plan 7.5), e.g.
- * `obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V`.
+ * `obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V  adapter 10:21:3E:4F:33:65`
+ * (the adapter suffix is omitted when none is configured, P3).
  * Pure and colorless so it is testable and greppable; the label column
  * matches the other rows (`telemetry  …`).
  * RUST-PORT: status-line seam — same columns, same order.
@@ -131,5 +132,6 @@ function print(st: DaemonStatus, now: number): void {
 export function obdStatusLine(obd: ObdStatus): string {
   const rate = obd.reqPerSec === null ? "— req/s" : `${obd.reqPerSec.toFixed(1)} req/s`;
   const volts = obd.voltage === null ? "— V" : `${obd.voltage.toFixed(1)} V`;
-  return `obd        ${obd.state}  link ${obd.link}  ${rate}  err ${obd.errors}  forbidden ${obd.forbidden}  ${volts}`;
+  const adapter = obd.adapter ? `  adapter ${obd.adapter}` : "";
+  return `obd        ${obd.state}  link ${obd.link}  ${rate}  err ${obd.errors}  forbidden ${obd.forbidden}  ${volts}${adapter}`;
 }

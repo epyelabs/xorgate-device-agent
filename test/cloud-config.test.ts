@@ -321,3 +321,31 @@ describe("simulation namespace (device-simulator Phase 2)", () => {
     expect(loadSettings().mode).toBe("replay");
   });
 });
+
+describe("obd namespace (obd2-bluetooth-integration P3)", () => {
+  const MSG = (obd: unknown) => JSON.stringify({ v: 1, rev: 51, obd });
+
+  it("parses the namespace normalized like local settings; all-invalid → null; wrong type → ignored", () => {
+    expect(parseCloudConfig(MSG({ enabled: true, adapterMac: "10:21:3e:4f:33:65", powerSource: "switched" }))).toEqual({
+      rev: 51,
+      obd: { enabled: true, adapterMac: "10:21:3E:4F:33:65", powerSource: "switched" },
+    });
+    expect(parseCloudConfig(MSG({}))).toEqual({ rev: 51, obd: null });
+    expect(parseCloudConfig(MSG({ pin: "x" }))).toEqual({ rev: 51, obd: null });
+    expect(parseCloudConfig(MSG("10:21:3E:4F:33:65"))).toEqual({ rev: 51 });
+    expect(parseCloudConfig(MSG([1]))).toEqual({ rev: 51 });
+  });
+
+  it("replaces the whole namespace, no-ops on an identical redelivery, clears on null, leaves alone when absent", () => {
+    saveSettings({ mode: "real", obd: { enabled: false, adapterMac: null, pollHz: 2 } });
+    const cloud = { enabled: true, adapterMac: "10:21:3E:4F:33:65", powerSource: "switched" as const };
+    expect(applyCloudConfig({ obd: cloud })).toEqual({ changed: true });
+    expect(loadSettings()).toEqual({ mode: "real", obd: cloud }); // pollHz 2 did NOT survive: replace, not merge
+    expect(applyCloudConfig({ obd: { ...cloud } })).toEqual({ changed: false });
+    expect(applyCloudConfig({ gnssAntBias: true })).toEqual({ changed: true });
+    expect(loadSettings().obd).toEqual(cloud);
+    expect(applyCloudConfig({ obd: null })).toEqual({ changed: true });
+    expect(loadSettings()).toEqual({ mode: "real", gnssAntBias: true });
+    expect(applyCloudConfig({ obd: null })).toEqual({ changed: false });
+  });
+});

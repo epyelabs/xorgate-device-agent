@@ -54,6 +54,15 @@
  *   timeSync.offlineSources <on|off>       timeSync.stepThresholdSecs <2-600>
  *   timeSync.maxStepsPerBoot <1-20>
  *
+ * `obd.*` keys (obd2-bluetooth-integration P3) are read live by the OBD
+ * collector each tick (~1 s; no restart). Cloud-delivered `obd` config
+ * overwrites local edits on the next retained delivery, and a local edit is
+ * reported back to the cloud as a local change like every other namespace:
+ *   obd.enabled <on|off>            obd.adapter <AA:BB:CC:DD:EE:FF|none>
+ *   obd.pin <4-6 digits>            obd.poll-hz <0.2-2>
+ *   obd.fields <csv|all>            obd.power-source <switched|constant>
+ * (`xorgate obd scan` lists candidate MACs; nothing here ever pairs by name.)
+ *
  * `cameraMount.<streamKey>.rotationDeg <0|180>` (cam-sensor-level-rotate plan)
  * is the odd one out: the worker's reconciler picks it up within a minute and
  * edits the `rotation` parameter on that camera's `dtoverlay=` line in
@@ -63,7 +72,10 @@
 import {
   APN_RE,
   loadSettings,
+  OBD_POLL_HZ_MAX,
+  OBD_POLL_HZ_MIN,
   parseCameraMountSettings,
+  parseObdSettings,
   parseRecordingSettings,
   parseTimeSyncSettings,
   saveSettings,
@@ -73,6 +85,7 @@ import {
   STREAM_KEY_RE,
   type AgentSettings,
   type CameraRotationDeg,
+  type ObdSettings,
   type RecordingSettings,
   type TimeSyncSettings,
 } from "../daemon/settings.js";
@@ -92,7 +105,7 @@ import {
 } from "../hardware/network.js";
 
 const USAGE =
-  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, apn <value|\"\"> [--no-wait], wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>, cameraMount.<streamKey>.rotationDeg <0|180>)";
+  "usage: xorgate set <key> <value>   (supported: mode <sim|real>, gps-antenna <active|passive>, gps-fix-reset-policy <defer|veto-deadzone>, deadzone-profile <conservative|balanced|aggressive>, apn <value|\"\"> [--no-wait], wifi <on|off> [--force], recording.<group>.<field> <value>, timeSync.<field> <value>, cameraMount.<streamKey>.rotationDeg <0|180>, obd.<enabled|adapter|pin|poll-hz|fields|power-source> <value>)";
 
 /** Parse an on/off/true/false/1/0 CLI value; undefined when unrecognizable. */
 function parseBoolValue(v: string | undefined): boolean | undefined {
@@ -364,6 +377,88 @@ function setTimeSyncCommand(key: string, value: string | undefined): void {
   console.log("  the agent's clock stepper reads it live within ~30 s (no restart needed)");
 }
 
+/** The CLI spelling of each `obd` namespace field (plan D3: `xorgate set obd.adapter <MAC>`). */
+const OBD_CLI_KEYS: Readonly<Record<string, keyof ObdSettings>> = {
+  enabled: "enabled",
+  adapter: "adapterMac",
+  adapterMac: "adapterMac",
+  pin: "pin",
+  "poll-hz": "pollHz",
+  pollHz: "pollHz",
+  fields: "fields",
+  "power-source": "powerSource",
+  powerSource: "powerSource",
+};
+
+/**
+ * `xorgate set obd.<field> <value>` — validate one field through the SAME
+ * parser loadSettings uses (so the CLI can never persist what the collector
+ * would drop), merge it into the persisted `obd` namespace, and let the
+ * collector's 1 s settings poll apply it (restarting the helper when the
+ * adapter/PIN/rate/fields/power source moved). Exported for tests.
+ */
+export function setObdCommand(key: string, value: string | undefined): void {
+  const parts = key.split(".");
+  const field = parts.length === 2 ? OBD_CLI_KEYS[parts[1] ?? ""] : undefined;
+  if (!field) {
+    console.error(
+      `unknown obd setting '${key}' (supported: obd.enabled, obd.adapter, obd.pin, obd.poll-hz, obd.fields, obd.power-source)`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  let raw: unknown;
+  if (field === "enabled") {
+    const bool = parseBoolValue(value);
+    if (bool === undefined) {
+      console.error(`${key} must be on|off, got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    raw = bool;
+  } else if (field === "adapterMac") {
+    if (value === undefined || value === "" || value === "none" || value === "null") raw = null;
+    else raw = value;
+  } else if (field === "pollHz") {
+    const num = value !== undefined && value !== "" ? Number(value) : NaN;
+    if (!Number.isFinite(num) || num < OBD_POLL_HZ_MIN || num > OBD_POLL_HZ_MAX) {
+      console.error(`${key} must be a number in [${OBD_POLL_HZ_MIN}, ${OBD_POLL_HZ_MAX}], got '${value ?? ""}'`);
+      process.exitCode = 1;
+      return;
+    }
+    raw = num;
+  } else if (field === "fields") {
+    raw = value === undefined || value === "" || value === "all" ? [] : value.split(",").map((f) => f.trim());
+  } else {
+    raw = value; // pin, powerSource: validated by the parser below
+  }
+  const patch = parseObdSettings({ [field]: raw });
+  if (patch === undefined || !(field in patch)) {
+    const hint =
+      field === "adapterMac"
+        ? " (expected AA:BB:CC:DD:EE:FF or none)"
+        : field === "pin"
+          ? " (expected 4 to 6 digits)"
+          : field === "powerSource"
+            ? " (expected switched|constant)"
+            : field === "fields"
+              ? " (expected a csv of field names, or all)"
+              : "";
+    console.error(`invalid obd setting '${key}' = '${value ?? ""}'${hint}`);
+    process.exitCode = 1;
+    return;
+  }
+  const settings: AgentSettings = { ...loadSettings() };
+  settings.obd = { ...settings.obd, ...patch };
+  saveSettings(settings);
+  const shown = JSON.stringify((patch as Record<string, unknown>)[field]);
+  console.log(`✓ ${key} = ${shown} (persisted to settings.json)`);
+  console.log("  the agent's OBD collector reads it live within ~1 s (no restart needed; the helper restarts itself when the adapter changes)");
+  if (field === "adapterMac" && patch.adapterMac && settings.obd.enabled !== true) {
+    console.log("  note: obd.enabled is off — nothing is polled until: xorgate set obd.enabled on");
+  }
+}
+
 /**
  * Say once that `sudo` is not needed here (settings-sync-hardening plan, phase
  * 1, Q1 → "warn and continue").
@@ -427,6 +522,12 @@ export async function setCommand(rest: string[]): Promise<void> {
   // no restart, but a reboot before the picture changes.
   if (key.startsWith("cameraMount.")) {
     setCameraMountCommand(key, value);
+    return;
+  }
+
+  // obd keys are read live by the OBD collector's settings poll — no restart.
+  if (key.startsWith("obd.")) {
+    setObdCommand(key, value);
     return;
   }
 
@@ -498,7 +599,7 @@ export async function setCommand(rest: string[]): Promise<void> {
     return;
   } else {
     console.error(
-      `unknown setting '${key}' (supported: mode, gps-antenna, gps-fix-reset-policy, deadzone-profile, apn, wifi, recording.*, timeSync.*, cameraMount.*)`,
+      `unknown setting '${key}' (supported: mode, gps-antenna, gps-fix-reset-policy, deadzone-profile, apn, wifi, recording.*, timeSync.*, cameraMount.*, obd.*)`,
     );
     process.exitCode = 1;
     return;

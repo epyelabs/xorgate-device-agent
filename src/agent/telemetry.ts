@@ -150,7 +150,7 @@ export interface ObdStatus {
   /**
    * Collector state: the helper's own states (connecting, pairing, probing,
    * live, ecu_silent, backoff, stopped, adapter_not_found) plus the
-   * supervisor's (unconfigured, starting, retrying, parked, exited).
+   * supervisor's (disabled, not_configured, starting, retrying, parked).
    */
   state: string;
   /** 0 no adapter, 1 adapter only, 2 ECU answering. */
@@ -169,6 +169,10 @@ export interface ObdStatus {
   since: number;
   /** Helper build, from its `ready` line. */
   helperVersion: string | null;
+  /** Configured adapter MAC (or the emulator pty), null when none (P3). */
+  adapter?: string | null;
+  /** One-line summary of the last vehicle profile the helper reported (P3), null before a probe. */
+  profile?: string | null;
 }
 
 /** One KVS WebRTC master the media runtime supervises (one per signaling channel). */

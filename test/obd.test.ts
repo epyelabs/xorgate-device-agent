@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildObdHelperArgs,
   isObdConfigured,
+  normalizeScanCandidates,
   parseObdLine,
   readObdEnvConfig,
+  resolveObdConfig,
   type ObdHelperConfig,
   type ObdSpawn,
   type ObdStreamHandlers,
@@ -17,6 +19,7 @@ import {
   type ObdEventLevel,
 } from "../src/agent/collectors/obd.js";
 import { createCollector } from "../src/agent/collectors/index.js";
+import { OBD_DEFAULTS, type ObdSettings } from "../src/daemon/settings.js";
 import { createSimulator } from "../src/agent/simulator.js";
 import { obdStatusLine } from "../src/commands/status.js";
 import type { RunResult } from "../src/lib/exec.js";
@@ -209,20 +212,29 @@ describe("createObdCollector", () => {
     vi.restoreAllMocks();
   });
 
-  it("without an adapter configured: link 0 only, no helper, warned once", async () => {
+  it("without an adapter configured (no namespace, no env): link 0 only, no helper, warned once", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: {}, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: {}, settings: () => undefined, spawn: h.spawn, onEvent });
     expect(await c.read()).toEqual({ link: { value: 0 } });
+    vi.advanceTimersByTime(5_000);
     expect(await c.read()).toEqual({ link: { value: 0 } });
     expect(h.runs).toHaveLength(0);
-    expect(c.status().state).toBe("unconfigured");
-    expect(console.warn).toHaveBeenCalledTimes(1);
-    expect(c.report()).toEqual({ status: "unconfigured", link: 0, adapter: { mac: null } });
+    expect(c.status().state).toBe("not_configured");
+    expect(c.status().adapter).toBeNull();
+    // One activity event for the transition, not one per tick.
+    expect(events).toEqual([{ level: "warn", msg: expect.stringContaining("adapter not configured") }]);
+    expect(c.report()).toEqual({
+      ...OBD_DEFAULTS,
+      status: "not_configured",
+      link: 0,
+      source: "env",
+      adapter: { mac: null },
+    });
   });
 
   it("maps a fresh sample to numeric leaves with units, link always present", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     expect(await c.read()).toEqual({ link: { value: 0 } }); // lazy start, nothing yet
     expect(h.runs).toHaveLength(1);
     expect(h.runs[0]!.cfg.adapter).toBe("AA:BB:CC:DD:EE:FF");
@@ -257,7 +269,7 @@ describe("createObdCollector", () => {
 
   it("drops a stale sample (>= 5 s) but keeps link", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed(LINES.statusLive);
     h.feed(LINES.sample);
@@ -273,7 +285,7 @@ describe("createObdCollector", () => {
   it("sample() carries a freshness stamp that advances on new data only", async () => {
     const h = fakeHelper();
     let mono = 1n;
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent, mono: () => mono++ });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent, mono: () => mono++ });
     await c.read();
     h.feed(LINES.statusLive);
     h.feed(LINES.sample);
@@ -288,7 +300,7 @@ describe("createObdCollector", () => {
 
   it("emits activity events on the transitions that matter only", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed('{"type":"status","state":"connecting","link":0}');
     h.feed('{"type":"status","state":"pairing","link":0}');
@@ -310,7 +322,7 @@ describe("createObdCollector", () => {
 
   it("exit 6 (software bug): parks 60 s with an error event, then respawns", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed(LINES.statusLive);
     h.feed(LINES.sample);
@@ -332,7 +344,7 @@ describe("createObdCollector", () => {
 
   it("exit 4 (protocol refused): parks 10 min", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed('{"type":"error","code":4,"error":"ATDPN A1 is not ISO 15765-4"}');
     h.runs[0]!.exit(4);
@@ -348,7 +360,7 @@ describe("createObdCollector", () => {
 
   it("media-style backoff: 2 s, 4 s, then the third quick failure parks for 60 s", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.runs[0]!.exit(2);
     await settle();
@@ -375,7 +387,7 @@ describe("createObdCollector", () => {
 
   it("a helper that ran >= 15 s then exited restarts promptly with a warn event", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed(LINES.statusLive);
     vi.advanceTimersByTime(20_000);
@@ -390,7 +402,7 @@ describe("createObdCollector", () => {
 
   it("status(): req/s from audit deltas, error and forbidden sums, voltage", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed(LINES.ready);
     h.feed(LINES.statusLive);
@@ -417,7 +429,7 @@ describe("createObdCollector", () => {
 
   it("report(): effective.obd with profile, bounded audit inventory, helper identity", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed(LINES.ready);
     h.feed(LINES.profile);
@@ -443,7 +455,7 @@ describe("createObdCollector", () => {
 
   it("stop(): SIGINTs the helper, cancels restarts, link 0", async () => {
     const h = fakeHelper();
-    const c = createObdCollector({ env: ENV, spawn: h.spawn, onEvent });
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
     await c.read();
     h.feed(LINES.statusLive);
     c.stop();
@@ -572,6 +584,422 @@ describe("obdStatusLine", () => {
     expect(obdStatusLine({ ...base, state: "connecting", link: 0, reqPerSec: null, voltage: null })).toBe(
       "obd        connecting  link 0  — req/s  err 0  forbidden 0  — V",
     );
+  });
+  it("appends the configured adapter (P3) and omits the column when there is none", () => {
+    expect(obdStatusLine({ ...base, adapter: "10:21:3E:4F:33:65" })).toBe(
+      "obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V  adapter 10:21:3E:4F:33:65",
+    );
+    expect(obdStatusLine({ ...base, state: "disabled", link: 0, reqPerSec: null, voltage: null, adapter: null })).toBe(
+      "obd        disabled  link 0  — req/s  err 0  forbidden 0  — V",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P3: the `obd` settings namespace drives the collector (fake helper stream)
+// ---------------------------------------------------------------------------
+
+describe("resolveObdConfig (settings over env, serial override)", () => {
+  it("absent namespace = the P1 env seam, reported as source env", () => {
+    const r = resolveObdConfig(undefined, { XORGATE_OBD_ADAPTER: "aa:bb:cc:dd:ee:ff", XORGATE_OBD_POLL_HZ: "2" });
+    expect(r).toMatchObject({ run: true, off: null, source: "env" });
+    expect(r.helper).toMatchObject({ adapter: "AA:BB:CC:DD:EE:FF", pollHz: 2, serial: null });
+    expect(r.settings).toEqual({ ...OBD_DEFAULTS, enabled: true, adapterMac: "AA:BB:CC:DD:EE:FF", pollHz: 2 });
+    expect(resolveObdConfig(undefined, {})).toMatchObject({ run: false, off: "not_configured", source: "env" });
+  });
+
+  it("present namespace: settings win over env, defaults fill the gaps, enabled is the kill switch", () => {
+    const env = { XORGATE_OBD_ADAPTER: "AA:BB:CC:DD:EE:FF", XORGATE_OBD_PIN: "9999", XORGATE_OBD_POLL_HZ: "2" };
+    const on = resolveObdConfig({ enabled: true, adapterMac: "10:21:3E:4F:33:65", powerSource: "switched" }, env);
+    expect(on).toMatchObject({ run: true, off: null, source: "settings" });
+    expect(on.helper).toEqual({
+      adapter: "10:21:3E:4F:33:65",
+      serial: null,
+      pin: "1234",
+      pollHz: 1,
+      fields: null,
+      powerSource: "switched",
+    });
+    expect(on.settings).toEqual({ ...OBD_DEFAULTS, enabled: true, adapterMac: "10:21:3E:4F:33:65" });
+    expect(resolveObdConfig({ enabled: false, adapterMac: "10:21:3E:4F:33:65" }, env)).toMatchObject({
+      run: false,
+      off: "disabled",
+    });
+    expect(resolveObdConfig({ enabled: true, adapterMac: null }, env)).toMatchObject({
+      run: false,
+      off: "not_configured",
+    });
+    expect(resolveObdConfig({ enabled: true }, env)).toMatchObject({ run: false, off: "not_configured" });
+    // fields [] = all (helper default); a non-empty list restricts.
+    expect(resolveObdConfig({ enabled: true, adapterMac: "10:21:3E:4F:33:65", fields: ["rpm", "speed"] }, env).helper.fields)
+      .toEqual(["rpm", "speed"]);
+  });
+
+  it("XORGATE_OBD_SERIAL overrides the adapter in both cases but still obeys enabled", () => {
+    const env = { XORGATE_OBD_SERIAL: "/dev/pts/4" };
+    expect(resolveObdConfig(undefined, env)).toMatchObject({ run: true, helper: { serial: "/dev/pts/4", adapter: null } });
+    expect(resolveObdConfig({ enabled: true, adapterMac: null }, env)).toMatchObject({ run: true, helper: { serial: "/dev/pts/4" } });
+    expect(resolveObdConfig({ enabled: false, adapterMac: null }, env)).toMatchObject({ run: false, off: "disabled" });
+  });
+});
+
+describe("normalizeScanCandidates", () => {
+  it("drops unnamed/malformed entries, dedups, sorts by rssi desc and caps at 20", () => {
+    const raw = [
+      { mac: "10:21:3e:4f:33:65", name: "OBDII", rssi: -58 },
+      { mac: "10:21:3E:4F:33:65", name: "OBDII dup", rssi: -10 },
+      { mac: "6C:3B:00:00:00:01", name: "6C-3B-00-00-00-01", rssi: -40 }, // BLE random, no name
+      { mac: "6C:3B:00:00:00:02", name: "", rssi: -40 },
+      { mac: "not a mac", name: "x", rssi: -1 },
+      { mac: "00:1D:A5:68:98:8B", name: "V-LINK" }, // no rssi → last
+      { mac: "AA:AA:AA:AA:AA:01", name: "TV", rssi: -70.4 },
+      ...Array.from({ length: 25 }, (_, i) => ({
+        mac: `BB:BB:BB:BB:BB:${(i + 10).toString(16).padStart(2, "0").toUpperCase()}`,
+        name: `dev${i}`,
+        rssi: -80 - i,
+      })),
+    ];
+    const out = normalizeScanCandidates(raw);
+    expect(out).toHaveLength(20);
+    expect(out[0]).toEqual({ mac: "10:21:3E:4F:33:65", name: "OBDII", rssi: -58 });
+    expect(out[1]).toEqual({ mac: "AA:AA:AA:AA:AA:01", name: "TV", rssi: -70 });
+    expect(out.some((c) => c.mac.startsWith("6C:3B"))).toBe(false);
+    expect(out.some((c) => c.name === "V-LINK")).toBe(false); // null rssi sorts after the 20 strongest
+    expect(normalizeScanCandidates("garbage")).toEqual([]);
+    expect(normalizeScanCandidates([{ mac: "00:1D:A5:68:98:8B", name: "V-LINK" }])).toEqual([
+      { mac: "00:1D:A5:68:98:8B", name: "V-LINK", rssi: null },
+    ]);
+  });
+});
+
+describe("createObdCollector + obd settings namespace (P3)", () => {
+  let events: Array<{ level: ObdEventLevel; msg: string }>;
+  const onEvent = (level: ObdEventLevel, msg: string) => events.push({ level, msg });
+  const MAC = "10:21:3E:4F:33:65";
+  const ENABLED: ObdSettings = { enabled: true, adapterMac: MAC, powerSource: "switched" };
+
+  beforeEach(() => {
+    events = [];
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-13T12:00:00Z"));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /** A collector whose namespace the test can flip between reads. */
+  function rig(initial: ObdSettings | undefined, env: NodeJS.ProcessEnv = { XORGATE_OBD_ADAPTER: "AA:BB:CC:DD:EE:FF" }) {
+    const h = fakeHelper();
+    let settings = initial;
+    let reads = 0;
+    const c = createObdCollector({
+      env,
+      settings: () => {
+        reads += 1;
+        return settings;
+      },
+      spawn: h.spawn,
+      onEvent,
+      scanner: async () => [{ mac: "00:1D:A5:68:98:8B", name: "V-LINK", rssi: -61 }],
+      unbond: async (mac) => {
+        unbonded.push(mac);
+      },
+    });
+    const unbonded: string[] = [];
+    return {
+      h,
+      c,
+      unbonded,
+      set(next: ObdSettings | undefined) {
+        settings = next;
+      },
+      get reads() {
+        return reads;
+      },
+    };
+  }
+
+  it("starts the helper from the namespace (env ignored) and reports the resolved namespace", async () => {
+    const r = rig(ENABLED);
+    expect(await r.c.read()).toEqual({ link: { value: 0 } });
+    expect(r.h.runs).toHaveLength(1);
+    expect(r.h.runs[0]!.cfg).toEqual({
+      adapter: MAC,
+      serial: null,
+      pin: "1234",
+      pollHz: 1,
+      fields: null,
+      powerSource: "switched",
+    });
+    expect(r.c.status().adapter).toBe(MAC);
+    expect(r.c.report()).toMatchObject({
+      ...OBD_DEFAULTS,
+      enabled: true,
+      adapterMac: MAC,
+      status: "connecting",
+      link: 0,
+      source: "settings",
+      adapter: { mac: MAC },
+    });
+    expect(r.c.report().fields).toEqual([]);
+  });
+
+  it("re-reads the namespace about once a second, not on every read", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    await r.c.read();
+    await r.c.sample();
+    expect(r.reads).toBe(1);
+    vi.advanceTimersByTime(1_000);
+    await r.c.read();
+    expect(r.reads).toBe(2);
+    r.c.reapply();
+    expect(r.reads).toBe(3);
+  });
+
+  it("enabled:false stops the helper → disabled/link 0 with ONE event; true again restarts it", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    r.h.feed(LINES.ready);
+    r.h.feed(LINES.statusLive);
+    r.h.feed(LINES.sample);
+    expect((await r.c.read()).rpm).toBeDefined();
+    events = [];
+
+    r.set({ ...ENABLED, enabled: false });
+    r.c.reapply();
+    expect(r.h.runs[0]!.stopped).toBe("SIGINT");
+    expect(await r.c.read()).toEqual({ link: { value: 0 } });
+    expect(r.c.status()).toMatchObject({ state: "disabled", link: 0 });
+    r.h.runs[0]!.exit(0);
+    await settle();
+    expect(r.c.status().state).toBe("disabled"); // the exit does not restart it
+    vi.advanceTimersByTime(60_000);
+    expect(r.h.runs).toHaveLength(1);
+    for (let i = 0; i < 5; i++) {
+      vi.advanceTimersByTime(1_000);
+      await r.c.read();
+    }
+    expect(events).toEqual([{ level: "info", msg: expect.stringContaining("disabled by settings") }]);
+    expect(r.c.report()).toMatchObject({ status: "disabled", enabled: false, link: 0 });
+
+    r.set(ENABLED);
+    vi.advanceTimersByTime(1_000);
+    await r.c.read();
+    expect(r.h.runs).toHaveLength(2);
+    expect(r.c.status().state).toBe("connecting");
+    expect(events.at(-1)).toEqual({ level: "info", msg: expect.stringContaining("starting helper") });
+  });
+
+  it("adapterMac null → not_configured (one warn event), link 0; a MAC appearing starts it", async () => {
+    const r = rig({ enabled: true, adapterMac: null });
+    await r.c.read();
+    expect(r.h.runs).toHaveLength(0);
+    expect(r.c.status()).toMatchObject({ state: "not_configured", link: 0, adapter: null });
+    vi.advanceTimersByTime(3_000);
+    await r.c.read();
+    expect(events).toEqual([{ level: "warn", msg: expect.stringContaining("adapter not configured") }]);
+    r.set(ENABLED);
+    r.c.reapply();
+    expect(r.h.runs).toHaveLength(1);
+    expect(r.c.status().state).toBe("connecting");
+  });
+
+  it("a changed adapter / pin / pollHz / fields / powerSource SIGINTs the helper and respawns with the new argv, no backoff", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    r.h.feed(LINES.statusLive);
+    events = [];
+    r.set({ ...ENABLED, adapterMac: "AA:BB:CC:DD:EE:01", pin: "4321", pollHz: 0.5, fields: ["rpm"], powerSource: "constant" });
+    r.c.reapply();
+    expect(r.h.runs[0]!.stopped).toBe("SIGINT");
+    expect(r.c.status().state).toBe("starting");
+    expect(events).toEqual([{ level: "info", msg: expect.stringContaining("settings changed (adapter AA:BB:CC:DD:EE:01, 0.5 Hz, 1 fields, constant power") }]);
+    expect(r.h.runs).toHaveLength(1); // not before the old one exits
+    r.h.runs[0]!.exit(0);
+    await settle();
+    expect(r.h.runs).toHaveLength(2);
+    expect(r.h.runs[1]!.cfg).toEqual({
+      adapter: "AA:BB:CC:DD:EE:01",
+      serial: null,
+      pin: "4321",
+      pollHz: 0.5,
+      fields: ["rpm"],
+      powerSource: "constant",
+    });
+    expect(r.c.status().state).toBe("connecting");
+    // An identical re-delivery is a no-op.
+    r.c.reapply();
+    expect(r.h.runs[1]!.stopped).toBeNull();
+  });
+
+  it("a settings change while parked/retrying cancels the timer and starts right away", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    r.h.runs[0]!.exit(2);
+    await settle();
+    expect(r.c.status().state).toBe("retrying");
+    r.set({ ...ENABLED, pollHz: 2 });
+    r.c.reapply();
+    expect(r.h.runs).toHaveLength(2);
+    expect(r.h.runs[1]!.cfg.pollHz).toBe(2);
+    vi.advanceTimersByTime(30_000);
+    expect(r.h.runs).toHaveLength(2); // the old retry timer did not fire a third run
+  });
+
+  it("namespace removed → falls back to the env seam", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    r.set(undefined);
+    r.c.reapply();
+    r.h.runs[0]!.exit(0);
+    await settle();
+    expect(r.h.runs[1]!.cfg.adapter).toBe("AA:BB:CC:DD:EE:FF");
+    expect(r.c.report().source).toBe("env");
+    const r2 = rig(ENABLED, {});
+    await r2.c.read();
+    r2.set(undefined);
+    r2.c.reapply();
+    r2.h.runs[0]!.exit(0);
+    await settle();
+    expect(r2.c.status().state).toBe("not_configured");
+    expect(r2.h.runs).toHaveLength(1);
+  });
+
+  it("adapter_not_found warns once per absence episode, then every 10 min, and says when it is back", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    const cycle = (ts: number) => {
+      r.h.feed(`{"type":"status","state":"connecting","link":0,"ts":${ts}}`);
+      r.h.feed(`{"type":"status","state":"adapter_not_found","link":0,"detail":"Host is down","ts":${ts}}`);
+      r.h.feed(`{"type":"status","state":"backoff","link":0,"ts":${ts}}`);
+    };
+    for (let i = 0; i < 20; i++) {
+      cycle(i);
+      vi.advanceTimersByTime(8_000);
+    }
+    const warns = events.filter((e) => e.level === "warn");
+    expect(warns).toEqual([{ level: "warn", msg: "obd: adapter not found (Host is down)" }]);
+    vi.advanceTimersByTime(600_000);
+    cycle(99);
+    expect(events.filter((e) => e.level === "warn")).toHaveLength(2);
+    expect(events.at(-1)!.msg).toMatch(/adapter still not found after 1[23] min/);
+    // Back: one info event, and the next absence is a fresh episode.
+    r.h.feed('{"type":"status","state":"probing","link":1,"ts":100}');
+    expect(events.at(-1)).toEqual({ level: "info", msg: expect.stringContaining("adapter found again") });
+    cycle(101);
+    expect(events.filter((e) => e.level === "warn")).toHaveLength(3);
+    // A helper restart (exit 3 after its own 10 min) keeps the episode open: no extra warn.
+    r.h.runs[0]!.exit(3);
+    await settle();
+    vi.advanceTimersByTime(2_000);
+    cycle(102);
+    expect(events.filter((e) => e.level === "warn").filter((e) => e.msg.includes("not found"))).toHaveLength(3);
+  });
+
+  it("req/s is seeded from profile.rate_req_s until two audit lines exist", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    expect(r.c.status().reqPerSec).toBeNull();
+    r.h.feed(LINES.profile); // rate_req_s 28.1
+    expect(r.c.status().reqPerSec).toBe(28.1);
+    r.h.feed('{"type":"audit","ts":1000,"counters":{"requests":0}}');
+    expect(r.c.status().reqPerSec).toBe(28.1);
+    r.h.feed('{"type":"audit","ts":1060,"counters":{"requests":600}}');
+    expect(r.c.status().reqPerSec).toBe(10);
+    r.h.runs[0]!.exit(0);
+    await settle();
+    expect(r.c.status().reqPerSec).toBeNull(); // not running → no seed either
+  });
+
+  it("scan(): runs the scanner once (a second call joins), parks the result in report().scan", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    expect(r.c.report().scan).toBeUndefined();
+    const p1 = r.c.scan();
+    const p2 = r.c.scan();
+    expect(p2).toBe(p1);
+    const res = await p1;
+    expect(res).toEqual({ ts: Date.now(), candidates: [{ mac: "00:1D:A5:68:98:8B", name: "V-LINK", rssi: -61 }] });
+    expect(r.c.report().scan).toEqual(res);
+    expect(events.map((e) => e.msg)).toEqual([
+      expect.stringContaining("scanning for Bluetooth adapters (25 s"),
+      "obd: scan done: 1 named device(s)",
+    ]);
+    // The helper kept running the whole time.
+    expect(r.h.runs[0]!.stopped).toBeNull();
+  });
+
+  it("scan(): a scanner failure lands as an empty result with an error, warn event", async () => {
+    const h = fakeHelper();
+    const c = createObdCollector({
+      env: {},
+      settings: () => ENABLED,
+      spawn: h.spawn,
+      onEvent,
+      scanner: async () => {
+        throw new Error("bluetoothctl not found");
+      },
+    });
+    await c.read();
+    const res = await c.scan();
+    expect(res).toEqual({ ts: Date.now(), candidates: [], error: "bluetoothctl not found" });
+    expect(events.at(-1)).toEqual({ level: "warn", msg: "obd: scan failed: bluetoothctl not found" });
+  });
+
+  it("forget(): stops the helper, unbonds, clears profile + last_stop, holds not_configured until the namespace changes", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    r.h.feed(LINES.profile);
+    r.h.feed(LINES.statusLive);
+    r.h.feed(LINES.audit);
+    expect(r.c.report().audit?.last_stop).toEqual({ ts: 1760000030, reason: "BUS ERROR" });
+    events = [];
+    const res = await r.c.forget();
+    expect(res).toEqual({ mac: MAC });
+    expect(r.unbonded).toEqual([MAC]);
+    expect(r.h.runs[0]!.stopped).toBe("SIGINT");
+    r.h.runs[0]!.exit(0);
+    await settle();
+    expect(r.c.status()).toMatchObject({ state: "not_configured", link: 0 });
+    const rep = r.c.report();
+    expect(rep.profile).toBeUndefined();
+    expect(rep.audit?.last_stop).toBeNull();
+    expect(rep).toMatchObject({ status: "not_configured", adapterMac: MAC, enabled: true });
+    expect(events).toEqual([{ level: "info", msg: expect.stringContaining(`adapter ${MAC} forgotten`) }]);
+    // Same namespace re-read (retained redelivery, 1 s poll): still off.
+    for (let i = 0; i < 3; i++) {
+      vi.advanceTimersByTime(1_000);
+      await r.c.read();
+    }
+    r.c.reapply();
+    expect(r.h.runs).toHaveLength(1);
+    // The console's PATCH {obd:null} → namespace cleared → env seam / defaults.
+    r.set({ enabled: true, adapterMac: null });
+    r.c.reapply();
+    expect(r.c.status().state).toBe("not_configured");
+    // A NEW adapter pairs afresh.
+    r.set({ ...ENABLED, adapterMac: "AA:BB:CC:DD:EE:01" });
+    r.c.reapply();
+    expect(r.h.runs).toHaveLength(2);
+    expect(r.h.runs[1]!.cfg.adapter).toBe("AA:BB:CC:DD:EE:01");
+  });
+
+  it("forget(): the same MAC set again after a clear pairs afresh (the latch follows the namespace)", async () => {
+    const r = rig(ENABLED);
+    await r.c.read();
+    await r.c.forget();
+    r.h.runs[0]!.exit(0);
+    await settle();
+    r.set({ enabled: true, adapterMac: null });
+    r.c.reapply();
+    r.set(ENABLED);
+    r.c.reapply();
+    expect(r.h.runs).toHaveLength(2);
   });
 });
 

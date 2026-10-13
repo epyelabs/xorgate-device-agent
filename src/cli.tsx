@@ -19,6 +19,7 @@ import { pipelineCommand } from "./commands/pipeline.js";
 import { recordingCommand } from "./commands/recording.js";
 import { ledCommand } from "./commands/led.js";
 import { smsCommand } from "./commands/sms.js";
+import { obdCommand } from "./commands/obd.js";
 import { formatBuildInfo } from "./lib/build-info.js";
 
 // `0.2.0 (a1b2c3d, dev)` for the banner; `-v` prints the same string so a field
@@ -99,6 +100,9 @@ async function main(): Promise<void> {
     case "sms":
       await smsCommand(rest);
       break;
+    case "obd":
+      await obdCommand(rest);
+      break;
     case "monitor": // deprecated alias for `manage`, kept working for one release
     case "manage": {
       if (cmd === "monitor") console.error("[xorgate] 'monitor' is deprecated; use 'manage'");
@@ -141,6 +145,10 @@ Commands:
   sms        Read the modem's stored SMS, newest first, without marking them read:
              'sms [--limit N] [--json]' (N 1..50, default 10). Bench tool; prints text.
              'sms clear [--yes]' deletes ALL stored SMS (SIM + modem); counts only.
+  obd        Vehicle OBD2 adapter: 'obd scan [--seconds N] [--json]' lists nearby Bluetooth
+             devices (never pairs); 'obd status' prints the obd line + last vehicle profile.
+             Settings: 'set obd.enabled on', 'set obd.adapter <MAC>', 'set obd.pin <digits>',
+             'set obd.poll-hz <0.2-2>', 'set obd.power-source <switched|constant>'.
   logs       Print the daemon log   (-f follow, -n N lines, --clear truncate)
   update     Fetch the latest agent build, install it, and restart the service
              (sudo; --tag <version> pins a build, --from <url> overrides the bucket)

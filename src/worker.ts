@@ -48,7 +48,7 @@ import { connect } from "./agent/mqtt.js";
 import { TelemetryScope, type ScopeChange } from "./agent/telemetry-scope.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector, type GroupSample } from "./agent/collectors/index.js";
-import { obdReportDue, type ObdEffectiveReport } from "./agent/collectors/obd.js";
+import { obdReportDue, type ObdEffectiveReport, type ObdScanResult } from "./agent/collectors/obd.js";
 import { createMediaCollector } from "./agent/collectors/media.js";
 import { loadManifest, persistUploadBucket } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
@@ -284,6 +284,9 @@ const source: {
   gnssView?: () => GnssView | null;
   obdStatus?: () => ObdStatus | null;
   obdReport?: () => ObdEffectiveReport | null;
+  obdReapply?: () => void;
+  obdScan?: () => Promise<ObdScanResult> | null;
+  obdForget?: () => Promise<{ mac: string | null }> | null;
 } =
   config.mode === "real"
     ? createCollector(
@@ -918,6 +921,10 @@ function handleConfigMessage(payload: Buffer): void {
     // ... and the `simulation` namespace (replay mode): a changed scenario
     // ends the current lap in place — same cadence as `recording`.
     replay?.reapply();
+    // ... and the `obd` namespace (obd2 P3): the collector re-reads it on its
+    // own 1 s poll too; forcing it here makes a cloud change take effect
+    // before the debounced report goes out.
+    source.obdReapply?.();
     // ... and the same for `cameraMount`: reconcile the boot config against
     // whatever settings.json now holds. Not awaited — an apply path may never
     // block on a subprocess (design.md §7) — and idempotent, so the skipped
@@ -1139,6 +1146,45 @@ async function handleCommandMessage(payload: Buffer): Promise<void> {
       store.event("warn", `${command} crashed: ${err.message}`, t);
       store.flush(t, true);
     });
+    return;
+  }
+
+  // `obd_scan` / `obd_forget` (obd2 P3) are in-process too. Rejected on the
+  // ack when this device has no OBD collector (hardware block without
+  // `peripherals.obd` — the cloud gates on the model, but a stale model move
+  // can still land here). Otherwise accepted, run, and the outcome reaches the
+  // cloud through the config report (`effective.obd.scan` / `status`).
+  if (cmd.command === "obd_scan" || cmd.command === "obd_forget") {
+    const command = cmd.command;
+    const job = command === "obd_scan" ? source.obdScan?.() : source.obdForget?.();
+    if (!job) {
+      console.warn(`[agent] ${command} rejected (${cmd.requestId}): no OBD peripheral on this device`);
+      store.event("warn", `${command} rejected: no OBD peripheral on this device`, now);
+      store.flush(now, true);
+      await publishCommandAck({ ...cmd, status: "rejected", reason: "no OBD peripheral" });
+      return;
+    }
+    await publishCommandAck({ ...cmd, status: "accepted" });
+    void job
+      .then((result) => {
+        const t = Date.now();
+        const summary =
+          command === "obd_scan"
+            ? `scan: ${(result as ObdScanResult).candidates.length} candidate(s)`
+            : `forget: ${(result as { mac: string | null }).mac ?? "no adapter"}`;
+        console.log(`[agent] ${command} ${cmd.requestId}: ${summary}`);
+        store.flush(t, true);
+        // The report is how the cloud sees the outcome; a link move alone
+        // would not necessarily fire the tick's edge detector.
+        configSync.request("boot");
+      })
+      .catch((err: Error) => {
+        const t = Date.now();
+        console.error(`[agent] ${command} ${cmd.requestId} crashed: ${err.message}`);
+        store.event("warn", `${command} crashed: ${err.message}`, t);
+        store.flush(t, true);
+        configSync.request("boot");
+      });
     return;
   }
 

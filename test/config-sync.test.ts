@@ -1184,6 +1184,90 @@ describe("apply classes", () => {
       cellular: "modem-poll",
       cameraMount: "agent-poll",
       simulation: "agent-poll",
+      obd: "agent-poll",
+    });
+  });
+});
+
+describe("status.obd (obd2-bluetooth-integration P3)", () => {
+  const MAC = "10:21:3E:4F:33:65";
+  const desiredObd = { enabled: true, adapterMac: MAC, powerSource: "switched" as const };
+  const held = { enabled: true, adapterMac: MAC, powerSource: "switched" as const };
+  const report = (over: Record<string, unknown> = {}) =>
+    ({
+      enabled: true,
+      adapterMac: MAC,
+      pin: "1234",
+      pollHz: 1,
+      fields: [],
+      powerSource: "switched",
+      status: "connecting",
+      link: 0,
+      source: "settings",
+      adapter: { mac: MAC },
+      ...over,
+    }) as unknown as import("../src/agent/collectors/obd.js").ObdEffectiveReport;
+  const verdict = (obd: ReturnType<typeof report> | null, settings = { obd: held }, raw: unknown = desiredObd) =>
+    buildConfigReport({
+      deviceId: "d",
+      ts: 7,
+      origin: "cloud",
+      lastAppliedRev: 51,
+      settings,
+      modem: NO_MODEM,
+      desired: desiredFrom({ v: 1, rev: 51, obd: raw }),
+      obd,
+    }).status.obd;
+
+  it("applied when the collector resolved exactly what the cloud asked (absent fields = defaults)", () => {
+    expect(verdict(report())).toEqual({ state: "applied", at: 7 });
+    expect(verdict(report({ status: "live", link: 2 }))).toEqual({ state: "applied", at: 7 });
+  });
+
+  it("applied with a detail when in force but the adapter is absent / forgotten / parked, or no adapter at all", () => {
+    expect(verdict(report({ status: "adapter_not_found" }))).toMatchObject({
+      state: "applied",
+      detail: expect.stringContaining("not reachable"),
+    });
+    expect(verdict(report({ status: "not_configured" }))).toMatchObject({
+      state: "applied",
+      detail: expect.stringContaining("forgot adapter 10:21:3E:4F:33:65"),
+    });
+    expect(verdict(report({ status: "parked" }))).toMatchObject({ state: "applied", detail: expect.stringContaining("parked") });
+    const none = { enabled: true, adapterMac: null };
+    expect(verdict(report({ adapterMac: null, status: "not_configured", adapter: { mac: null } }), { obd: none }, none)).toMatchObject({
+      state: "applied",
+      detail: expect.stringContaining("no adapter configured"),
+    });
+  });
+
+  it("rejected when the device has no OBD collector (hardware block without peripherals.obd)", () => {
+    expect(verdict(null)).toMatchObject({ state: "rejected", reason: expect.stringContaining("peripherals.obd") });
+  });
+
+  it("adjusted when settings.json differs, when the collector has not caught up, or when it still runs on the env seam", () => {
+    expect(verdict(report(), { obd: { ...held, pollHz: 2 } })).toMatchObject({
+      state: "adjusted",
+      detail: expect.stringContaining("different value"),
+    });
+    expect(verdict(report(), {})).toMatchObject({ state: "adjusted", detail: expect.stringContaining("not holding") });
+    expect(verdict(report({ pollHz: 2 }))).toMatchObject({ state: "adjusted", detail: expect.stringContaining("next tick") });
+    expect(verdict(report({ adapterMac: "AA:BB:CC:DD:EE:FF", source: "env", adapter: { mac: "AA:BB:CC:DD:EE:FF" } }))).toMatchObject({
+      state: "adjusted",
+      detail: expect.stringContaining("env seam"),
+    });
+  });
+
+  it("the generic verdicts still apply first: clamped → adjusted, all-invalid → rejected, {} revert → applied", () => {
+    const clamped = { enabled: true, adapterMac: MAC, pollHz: 99 };
+    expect(verdict(report({ pollHz: 2 }), { obd: { enabled: true, adapterMac: MAC, pollHz: 2 } }, clamped)).toMatchObject({
+      state: "adjusted",
+      detail: expect.stringContaining("clamped"),
+    });
+    expect(verdict(report(), { obd: held }, { pin: "x" })).toMatchObject({ state: "rejected" });
+    expect(verdict(report({ enabled: false, adapterMac: null, status: "disabled", adapter: { mac: null } }), {}, {})).toEqual({
+      state: "applied",
+      at: 7,
     });
   });
 });

@@ -161,3 +161,45 @@ describe("xorgate set cameraMount.<streamKey>.rotationDeg", () => {
     expect(settings.cameraMount?.cameras?.cam0?.rotationDeg).toBe(180);
   });
 });
+
+describe("xorgate set obd.* (obd2-bluetooth-integration P3)", () => {
+  it("writes each field through the namespace parser, merging into the held namespace", async () => {
+    await setCommand(["obd.adapter", "10:21:3e:4f:33:65"]);
+    expect(process.exitCode).toBeUndefined();
+    expect(loadSettings().obd).toEqual({ adapterMac: "10:21:3E:4F:33:65" });
+    await setCommand(["obd.enabled", "on"]);
+    await setCommand(["obd.pin", "4321"]);
+    await setCommand(["obd.poll-hz", "0.5"]);
+    await setCommand(["obd.power-source", "constant"]);
+    await setCommand(["obd.fields", "rpm,speed, fuel_level"]);
+    expect(process.exitCode).toBeUndefined();
+    expect(loadSettings().obd).toEqual({
+      adapterMac: "10:21:3E:4F:33:65",
+      enabled: true,
+      pin: "4321",
+      pollHz: 0.5,
+      powerSource: "constant",
+      fields: ["rpm", "speed", "fuel_level"],
+    });
+    await setCommand(["obd.fields", "all"]);
+    await setCommand(["obd.adapter", "none"]);
+    expect(loadSettings().obd).toMatchObject({ fields: [], adapterMac: null });
+  });
+
+  it("rejects what the collector would drop, and never clobbers other settings", async () => {
+    saveSettings({ mode: "real", obd: { enabled: true } });
+    for (const [key, value] of [
+      ["obd.adapter", "10:21:3E:4F:33"],
+      ["obd.pin", "12"],
+      ["obd.poll-hz", "5"],
+      ["obd.power-source", "solar"],
+      ["obd.enabled", "maybe"],
+      ["obd.bogus", "1"],
+    ] as const) {
+      process.exitCode = undefined;
+      await setCommand([key, value]);
+      expect(process.exitCode, key).toBe(1);
+    }
+    expect(loadSettings()).toEqual({ mode: "real", obd: { enabled: true } });
+  });
+});

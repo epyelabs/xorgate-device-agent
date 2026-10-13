@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { writeFileSync } from "node:fs";
-import { loadSettings, saveSettings, settingsPath } from "../src/daemon/settings.js";
+import {
+  loadSettings,
+  OBD_POLL_HZ_MAX,
+  OBD_POLL_HZ_MIN,
+  parseObdSettings,
+  saveSettings,
+  settingsPath,
+} from "../src/daemon/settings.js";
 import { cleanup, tempHome } from "./helpers.js";
 
 let home: string;
@@ -89,5 +96,55 @@ describe("settings persistence", () => {
     expect(loadSettings()).toEqual({});
     writeFileSync(settingsPath(), JSON.stringify({ mode: "bogus" }));
     expect(loadSettings()).toEqual({});
+  });
+});
+
+describe("obd namespace (obd2-bluetooth-integration P3)", () => {
+  it("parses the contract shape: MAC uppercased, null kept, pin 4-6 digits, pollHz clamped, fields deduped, enum power", () => {
+    expect(
+      parseObdSettings({
+        enabled: true,
+        adapterMac: " 10:21:3e:4f:33:65 ",
+        pin: "123456",
+        pollHz: 0.5,
+        fields: ["rpm", "speed", "rpm", "Bad Name", 7],
+        powerSource: "constant",
+      }),
+    ).toEqual({
+      enabled: true,
+      adapterMac: "10:21:3E:4F:33:65",
+      pin: "123456",
+      pollHz: 0.5,
+      fields: ["rpm", "speed"],
+      powerSource: "constant",
+    });
+    expect(parseObdSettings({ adapterMac: null, fields: [] })).toEqual({ adapterMac: null, fields: [] });
+    expect(parseObdSettings({ pollHz: 50 })).toEqual({ pollHz: OBD_POLL_HZ_MAX });
+    expect(parseObdSettings({ pollHz: 0 })).toEqual({ pollHz: OBD_POLL_HZ_MIN });
+  });
+
+  it("DROPS (never repairs) a malformed MAC or PIN, and mistyped keys; nothing valid → undefined", () => {
+    expect(parseObdSettings({ adapterMac: "10:21:3E:4F:33", pin: "12", powerSource: "solar", enabled: "yes" })).toBeUndefined();
+    expect(parseObdSettings({ adapterMac: "10-21-3E-4F-33-65", enabled: true })).toEqual({ enabled: true });
+    expect(parseObdSettings({ pin: "abcd", enabled: false })).toEqual({ enabled: false });
+    expect(parseObdSettings(null)).toBeUndefined();
+    expect(parseObdSettings([])).toBeUndefined();
+    expect(parseObdSettings({})).toBeUndefined();
+  });
+
+  it("is kept by the allowlist rewriter alongside the other namespaces (unknown keys inside dropped)", () => {
+    writeFileSync(
+      settingsPath(),
+      JSON.stringify({
+        mode: "real",
+        obd: { enabled: true, adapterMac: "10:21:3e:4f:33:65", powerSource: "switched", bogus: 1 },
+      }),
+    );
+    expect(loadSettings()).toEqual({
+      mode: "real",
+      obd: { enabled: true, adapterMac: "10:21:3E:4F:33:65", powerSource: "switched" },
+    });
+    saveSettings({ ...loadSettings(), gnssAntBias: true });
+    expect(loadSettings().obd).toEqual({ enabled: true, adapterMac: "10:21:3E:4F:33:65", powerSource: "switched" });
   });
 });

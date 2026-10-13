@@ -12,6 +12,7 @@ import {
   type ObdCollector,
   type ObdEffectiveReport,
   type ObdEventLevel,
+  type ObdScanResult,
 } from "./obd.js";
 import type { HardwarePeripherals } from "../../hardware/hardware-config.js";
 import type { ObdStatus } from "../telemetry.js";
@@ -140,6 +141,12 @@ export function createCollector(
   obdStatus(): ObdStatus | null;
   /** The config report's `effective.obd`; null without the peripheral. */
   obdReport(): ObdEffectiveReport | null;
+  /** Re-read the `obd` settings namespace now (after a cloud config message, P3). */
+  obdReapply(): void;
+  /** `obd_scan` (P3): Bluetooth discovery; null without the peripheral. */
+  obdScan(): Promise<ObdScanResult> | null;
+  /** `obd_forget` (P3): stop + unbond; null without the peripheral. */
+  obdForget(): Promise<{ mac: string | null }> | null;
 } {
   const collectors: Collector[] = [];
   const system = ioCapabilities.system
@@ -226,6 +233,15 @@ export function createCollector(
     },
     obdReport(): ObdEffectiveReport | null {
       return obd?.report() ?? null;
+    },
+    obdReapply(): void {
+      obd?.reapply();
+    },
+    obdScan(): Promise<ObdScanResult> | null {
+      return obd ? obd.scan() : null;
+    },
+    obdForget(): Promise<{ mac: string | null }> | null {
+      return obd ? obd.forget() : null;
     },
   };
 }

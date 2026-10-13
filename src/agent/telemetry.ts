@@ -82,6 +82,93 @@ export interface TelemetryMetrics {
     /** PSU max current negotiated at boot (mA): 5000 on a 5V/5A PD supply, 3000 otherwise. */
     psu_max_current?: MetricLeaf;
   };
+  /**
+   * OBD2 vehicle data (obd2-bluetooth-integration P1, plan D4): standard Mode
+   * 01 PIDs read from an ELM327 Bluetooth SPP adapter by `python/obd_read.py`.
+   * Present only on devices whose hardware block declares
+   * `peripherals.obd`. `link` is the health code (C9 pattern, like
+   * `lte.gnss_health`) and is ALWAYS present while the collector exists; every
+   * other leaf appears only when the helper's latest sample is < 5 s old AND
+   * the vehicle supports that PID — a PID the car lacks is never emitted, and
+   * no leaf is ever null or a string (cloud schema C1 drops the whole frame).
+   *
+   * RUST-PORT: telemetry type seam — mirror this group, field for field, in
+   * the port's metrics model (see docs/PORTING-obd.md, "Field table").
+   */
+  obd: {
+    /** 0 no adapter, 1 adapter only (ECU silent), 2 ECU answering. */
+    link: MetricLeaf;
+    /** PID 0C, rpm. */
+    rpm?: MetricLeaf;
+    /** PID 0D, km/h. */
+    speed?: MetricLeaf;
+    /** PID 05, °C. */
+    coolant_temp?: MetricLeaf;
+    /** PID 04, %. */
+    engine_load?: MetricLeaf;
+    /** PID 11, %. */
+    throttle?: MetricLeaf;
+    /** PID 49, %. */
+    pedal?: MetricLeaf;
+    /** PID 68 (first sensor) else 0F, °C. */
+    intake_temp?: MetricLeaf;
+    /** PID 46, °C. */
+    ambient_temp?: MetricLeaf;
+    /** PID 0B, kPa. */
+    intake_map?: MetricLeaf;
+    /** PID 33, kPa. */
+    baro?: MetricLeaf;
+    /** PID 2F, %. */
+    fuel_level?: MetricLeaf;
+    /** PID 9D (else 5E), L/h. */
+    fuel_rate?: MetricLeaf;
+    /** PID 42, V — the ECU's own reading. */
+    module_voltage?: MetricLeaf;
+    /** ATRV, V — the adapter's reading (~0.85 V low on the experiment adapter). */
+    adapter_voltage?: MetricLeaf;
+    /** PID 1F, s since engine start. */
+    run_time?: MetricLeaf;
+    /** PID A6, km. */
+    odometer?: MetricLeaf;
+    /** PID A4, 0 = park/neutral. */
+    gear?: MetricLeaf;
+    /** PID 31, km since DTCs cleared. */
+    distance_since_clear?: MetricLeaf;
+    /** PID 01 bit A7, 0/1. */
+    mil?: MetricLeaf;
+    /** PID 01 A & 0x7F. */
+    dtc_count?: MetricLeaf;
+  };
+}
+
+/**
+ * OBD collector health for `xorgate status` and the monitor (obd2 P1). Written
+ * by the worker each tick from the collector's `status()`; absent on devices
+ * without the peripheral and on agents predating it.
+ */
+export interface ObdStatus {
+  /**
+   * Collector state: the helper's own states (connecting, pairing, probing,
+   * live, ecu_silent, backoff, stopped, adapter_not_found) plus the
+   * supervisor's (unconfigured, starting, retrying, parked, exited).
+   */
+  state: string;
+  /** 0 no adapter, 1 adapter only, 2 ECU answering. */
+  link: 0 | 1 | 2;
+  /** Requests per second, from the deltas between the helper's audit lines. */
+  reqPerSec: number | null;
+  /** Adapter + protocol + identity + voltage error count since helper start. */
+  errors: number;
+  /** Allowlist rejections (must stay 0 — a non-zero value is a software bug). */
+  forbidden: number;
+  /** Latest module (PID 42) or adapter (ATRV) voltage, V. */
+  voltage: number | null;
+  /** Last status `detail` text from the helper, if any. */
+  detail: string | null;
+  /** Epoch ms the current state began. */
+  since: number;
+  /** Helper build, from its `ready` line. */
+  helperVersion: string | null;
 }
 
 /** One KVS WebRTC master the media runtime supervises (one per signaling channel). */
@@ -246,4 +333,6 @@ export interface StateSnapshot {
   recentEvents: ActivityEvent[];
   /** On-device recording status; absent on agents predating the recording feature. */
   recording?: RecordingStatus;
+  /** OBD2 collector health (obd2 P1); absent without the peripheral. */
+  obd?: ObdStatus;
 }

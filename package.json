@@ -17,7 +17,8 @@
     "start": "tsx src/cli.tsx start",
     "manage": "tsx src/cli.tsx manage",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:python": "python3 -m unittest discover -s python/tests"
   },
   "dependencies": {
     "execa": "^9.5.1",

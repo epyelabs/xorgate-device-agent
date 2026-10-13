@@ -59,6 +59,73 @@ describe("parseHardwareBlock", () => {
     expect(parseHardwareBlock("nope")).toBeNull();
   });
 
+  describe("peripherals (obd2 P1): the one lenient key", () => {
+    const OBD = { adapter: "elm327", transport: "bt-spp" } as const;
+
+    it("absent → no peripherals key at all (serialises exactly as before)", () => {
+      const block = parseHardwareBlock(CM4_BLOCK)!;
+      expect("peripherals" in block).toBe(false);
+      expect(JSON.stringify(block)).toBe(JSON.stringify(CM4_BLOCK));
+      expect(parseHardwareBlock({ ...CM4_BLOCK, peripherals: {} })).not.toHaveProperty("peripherals");
+    });
+
+    it("present and valid → parsed verbatim, equality sees it", () => {
+      const warnings: string[] = [];
+      const block = parseHardwareBlock({ ...CM4_BLOCK, peripherals: { obd: OBD } }, (m) => warnings.push(m));
+      expect(block?.peripherals).toEqual({ obd: OBD });
+      expect(warnings).toEqual([]);
+      expect(hardwareBlocksEqual(block, parseHardwareBlock(CM4_BLOCK))).toBe(false);
+    });
+
+    it("invalid obd entry → ignored with ONE warning, rest of the block valid", () => {
+      const warnings: string[] = [];
+      const block = parseHardwareBlock(
+        { ...CM4_BLOCK, peripherals: { obd: { adapter: "elm327", transport: "ble" } } },
+        (m) => warnings.push(m),
+      );
+      expect(block).not.toBeNull();
+      expect(block?.platform).toBe("rpi-cm4");
+      expect(block).not.toHaveProperty("peripherals");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("peripherals.obd");
+      expect(parseHardwareBlock({ ...CM4_BLOCK, peripherals: { obd: "elm327" } }, () => {})).not.toHaveProperty("peripherals");
+      expect(parseHardwareBlock({ ...CM4_BLOCK, peripherals: { obd: null } }, () => {})).not.toHaveProperty("peripherals");
+    });
+
+    it("unknown peripheral / non-object peripherals → ignored with a warning, strictness elsewhere unchanged", () => {
+      const warnings: string[] = [];
+      const block = parseHardwareBlock(
+        { ...CM4_BLOCK, peripherals: { lidar: { adapter: "x" }, obd: OBD } },
+        (m) => warnings.push(m),
+      );
+      expect(block?.peripherals).toEqual({ obd: OBD });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("lidar");
+      expect(parseHardwareBlock({ ...CM4_BLOCK, peripherals: "obd" }, () => {})).not.toHaveProperty("peripherals");
+      expect(parseHardwareBlock({ ...CM4_BLOCK, peripherals: [OBD] }, () => {})).not.toHaveProperty("peripherals");
+      // A bad enum next to a valid peripheral is still fatal for the block.
+      expect(parseHardwareBlock({ ...CM4_BLOCK, encoder: "av1", peripherals: { obd: OBD } }, () => {})).toBeNull();
+    });
+
+    it("loadHardwareBlock keeps a block whose only fault is a bad peripheral", () => {
+      const dir = mkdtempSync(join(tmpdir(), "xg-hw-"));
+      const path = join(dir, "hardware.json");
+      const logs: string[] = [];
+      try {
+        writeFileSync(path, JSON.stringify({ ...CM4_BLOCK, peripherals: { obd: { adapter: "stn" } } }));
+        const block = loadHardwareBlock(path, (m) => logs.push(m));
+        expect(block?.platform).toBe("rpi-cm4");
+        expect(block).not.toHaveProperty("peripherals");
+        expect(logs).toHaveLength(1);
+        writeFileSync(path, JSON.stringify({ ...CM4_BLOCK, peripherals: { obd: OBD } }));
+        expect(loadHardwareBlock(path, (m) => logs.push(m))?.peripherals?.obd).toEqual(OBD);
+        expect(logs).toHaveLength(1);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("round-trips through save/load and compares structurally", () => {
     const dir = mkdtempSync(join(tmpdir(), "xg-hw-"));
     const path = join(dir, "hardware.json");

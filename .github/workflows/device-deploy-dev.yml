@@ -37,6 +37,7 @@ on:
     paths:
       - "src/**"
       - "systemd/**"
+      - "python/**"
       - "modem/**"
       - "system/**"
       - "package.json"

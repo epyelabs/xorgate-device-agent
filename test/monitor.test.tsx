@@ -102,7 +102,7 @@ describe("MonitorApp", () => {
     expect(frame).toContain("Connectivity"); // per-interface + mqtt status row
     expect(frame).toContain("mqtt"); // cloud/MQTT indicator restored
     expect(frame).toContain("pid"); // daemon stats live on the header status line
-    for (const title of ["IMU", "GPS", "LTE", "System", "Media", "Activity", "Settings"]) {
+    for (const title of ["IMU", "GPS", "LTE", "System", "OBD", "Media", "Activity", "Settings"]) {
       expect(frame).toContain(title); // sidebar lists every module
     }
     expect(frame).toContain("recent events"); // default selection = Activity detail

@@ -172,6 +172,10 @@ Other env: `XORGATE_HOME` (runtime dir, default `~/.xorgate`),
 `XORGATE_STOP_TIMEOUT_MS` (graceful-stop timeout before SIGKILL, default 5000),
 `XORGATE_PYTHON_DIR` (override the `python/` helper dir; defaults to the package root).
 
+OBD2 env (see the **OBD peripheral** section below): `XORGATE_OBD_ADAPTER`,
+`XORGATE_OBD_SERIAL`, `XORGATE_OBD_PIN`, `XORGATE_OBD_POLL_HZ`, `XORGATE_OBD_FIELDS`,
+`XORGATE_OBD_POWER_SOURCE`.
+
 Media-runtime env (see the **Media runtime (KVS WebRTC)** section below):
 `MEDIA_ENABLED` (or `xorgate set media on`), `KVS_MANIFEST` (default `./creds/kvs.json`,
 `/etc/xorgate/kvs.json` on a device), `KVS_PIPELINE_DIR` (default `/etc/xorgate/pipelines`),
@@ -339,6 +343,60 @@ sudo usermod -aG i2c "$USER"                                 # non-root bus acce
 
 Iterate off-hardware with `XORGATE_MOCK=1` (or any non-Linux host): detection
 reports a synthetic sensor and the stream emits a slowly-rotating mock signal.
+
+## OBD peripheral (ELM327 over Bluetooth SPP, `MODE=real`)
+
+Devices whose hardware block (`/etc/xorgate/hardware.json`, delivered from the
+device model) declares `"peripherals": { "obd": { "adapter": "elm327", "transport": "bt-spp" } }`
+get an `obd` collector (`src/agent/collectors/obd.ts`) that supervises the
+stdlib-only helper `python/obd_read.py` (`src/hardware/obd.ts`, same JSON-lines
+pattern as the IMU helper) and publishes `metrics.obd.*`: `link` (0 no adapter,
+1 adapter only, 2 ECU answering; always present) plus `rpm`, `speed`,
+`coolant_temp`, `engine_load`, `throttle`, `pedal`, `intake_temp`,
+`ambient_temp`, `intake_map`, `baro`, `fuel_level`, `fuel_rate`,
+`module_voltage`, `adapter_voltage`, `run_time`, `odometer`, `gear`,
+`distance_since_clear`, `mil`, `dtc_count`, each only when the car supports the
+PID and the helper's last sample is under 5 s old (never a null leaf). Without
+the block nothing changes. The helper owns the one allowlist gate every byte to
+the car passes through, its own reconnect backoff, and the append-only audit log
+under `$XORGATE_HOME/obd/audit/`; the collector only supervises it (2 s backoff,
+30 s cap, 3 quick failures park 60 s; exit 6 = helper software bug, parked with
+an `error` event; exit 4 = protocol refused, parked 10 min).
+
+Phase 1 takes the adapter from the agent's environment (`agent.env`; the cloud
+`obd` settings namespace is a later phase):
+
+| Env                        | Default    | Notes                                                                 |
+| -------------------------- | ---------- | --------------------------------------------------------------------- |
+| `XORGATE_OBD_ADAPTER`      | —          | Adapter MAC `AA:BB:CC:DD:EE:FF`. Unset = collector publishes `link 0` and logs "adapter not configured" once. |
+| `XORGATE_OBD_SERIAL`       | —          | Emulator pty (`/dev/pts/N`); overrides the adapter.                   |
+| `XORGATE_OBD_PIN`          | `1234`     | Legacy pairing PIN (SSP adapters ignore it).                          |
+| `XORGATE_OBD_POLL_HZ`      | `1`        | Poll cycle (hard cap 20 req/s inside the helper).                     |
+| `XORGATE_OBD_FIELDS`       | all        | CSV of field names to poll.                                           |
+| `XORGATE_OBD_POWER_SOURCE` | `switched` | `switched` (ignition-switched 12 V) or `constant` (battery policy on). |
+
+Where it shows: `xorgate status` prints
+`obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V`; the monitor has
+an **OBD** module; the config report carries a reported-only `effective.obd`
+(state, link, adapter MAC, the helper's vehicle profile, audit counters, the
+distinct-command inventory capped at 200 keys, last stop, helper version and
+allowlist hash). `forbidden` must stay 0: a non-zero value is a software bug,
+not a vehicle problem.
+
+Run against the emulator on any Linux/macOS box (no car, no Bluetooth):
+
+```sh
+pip install ELM327-emulator
+elm -b out -s taos-2022            # prints the pty it created, e.g. /dev/pts/4
+XORGATE_OBD_SERIAL=/dev/pts/4 MODE=real xorgate start --offline
+xorgate status                     # obd line; `xorgate monitor` → OBD module
+```
+
+Off-hardware with `XORGATE_MOCK=1` (or any non-Linux host) and the adapter env
+set, the helper is replaced by a synthetic stream (idle ~900 rpm, slow fuel
+drain). A `sim` run of a model with `peripherals.obd` emits a plausible `obd`
+group too. The helper's own tests run with `npm run test:python` (separate from
+`npm test`). Porting notes for the Rust agent: `docs/PORTING-obd.md`.
 
 ## GPS / GNSS (SIM7600, `MODE=real`)
 

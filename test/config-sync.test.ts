@@ -116,6 +116,32 @@ describe("effective values", () => {
     expect(buildEffective({}, NO_MODEM)).toEqual({});
   });
 
+  it("carries the OBD collector report as reported-only effective.obd (obd2 P1)", () => {
+    const obd = {
+      status: "live" as const,
+      link: 2 as const,
+      adapter: { mac: "AA:BB:CC:DD:EE:FF" },
+      profile: { protocol: { dpn: "A6" }, supported_fields: ["rpm"] },
+      audit: { counters: { requests: 60, forbidden_attempts: 0 }, inventory: { "010C1": 60 }, last_stop: null },
+      helper_version: "0.1.0",
+      allowlist_sha256: "abc",
+    };
+    expect(buildEffective({}, NO_MODEM, undefined, undefined, undefined, obd)).toEqual({ obd });
+    expect(buildEffective({}, NO_MODEM, undefined, undefined, undefined, null)).toEqual({});
+    const report = buildConfigReport({
+      deviceId: "d",
+      ts: 1,
+      origin: "boot",
+      lastAppliedRev: 0,
+      settings: {},
+      modem: NO_MODEM,
+      desired: desiredFrom({ v: 1, rev: 1, gnssAntBias: true }),
+      obd,
+    });
+    expect(report.effective.obd).toEqual(obd);
+    expect(report.status).not.toHaveProperty("obd"); // never a config namespace
+  });
+
   it("sources gnssAntBias from the modem, not from settings.json", () => {
     // settings.json says the bias was REQUESTED on; the modem says it is off.
     // The reported value must be the applied one — that is the whole point.

@@ -39,6 +39,7 @@
  * writer, and the sim7600-lte daemon greps settings.json by exact path.
  */
 import { createHash } from "node:crypto";
+import type { ObdEffectiveReport } from "./collectors/obd.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "../lib/atomicWrite.js";
@@ -602,6 +603,7 @@ export function buildEffective(
   mode?: string,
   cameraMount?: CameraMountState | null,
   telemetryScope?: TelemetryScopeReport | null,
+  obd?: ObdEffectiveReport | null,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   // The APPLIED bias, not the requested one; omitted entirely when the modem
@@ -653,6 +655,14 @@ export function buildEffective(
   // reads for "what APN is this device actually on" (configured or not), and
   // its ABSENCE is how the cloud spots a device with no rollback net.
   if (modem.apn !== undefined) out.apn = modem.apn;
+  // `obd` (obd2-bluetooth-integration P1, plan 7.5) is reported-only like
+  // `sim`/`uplink`: the collector's state, link, the helper's vehicle profile
+  // and its audit counters/inventory/last stop. Present only on devices whose
+  // hardware block declares the peripheral; never a config namespace (P3 adds
+  // the `obd` settings namespace separately), so no `status` entry, no
+  // contract entry, no fold-back into `devices.config`.
+  // RUST-PORT: config-report seam — same key, same shape (docs/PORTING-obd.md).
+  if (obd) out.obd = obd;
   return out;
 }
 
@@ -1055,6 +1065,8 @@ export interface ReportInput {
   telemetryScope?: TelemetryScopeReport | null;
   /** Locally-changed namespaces; only meaningful on an `origin: "local"` report. */
   changed?: Record<string, unknown>;
+  /** OBD collector report (obd2 P1); reported-only, absent without the peripheral. */
+  obd?: ObdEffectiveReport | null;
 }
 
 /** Assemble a complete report. Pure — every input is supplied by the caller. */
@@ -1065,6 +1077,7 @@ export function buildConfigReport(input: ReportInput): ConfigReport {
     input.mode,
     input.cameraMount,
     input.telemetryScope,
+    input.obd,
   );
   const report: ConfigReport = {
     v: 1,
@@ -1115,6 +1128,8 @@ export interface ConfigSyncOptions {
   cameraMount?: () => CameraMountState | null;
   /** Live view of the telemetry topic in force; see `telemetry-scope.ts`. */
   telemetryScope?: () => TelemetryScopeReport | null;
+  /** OBD collector's `effective.obd` (obd2 P1); a snapshot read, never a spawn. */
+  obd?: () => ObdEffectiveReport | null;
   onEvent?: (level: "info" | "warn", msg: string) => void;
   now?: () => number;
   statePath?: string;
@@ -1547,6 +1562,7 @@ export class ConfigSync {
         hints: this.opts.hints?.(),
         cameraMount: this.opts.cameraMount?.(),
         telemetryScope: this.opts.telemetryScope?.(),
+        obd: this.opts.obd?.(),
         mode: this.opts.mode,
         changed,
       });

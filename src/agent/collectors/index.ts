@@ -7,6 +7,14 @@ import type { GnssView } from "../../lib/sky-state.js";
 import { createLteCollector } from "./lte.js";
 import { createSystemCollector } from "./system.js";
 import { createMediaCollector, type MediaSupervisor } from "./media.js";
+import {
+  createObdCollector,
+  type ObdCollector,
+  type ObdEffectiveReport,
+  type ObdEventLevel,
+} from "./obd.js";
+import type { HardwarePeripherals } from "../../hardware/hardware-config.js";
+import type { ObdStatus } from "../telemetry.js";
 
 /** One group's cached reading + when the underlying data last changed. */
 export interface GroupSample {
@@ -71,6 +79,18 @@ export interface IoCapabilities {
 }
 
 /**
+ * Hardware-block facts the registry gates PERIPHERAL collectors on (obd2 P1).
+ * Separate from `IoCapabilities` because these come from the device hardware
+ * block (`/etc/xorgate/hardware.json`), not the model's io_capabilities, and
+ * because absence must mean "exactly today's collector list".
+ */
+export interface CollectorHardware {
+  peripherals?: HardwarePeripherals;
+  /** Activity-event sink for supervised peripherals (the worker's store.event). */
+  onEvent?: (level: ObdEventLevel, msg: string) => void;
+}
+
+/**
  * Capability-driven collector registry (P5 skeleton).
  *
  * Given a device model's `io_capabilities`, instantiate only the collectors the
@@ -84,6 +104,7 @@ export interface IoCapabilities {
 export function createCollector(
   ioCapabilities: IoCapabilities = {},
   mediaConfig?: MediaConfig,
+  hardware: CollectorHardware = {},
 ): {
   read(): Promise<TelemetryReading>;
   /** Recorder view: latest per-group samples with freshness stamps (see GroupSample). */
@@ -115,6 +136,10 @@ export function createCollector(
    * on a device that can never satisfy it.
    */
   gnssView(): GnssView | null;
+  /** OBD collector health (obd2 P1); null when the hardware block declares no `peripherals.obd`. */
+  obdStatus(): ObdStatus | null;
+  /** The config report's `effective.obd`; null without the peripheral. */
+  obdReport(): ObdEffectiveReport | null;
 } {
   const collectors: Collector[] = [];
   const system = ioCapabilities.system
@@ -127,6 +152,13 @@ export function createCollector(
   if (gps) collectors.push(gps);
   if (ioCapabilities.comm?.signal) collectors.push(createLteCollector());
   if (system) collectors.push(system);
+  // RUST-PORT: collector-creation seam (obd2 P1). Gated ONLY on the hardware
+  // block's `peripherals.obd`; with it absent the collector list — and so the
+  // telemetry payload — is byte-for-byte what it was before (test asserts it).
+  const obd: ObdCollector | null = hardware.peripherals?.obd
+    ? createObdCollector({ onEvent: hardware.onEvent })
+    : null;
+  if (obd) collectors.push(obd);
 
   // The media collector supervises the KVS WebRTC runtime; it produces the
   // `media` field (and self-gates when off/unavailable). When disabled, media
@@ -163,6 +195,7 @@ export function createCollector(
     },
     stop(): void {
       media?.stop();
+      obd?.stop();
     },
     restartMediaChannel(streamKey: string): void {
       media?.restartChannel(streamKey);
@@ -187,6 +220,12 @@ export function createCollector(
     gnssView(): GnssView | null {
       if (!gps) return null;
       return { fix: gps.hasFix(), sky: gps.sky().state };
+    },
+    obdStatus(): ObdStatus | null {
+      return obd?.status() ?? null;
+    },
+    obdReport(): ObdEffectiveReport | null {
+      return obd?.report() ?? null;
     },
   };
 }

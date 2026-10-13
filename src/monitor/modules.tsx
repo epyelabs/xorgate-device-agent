@@ -23,6 +23,7 @@ import type {
   ActivityEvent,
   MediaStream,
   MetricLeaf,
+  ObdStatus,
   RunMode,
   StateSnapshot,
 } from "../agent/telemetry.js";
@@ -382,6 +383,121 @@ const system: Module = {
   },
 };
 
+/** OBD collector state → badge (obd2 P1). */
+function obdBadge(obd: ObdStatus): Status {
+  if (obd.forbidden > 0) return "error";
+  switch (obd.state) {
+    case "live":
+      return "ok";
+    case "connecting":
+    case "pairing":
+    case "probing":
+    case "starting":
+      return "busy";
+    case "ecu_silent":
+    case "backoff":
+    case "retrying":
+    case "unconfigured":
+      return "warn";
+    case "parked":
+    case "stopped":
+    case "adapter_not_found":
+      return "error";
+    default:
+      return "unknown";
+  }
+}
+const OBD_BADGE_COLOR: Record<Status, string> = {
+  ok: "green",
+  busy: "yellow",
+  warn: "yellow",
+  error: "red",
+  unknown: "gray",
+};
+const LINK_LABEL: Record<number, string> = { 0: "no adapter", 1: "adapter only", 2: "ECU answering" };
+
+function ObdDetail({ snapshot }: DetailProps) {
+  const obd = snapshot?.obd;
+  const m = snapshot?.latest?.metrics?.obd;
+  return (
+    <Box flexDirection="column">
+      <DetailTitle>OBD2 · vehicle (ELM327 over Bluetooth)</DetailTitle>
+      {obd ? (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text>
+            <Text color={OBD_BADGE_COLOR[obdBadge(obd)]}>● </Text>
+            {obd.state}
+            {obd.detail ? <Text color="gray"> — {obd.detail}</Text> : null}
+          </Text>
+          <Text>
+            <Text color="gray">link </Text>
+            {obd.link} ({LINK_LABEL[obd.link] ?? "?"})
+            <Text color="gray">   rate </Text>
+            {obd.reqPerSec === null ? "—" : `${obd.reqPerSec.toFixed(1)} req/s`}
+            <Text color="gray">   err </Text>
+            {obd.errors}
+            <Text color="gray">   forbidden </Text>
+            <Text color={obd.forbidden > 0 ? "red" : undefined}>{obd.forbidden}</Text>
+            <Text color="gray">   helper </Text>
+            {obd.helperVersion ?? "—"}
+          </Text>
+        </Box>
+      ) : null}
+      {m ? (
+        <Box flexDirection="column">
+          <Text>
+            <Text color="gray">engine </Text>
+            {leaf(m.rpm, 0)} · load {leaf(m.engine_load, 1)} · throttle {leaf(m.throttle, 1)} · run{" "}
+            {leaf(m.run_time, 0)}
+          </Text>
+          <Text>
+            <Text color="gray">motion </Text>
+            {leaf(m.speed, 0)} · gear {leaf(m.gear, 0)} · odometer {leaf(m.odometer, 1)}
+          </Text>
+          <Text>
+            <Text color="gray">temps  </Text>
+            coolant {leaf(m.coolant_temp, 0)} · intake {leaf(m.intake_temp, 0)} · ambient{" "}
+            {leaf(m.ambient_temp, 0)}
+          </Text>
+          <Text>
+            <Text color="gray">fuel   </Text>
+            {leaf(m.fuel_level, 1)} · rate {leaf(m.fuel_rate, 2)}
+          </Text>
+          <Text>
+            <Text color="gray">power  </Text>
+            module {leaf(m.module_voltage, 2)} · adapter {leaf(m.adapter_voltage, 2)}
+          </Text>
+          <Text>
+            <Text color="gray">dtc    </Text>
+            mil {leaf(m.mil, 0)} · count {leaf(m.dtc_count, 0)} · since clear{" "}
+            {leaf(m.distance_since_clear, 0)}
+          </Text>
+        </Box>
+      ) : obd ? (
+        <Text color="gray">no vehicle samples yet</Text>
+      ) : (
+        <NoData />
+      )}
+    </Box>
+  );
+}
+
+const obd: Module = {
+  id: "obd",
+  title: "OBD",
+  status: (s) => {
+    const o = s?.obd;
+    if (!o) {
+      const link = val(s?.latest?.metrics?.obd?.link);
+      return link === undefined ? UNKNOWN : { label: `link ${link}`, status: link === 2 ? "ok" : "warn" };
+    }
+    const rpm = val(s?.latest?.metrics?.obd?.rpm);
+    const label = o.state === "live" && rpm !== undefined ? `${Math.round(rpm)} rpm` : `${o.state} · link ${o.link}`;
+    return { label, status: obdBadge(o) };
+  },
+  Detail: ObdDetail,
+};
+
 /** KVS master per-channel lifecycle state → text color. */
 const STREAM_STATE_COLOR: Record<MediaStream["state"], string> = {
   starting: "yellow",
@@ -607,4 +723,4 @@ const activity: Module = {
 };
 
 /** Sidebar order = navigation order. */
-export const MODULES: Module[] = [activity, system, lte, gps, imu, media, settings];
+export const MODULES: Module[] = [activity, system, lte, gps, imu, obd, media, settings];

@@ -9,6 +9,7 @@ import { atomicWriteJson } from "../lib/atomicWrite.js";
 import type {
   ActivityEvent,
   ConnectionState,
+  ObdStatus,
   RecordingStatus,
   StateSnapshot,
   TelemetryPayload,
@@ -88,6 +89,12 @@ export class StateStore {
 
   setRecording(recording: RecordingStatus): void {
     this.snap.recording = recording;
+  }
+
+  /** OBD collector health (obd2 P1); null removes the key (no peripheral). */
+  setObd(obd: ObdStatus | null): void {
+    if (obd) this.snap.obd = obd;
+    else delete this.snap.obd;
   }
 
   setLatest(payload: TelemetryPayload): void {

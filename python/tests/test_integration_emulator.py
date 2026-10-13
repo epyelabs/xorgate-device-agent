@@ -162,6 +162,11 @@ class EmulatorLifecycleTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         states = [l["state"] for l in _by_type(lines, "status")]
         self.assertIn("backoff", states)
+        # WP3 joint run: the transition is its own status line, before the backoff
+        self.assertIn("ecu_silent", states)
+        self.assertLess(states.index("ecu_silent"), states.index("backoff"))
+        silent = [l for l in _by_type(lines, "status") if l["state"] == "ecu_silent"][0]
+        self.assertEqual(silent["link"], 1)
         detail = [l["detail"] for l in _by_type(lines, "status") if l["state"] == "backoff"][0]
         self.assertIn("ECU silent", detail)
         audit = _by_type(lines, "audit")[-1]

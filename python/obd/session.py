@@ -210,6 +210,10 @@ class Session:
         self._sleep(delay)
 
     def _after_ecu_silent(self, exc):
+        # Contract 1: the transition itself is a status line (the agent turns
+        # it into the "ECU silent, polling stopped" event); link 1 because the
+        # adapter still answers, only the ECU went quiet (ignition off).
+        self.status("ecu_silent", 1, str(exc)[:120])
         self._close("ecu silent")
         delay = self._backoff_delay(self._ecu_backoff_n)
         self._ecu_backoff_n += 1

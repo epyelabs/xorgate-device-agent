@@ -27,6 +27,8 @@ const NATIVE_CADENCE_HZ: Record<string, number> = {
   gps: 1,
   lte: 1,
   system: 1,
+  /** OBD helper default poll cycle (obd2 P1, constraint C10). */
+  obd: 1,
 };
 
 /** Tolerance so a tick landing a few ms early still counts as the next period. */

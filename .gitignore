@@ -5,3 +5,7 @@ creds/
 sim/build/
 sim/state/
 sim/creds/
+.venv-obd/
+.venv*/
+python/obd/emulator/elm.log*
+__pycache__/

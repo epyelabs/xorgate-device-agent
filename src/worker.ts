@@ -48,6 +48,7 @@ import { connect } from "./agent/mqtt.js";
 import { TelemetryScope, type ScopeChange } from "./agent/telemetry-scope.js";
 import { createSimulator } from "./agent/simulator.js";
 import { createCollector, type GroupSample } from "./agent/collectors/index.js";
+import { obdReportDue, type ObdEffectiveReport } from "./agent/collectors/obd.js";
 import { createMediaCollector } from "./agent/collectors/media.js";
 import { loadManifest, persistUploadBucket } from "./media/manifest.js";
 import { IotCredentialsProvider } from "./recording/iot-creds.js";
@@ -68,6 +69,7 @@ import { resolveBridgedCameras } from "./recording/video-capture.js";
 import type {
   RecordingStatus,
   StateSnapshot,
+  ObdStatus,
   TelemetryPayload,
   TelemetryReading,
 } from "./agent/telemetry.js";
@@ -118,7 +120,8 @@ if (hardwareBlock) {
   console.log(
     `[agent] hardware block: ${hardwareBlock.platform} encoder=${hardwareBlock.encoder} ` +
       `cameras=${hardwareBlock.video.map((v) => `${v.key}@${v.connector}`).join(",") || "none"} ` +
-      `rails=${hardwareBlock.rails} led=${hardwareBlock.statusLed ? "yes" : "no"} imu=${hardwareBlock.imu ?? "none"}`,
+      `rails=${hardwareBlock.rails} led=${hardwareBlock.statusLed ? "yes" : "no"} imu=${hardwareBlock.imu ?? "none"}` +
+      (hardwareBlock.peripherals?.obd ? " obd=elm327/bt-spp" : ""),
   );
 }
 
@@ -169,6 +172,8 @@ let cameraMountState: CameraMountState | null = null;
  * would be a temporal-dead-zone throw on the startup path.
  */
 let requestConfigReport: ((origin: "boot") => void) | null = null;
+/** Last OBD status seen by the publish tick (report-trigger edge detector). */
+let lastObdStatus: ObdStatus | null = null;
 
 async function reconcileCameraMountNow(): Promise<void> {
   if (config.mode !== "real") return;
@@ -277,6 +282,8 @@ const source: {
   samplePower?: () => Promise<PowerSampleReading | null>;
   gpsClock?: () => GpsClockReading | null;
   gnssView?: () => GnssView | null;
+  obdStatus?: () => ObdStatus | null;
+  obdReport?: () => ObdEffectiveReport | null;
 } =
   config.mode === "real"
     ? createCollector(
@@ -290,11 +297,24 @@ const source: {
           comm: { gps: true, signal: true },
         },
         config.media,
+        {
+          // Peripheral gating (obd2 P1): only a block that declares
+          // `peripherals.obd` adds the OBD collector; no block / no key is
+          // exactly the pre-plan collector list.
+          peripherals: hardwareBlock?.peripherals,
+          onEvent: (level, msg) => {
+            const t = Date.now();
+            store.event(level, msg, t);
+            store.flush(t, true);
+          },
+        },
       )
     : replay
       ? replay
       : (() => {
-        const next = createSimulator();
+        // A sim run of an OBD-equipped model emits a plausible `obd` group
+        // (obd2 P1) so the whole console path is exercisable without a car.
+        const next = createSimulator({ obd: hardwareBlock?.peripherals?.obd !== undefined });
         // Device-simulator plan (Phase 0 spike): a sim run that opts in with
         // XORGATE_SIM_MEDIA supervises the KVS masters exactly like real mode,
         // so a container whose capture pipeline is fed from a file can stream
@@ -717,6 +737,9 @@ const configSync = new ConfigSync({
   // sees that this device fell back to the unscoped telemetry topic. Nothing
   // else off-box can tell — the first-party console subscribes to both planes.
   telemetryScope: () => telemetryScope.report(),
+  // Reported-only (obd2 P1): the OBD collector's state + the helper's vehicle
+  // profile and audit, so an incident is visible in the console without SSH.
+  obd: () => source.obdReport?.() ?? null,
   hints: () => {
     const status = recording.status();
     return {
@@ -842,6 +865,17 @@ function handleConfigMessage(payload: Buffer): void {
     );
     store.event("info", `hardware block updated: ${hardwareBlock.platform}/${hardwareBlock.encoder}`, now);
     store.flush(now, true);
+    // The OBD collector is created once at startup from the boot-time block
+    // (obd2 P1); a peripheral that appears or disappears live is persisted
+    // above and takes effect on the next restart — say so rather than run a
+    // collector the block no longer declares (or miss one it now does).
+    const obdDeclared = hardwareBlock.peripherals?.obd !== undefined;
+    const obdRunning = (source.obdStatus?.() ?? null) !== null;
+    if (obdDeclared !== obdRunning) {
+      console.warn("[agent] hardware block changed peripherals.obd — restart the agent to apply");
+      store.event("warn", "hardware block changed peripherals.obd — restart the agent to apply", now);
+      store.flush(now, true);
+    }
     void reconcileHardwareNow()
       .then((changedStreams) => {
         for (const streamKey of changedStreams) source.restartMediaChannel?.(streamKey);
@@ -1254,6 +1288,14 @@ client.on("connect", () => {
         recording: recordingStatus,
       };
       store.setLatest(payload);
+      // OBD collector health for `xorgate status` / the monitor (obd2 P1);
+      // a snapshot read from the collector, never a spawn.
+      const obdNow = source.obdStatus?.() ?? null;
+      // A link move or a park/exit re-publishes the config report so the
+      // cloud's `effective.obd` follows the helper (debounced in ConfigSync).
+      if (obdReportDue(lastObdStatus, obdNow)) requestConfigReport?.("boot");
+      lastObdStatus = obdNow;
+      store.setObd(obdNow);
       // The backoff re-probe lives on this tick rather than its own timer: it
       // only ever matters while we are publishing, and this is the publish.
       const reprobe = telemetryScope.noteTick(ts);

@@ -7,6 +7,7 @@ import { inspect, type DaemonStatus } from "../daemon/manager.js";
 import { logPath, runtimeHome } from "../daemon/runtime.js";
 import { ageLabel, formatBytes, uptimeLabel } from "../lib/format.js";
 import { formatBuildInfo } from "../lib/build-info.js";
+import type { ObdStatus } from "../agent/telemetry.js";
 
 const useColor = process.stdout.isTTY && process.env.NO_COLOR === undefined;
 const c = (code: string, s: string): string => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -112,9 +113,23 @@ function print(st: DaemonStatus, now: number): void {
       const parts = capture.map((s) => `${s.streamKey} ${s.recording ? green("recording") : gray("idle")}`);
       console.log(`  video      ${parts.join("   ")}`);
     }
+    if (state.obd) console.log(`  ${obdStatusLine(state.obd)}`);
     if (state.lastError) console.log(`  last error ${yellow(state.lastError)}`);
   } else {
     console.log(gray("  (no state snapshot yet)"));
   }
   console.log(dim(`  log        ${logPath()}`));
+}
+
+/**
+ * The `obd` status line (obd2 P1, plan 7.5), e.g.
+ * `obd        live  link 2  10.0 req/s  err 0  forbidden 0  14.1 V`.
+ * Pure and colorless so it is testable and greppable; the label column
+ * matches the other rows (`telemetry  …`).
+ * RUST-PORT: status-line seam — same columns, same order.
+ */
+export function obdStatusLine(obd: ObdStatus): string {
+  const rate = obd.reqPerSec === null ? "— req/s" : `${obd.reqPerSec.toFixed(1)} req/s`;
+  const volts = obd.voltage === null ? "— V" : `${obd.voltage.toFixed(1)} V`;
+  return `obd        ${obd.state}  link ${obd.link}  ${rate}  err ${obd.errors}  forbidden ${obd.forbidden}  ${volts}`;
 }

@@ -33,7 +33,17 @@ function channel(initial: number, step: number, min: number, max: number): () =>
   };
 }
 
-export function createSimulator(): () => TelemetryReading {
+export interface SimulatorOptions {
+  /**
+   * Emit a plausible `obd` group (obd2 P1): the device's hardware block
+   * declares `peripherals.obd`, so a sim run of that model should look like
+   * the real thing — idle rpm, a slowly draining tank, an odometer that
+   * follows the simulated speed, ECU answering (link 2).
+   */
+  obd?: boolean;
+}
+
+export function createSimulator(opts: SimulatorOptions = {}): () => TelemetryReading {
   // IMU: a slowly rotating orientation quaternion (mirrors the BNO085 rotation
   // vector) plus small linear-accel jitter around zero — the BNO085 reports
   // gravity-removed acceleration, so z hovers near 0 rather than ~9.81.
@@ -64,6 +74,18 @@ export function createSimulator(): () => TelemetryReading {
   const ramUsage = channel(47, 1.5, 10, 95); // %
   const diskUsage = channel(38, 0.3, 5, 95); // %
 
+  // OBD (opt-in): a warm idling engine. Odometer integrates the GPS sim speed
+  // over wall time so a 10 Hz recorder and a 1 Hz publisher agree on distance.
+  const rpmJitter = channel(0, 8, -40, 40);
+  const engineLoad = channel(22, 1.5, 10, 45); // % at idle
+  const throttle = channel(11, 0.6, 8, 18); // %
+  const moduleVoltage = channel(14.1, 0.03, 13.6, 14.5); // V, alternator running
+  let coolant = 42; // °C, warms toward 90
+  let fuel = 61.2; // %, drains slowly
+  let odometer = 48213.4; // km
+  let runTime = 0; // s
+  let obdLastMs = Date.now();
+
   return function next(): TelemetryReading {
     const spd = speed();
     // Wander the heading slowly, then step position along it so the track and
@@ -82,6 +104,32 @@ export function createSimulator(): () => TelemetryReading {
       k: Math.cos(imuT / 4) * 0.2,
     });
     const euler = quatToEuler(quat);
+
+    let obd: TelemetryReading["metrics"]["obd"] | undefined;
+    if (opts.obd) {
+      const nowMs = Date.now();
+      const dtS = Math.max(0, Math.min(5, (nowMs - obdLastMs) / 1000));
+      obdLastMs = nowMs;
+      runTime += dtS;
+      coolant = Math.min(90, coolant + dtS * 0.08);
+      fuel = Math.max(5, fuel - dtS * 0.0004);
+      odometer += (spd / 3600) * dtS;
+      obd = {
+        link: { value: 2 },
+        rpm: { value: Math.round(900 + spd * 45 + rpmJitter()), unit: "rpm" },
+        speed: { value: Math.round(spd), unit: "km/h" },
+        coolant_temp: { value: Math.round(coolant), unit: "°C" },
+        engine_load: { value: round(engineLoad(), 1), unit: "%" },
+        throttle: { value: round(throttle() + spd * 0.8, 1), unit: "%" },
+        fuel_level: { value: round(fuel, 1), unit: "%" },
+        module_voltage: { value: round(moduleVoltage(), 2), unit: "V" },
+        run_time: { value: Math.round(runTime), unit: "s" },
+        odometer: { value: round(odometer, 1), unit: "km" },
+        gear: { value: spd < 1 ? 0 : Math.min(6, 1 + Math.floor(spd / 12)) },
+        mil: { value: 0 },
+        dtc_count: { value: 0 },
+      };
+    }
 
     return {
       metrics: {
@@ -118,6 +166,7 @@ export function createSimulator(): () => TelemetryReading {
           ram_usage: { value: round(ramUsage(), 1), unit: "%" },
           disk_usage: { value: round(diskUsage(), 1), unit: "%" },
         },
+        ...(obd ? { obd } : {}),
       },
       media: {
         kvs: { value: false },

@@ -37,6 +37,7 @@ on:
     paths:
       - "src/**"
       - "systemd/**"
+      - "python/**"
       - "modem/**"
       - "system/**"
       - "package.json"
@@ -104,6 +105,8 @@ jobs:
           tar -tzf "$TARBALL" | grep -q "^package-lock.json$" || { echo "missing package-lock.json"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^systemd/xorgate-agent.service$" || { echo "missing systemd unit"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^python/bno085_read.py$" || { echo "missing python/bno085_read.py"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^python/obd_read.py$" || { echo "missing python/obd_read.py"; exit 1; }
+          tar -tzf "$TARBALL" | grep -q "^python/obd/session.py$" || { echo "missing python/obd/session.py"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^modem/sim7600-lte.sh$" || { echo "missing modem/sim7600-lte.sh"; exit 1; }
           tar -tzf "$TARBALL" | grep -q "^dist/build-info.json$" || { echo "missing dist/build-info.json"; exit 1; }
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"

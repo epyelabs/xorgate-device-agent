@@ -39,6 +39,21 @@ export interface HardwareVideo {
   maxFps?: number;
 }
 
+/**
+ * OBD2 peripheral declaration (obd2-bluetooth-integration, P1): an ELM327
+ * adapter reached over Bluetooth SPP. The only shape v1 accepts; anything else
+ * under `peripherals.obd` is ignored with a warning (see parseHardwareBlock).
+ */
+export interface HardwareObdPeripheral {
+  adapter: "elm327";
+  transport: "bt-spp";
+}
+
+/** Optional peripherals a model declares beyond its own board. */
+export interface HardwarePeripherals {
+  obd?: HardwareObdPeripheral;
+}
+
 export interface DeviceHardwareBlock {
   v: 2;
   platform: Platform;
@@ -48,6 +63,12 @@ export interface DeviceHardwareBlock {
   /** IMU part number, or null when the model declares no IMU. */
   imu: string | null;
   video: HardwareVideo[];
+  /**
+   * Present ONLY when at least one recognised peripheral is declared, so a
+   * block without peripherals serialises exactly as it did before this key
+   * existed (hardwareBlocksEqual compares the JSON).
+   */
+  peripherals?: HardwarePeripherals;
 }
 
 function isPlatform(v: unknown): v is Platform {
@@ -68,11 +89,54 @@ function pin(v: unknown): number | null {
 }
 
 /**
+ * `peripherals` is the ONE lenient key of the block (obd2 P1 contract 2): an
+ * invalid or unknown peripheral entry is dropped with a single warning and the
+ * rest of the block stays valid. A peripheral is additive (a collector that
+ * runs or does not), never a fact the camera/encoder path depends on, so a typo
+ * here must not knock a fielded device back to legacy wiring the way a bad
+ * encoder token rightly does.
+ *
+ * RUST-PORT: hardware-block parse seam. The Rust port's block struct gains the
+ * same optional `peripherals.obd {adapter, transport}` with the same leniency;
+ * see docs/PORTING-obd.md.
+ */
+function parsePeripherals(
+  raw: unknown,
+  warn: (msg: string) => void,
+): HardwarePeripherals | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    warn("peripherals is not an object — ignoring it (rest of the block kept)");
+    return undefined;
+  }
+  const out: HardwarePeripherals = {};
+  for (const [key, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (key !== "obd") {
+      warn(`peripherals.${key} is not a known peripheral — ignoring it`);
+      continue;
+    }
+    const e = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null;
+    if (e && e.adapter === "elm327" && e.transport === "bt-spp") {
+      out.obd = { adapter: "elm327", transport: "bt-spp" };
+    } else {
+      warn(
+        `peripherals.obd ${JSON.stringify(entry)} is not {adapter:"elm327",transport:"bt-spp"} — ignoring it`,
+      );
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
  * Validate a hardware block. Returns null (and the caller logs + falls back to
  * legacy behavior) on ANY unrecognized enum or malformed required field —
- * tolerant only about truly optional extras.
+ * tolerant only about truly optional extras (and, by design, `peripherals`:
+ * see parsePeripherals).
  */
-export function parseHardwareBlock(obj: unknown): DeviceHardwareBlock | null {
+export function parseHardwareBlock(
+  obj: unknown,
+  warn: (msg: string) => void = (m) => console.warn(`[hardware] ${m}`),
+): DeviceHardwareBlock | null {
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
   const o = obj as Record<string, unknown>;
   if (o.v !== 2) return null;
@@ -110,6 +174,8 @@ export function parseHardwareBlock(obj: unknown): DeviceHardwareBlock | null {
     });
   }
 
+  const peripherals = parsePeripherals(o.peripherals, warn);
+
   return {
     v: 2,
     platform: o.platform,
@@ -118,6 +184,7 @@ export function parseHardwareBlock(obj: unknown): DeviceHardwareBlock | null {
     statusLed,
     imu: typeof o.imu === "string" && o.imu.length > 0 ? o.imu : null,
     video,
+    ...(peripherals ? { peripherals } : {}),
   };
 }
 
@@ -143,7 +210,7 @@ export function loadHardwareBlock(
     log(`${path} is not valid JSON — ignoring; using legacy hardware behavior`);
     return null;
   }
-  const block = parseHardwareBlock(obj);
+  const block = parseHardwareBlock(obj, log);
   if (block === null) {
     log(`${path} failed validation — ignoring; using legacy hardware behavior`);
   }

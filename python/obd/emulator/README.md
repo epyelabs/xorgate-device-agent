@@ -14,6 +14,9 @@ Scenarios in the module:
 | `taos-2022` | the car at idle, ISO 15765-4 CAN 11/500 (`ATDPN` `A6`) |
 | `taos-2022-badproto` | same car but `ATDPN` `A3`: the helper must refuse (exit 4) |
 | `taos-2022-nodata2f` | PID `2F` advertised in the bitmap but answers `NO DATA`: polled once, then dropped |
+| `taos-2022-crank` | start-stop: rpm 0 for four reads, the fourth PID 42 read is a 9.82 V crank dip, then 928 rpm at 14.40 V; the helper must not stop (either power source) |
+| `taos-2022-ignoff` | ignition off on a CAN-only car: AT answers, `0100` is `SEARCHING...` / `UNABLE TO CONNECT`, every PID `NO DATA` (deterministic, unlike the built-in `engineoff`); the helper probes without tearing the link down |
+| `taos-2022-lowbatt` | engine off, 11.50 V for eight PID 42 reads then 13.40 V; `constant` power stops after the sustained window and resumes from one re-check, `switched` never stops |
 
 ## Install (never system-wide)
 

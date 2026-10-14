@@ -5,7 +5,25 @@ backoff, stopped, adapter_not_found. link: 0 none, 1 adapter only,
 2 ECU answering. Exit codes: 2 no Bluetooth controller, 3 adapter unreachable
 after 10 min of backoff, 4 protocol refused, 5 repeated stop conditions,
 6 software bug (forbidden/budget). SIGINT/SIGTERM: ATZ, close, exit 0.
+
+Start-stop awareness (2026-10-14 Taos drive, fix/obd-startstop-voltage):
+- rpm 0 with the ECU answering is a normal `live` state (engine auto-stop at
+  a light). Ignition off is ONLY three consecutive misses once the ECU has
+  answered; the RFCOMM link then stays open and ONE probe (010C1) goes out on
+  the ECU_SILENT_PROBE_SCHEDULE until the first answer resumes polling. The
+  link is torn down only on transport errors, stop strings or a signal.
+- Voltage (rule 5) depends on --power-source. `switched` (the socket dies
+  with the ignition): never stop, count the episode (`voltage_low_events`),
+  log it, refresh the status detail. `constant`: stop only after a SUSTAINED
+  low (>= VOLTAGE_SUSTAIN_S and >= VOLTAGE_SUSTAIN_CYCLES consecutive cycles
+  below V_STOP) while rpm is 0 or unknown; a single low sample (a crank dip)
+  never stops. Stopped = link kept open, status `stopped` link 1, ONE request
+  per VOLTAGE_RECHECK_S (PID 42 while the ECU answers, else ATRV, alternating
+  back so a returning ECU is seen), resume at >= V_RESUME. On the Taos the
+  old rule fired twice in one 24 min drive (11.72 V after 50 s of auto-stop,
+  then a 9.82 V crank dip) and each stop cost a 600 s blind window.
 """
+import os
 import re
 import sys
 import time
@@ -15,7 +33,7 @@ from . import HELPER_VERSION
 from .allowlist import ALLOWLIST_SHA256
 from .decoders import FIELDS, DEFAULT_FIELDS, decode_field, plan_fields
 from .gate import Gate, Forbidden, BudgetExceeded, StopCondition, LinkLost, new_counters
-from .isotp import isotp_reassemble, is_no_data, supported_bitmap, find_payload
+from .isotp import isotp_reassemble, supported_bitmap, find_payload
 from .transport import TransportError, NoBluetooth, RfcommTransport, SerialTransport
 
 # voltage policy (D6); ATRV reads ~0.85 V below PID 42 on the Vgate, corrected
@@ -23,19 +41,50 @@ from .transport import TransportError, NoBluetooth, RfcommTransport, SerialTrans
 V_STOP = 11.8
 V_RESUME = 12.4
 ATRV_OFFSET_V = 0.85
-VOLTAGE_BACKOFF_S = 600.0
 
-BACKOFF_CAP_S = 300.0
-STOP_BACKOFF_BASE_S = 60.0
+# Test-only timescale (python/tests): scales every policy interval below so
+# the emulator tests run in seconds. Never set on a device; default 1.0.
+_TIMESCALE = float(os.environ.get("OBD_TEST_TIMESCALE", "1") or "1")
+if not (0.001 <= _TIMESCALE <= 1.0):
+    _TIMESCALE = 1.0
+
+# constant power: low for this long AND this many consecutive cycles, with
+# rpm 0/unknown, before polling stops
+VOLTAGE_SUSTAIN_S = 30.0 * _TIMESCALE
+VOLTAGE_SUSTAIN_CYCLES = 3
+# stopped on voltage: one request per re-check, link kept open
+VOLTAGE_RECHECK_S = 60.0 * _TIMESCALE
+# reconnect cap while a voltage hold loses the link (was 600 s)
+VOLTAGE_BACKOFF_CAP_S = 300.0 * _TIMESCALE
+
+# ECU silent: (until elapsed s, probe interval s); the last entry is forever
+ECU_SILENT_PROBE_SCHEDULE = (
+    (600.0 * _TIMESCALE, 10.0 * _TIMESCALE),
+    (3600.0 * _TIMESCALE, 60.0 * _TIMESCALE),
+    (None, 300.0 * _TIMESCALE),
+)
+ECU_PROBE_CMD = "010C1"
+
+BACKOFF_CAP_S = 300.0 * _TIMESCALE
+STOP_BACKOFF_BASE_S = 60.0 * _TIMESCALE
 ADAPTER_UNREACHABLE_S = 600.0
 STOP_SESSIONS_LIMIT = 3
 ECU_MISS_LIMIT = 3
-IDENTITY_EVERY_S = 60.0
-ATRV_EVERY_S = 60.0
-AUDIT_EVERY_S = 60.0
+IDENTITY_EVERY_S = 60.0 * _TIMESCALE
+ATRV_EVERY_S = 60.0 * _TIMESCALE
+AUDIT_EVERY_S = 60.0 * _TIMESCALE
 RETRIES = 3
 
 _VOLT = re.compile(r"(\d+(?:\.\d+)?)\s*V")
+
+
+def ecu_silent_probe_interval(elapsed_s):
+    """Probe cadence while the ECU is silent: 10 s for 10 min, 60 s for the
+    rest of the hour, then 300 s. Pure; unit-tested."""
+    for until, interval in ECU_SILENT_PROBE_SCHEDULE:
+        if until is None or elapsed_s < until:
+            return interval
+    return ECU_SILENT_PROBE_SCHEDULE[-1][1]
 
 
 class Shutdown(BaseException):
@@ -74,6 +123,7 @@ class Session:
         self.gate = Gate(audit, self.counters, self.inventory, mac=args.adapter or "")
         self.poll_hz = max(0.05, float(args.poll_hz))
         self.requested = self._parse_fields(args.fields)
+        self.power_source = getattr(args, "power_source", "switched") or "switched"
         self.state = None
         self.link = 0
         self.identity = {}
@@ -84,7 +134,14 @@ class Session:
         self._stop_sessions = 0
         self._connect_fail_since = None
         self._backoff_n = 0
-        self._ecu_backoff_n = 0
+        # voltage episode tracking (both power sources)
+        self._low_episode = False      # below V_STOP, not yet back above V_RESUME
+        self._low_since = None         # monotonic start of the consecutive-low run
+        self._low_cycles = 0
+        self._voltage_hold = False     # constant power: polling stopped on voltage
+        # per-session poll bookkeeping (survives an ecu_silent / voltage resume)
+        self._answered = set()
+        self._dropped = set()
         # True once the shutdown close has run: later signals are ignored
         # (the agent SIGINTs us and systemd SIGTERMs the cgroup ~100 ms apart).
         self.closed = False
@@ -143,14 +200,10 @@ class Session:
                     self._session()
                 except (LinkLost, TransportError) as exc:
                     self._after_link_loss(exc)
-                except EcuSilent as exc:
-                    self._after_ecu_silent(exc)
                 except StopCondition as exc:
                     self._after_stop(exc)
                 except IdentityChanged as exc:
                     self._after_identity(exc)
-                except VoltageLow as exc:
-                    self._after_voltage(exc)
         except Shutdown:
             self._close("shutdown")
             self.closed = True
@@ -194,7 +247,8 @@ class Session:
     def _after_link_loss(self, exc):
         self.counters["reconnects"] += 1
         self._close("link lost")
-        delay = self._backoff_delay(self._backoff_n)
+        cap = VOLTAGE_BACKOFF_CAP_S if self._voltage_hold else BACKOFF_CAP_S
+        delay = self._backoff_delay(self._backoff_n, cap=cap)
         self._backoff_n += 1
         self.status("backoff", 0, "link: %s; retry in %.0f s" % (str(exc)[:80], delay))
         self._sleep(delay)
@@ -211,17 +265,6 @@ class Session:
         delay = self._backoff_delay(self._backoff_n)
         self._backoff_n += 1
         self.status("backoff", 0, "adapter unreachable; retry in %.0f s" % delay)
-        self._sleep(delay)
-
-    def _after_ecu_silent(self, exc):
-        # Contract 1: the transition itself is a status line (the agent turns
-        # it into the "ECU silent, polling stopped" event); link 1 because the
-        # adapter still answers, only the ECU went quiet (ignition off).
-        self.status("ecu_silent", 1, str(exc)[:120])
-        self._close("ecu silent")
-        delay = self._backoff_delay(self._ecu_backoff_n)
-        self._ecu_backoff_n += 1
-        self.status("backoff", 0, "ECU silent (%s); retry in %.0f s" % (str(exc)[:60], delay))
         self._sleep(delay)
 
     def _after_stop(self, exc):
@@ -243,14 +286,6 @@ class Session:
         self.status("backoff", 0, "adapter identity changed; reconnecting in 1 s")
         self._sleep(1.0)
 
-    def _after_voltage(self, exc):
-        self.counters["err_voltage"] += 1
-        self.gate.last_stop = {"ts": time.time(), "reason": "voltage: %s" % str(exc)[:80]}
-        self._close("voltage low")
-        self.status("stopped", 0, str(exc)[:120])
-        self.status("backoff", 0, "voltage low; retry in %.0f s" % VOLTAGE_BACKOFF_S)
-        self._sleep(VOLTAGE_BACKOFF_S)
-
     # ---------------------------------------------------------- one session
     def _session(self):
         transport = self._connect()
@@ -259,11 +294,22 @@ class Session:
         self.gate.open(transport, uuid.uuid4().hex[:12])
         self._backoff_n = 0
         self._connect_fail_since = None
+        self._answered = set()
+        self._dropped = set()
         self._handshake()
+        self._wait_for_ecu()
         self._probe()
         self._stop_sessions = 0
-        self._ecu_backoff_n = 0
-        self._poll_loop()
+        # The link stays open across ECU silence and voltage holds: both
+        # return here and polling resumes with the same plan. Transport
+        # errors, stop strings and identity changes still unwind to run().
+        while True:
+            try:
+                self._poll_loop()
+            except EcuSilent as exc:
+                self._ecu_silent_wait(exc)
+            except VoltageLow as exc:
+                self._voltage_hold_wait(exc)
 
     def _connect(self):
         if self.args.serial:
@@ -321,6 +367,19 @@ class Session:
                 return float(m.group(1))
         return None
 
+    def _read_pid42(self):
+        """One PID 42 request: (volts or None, ecu_answered)."""
+        lines, status = self._send("01421")
+        if status != "ok":
+            return None, False
+        _, payload = find_payload(isotp_reassemble(lines), "4142")
+        if payload is None:
+            return None, False
+        try:
+            return decode_field("module_voltage", "42", payload[4:]), True
+        except (ValueError, IndexError):
+            return None, True
+
     def _handshake(self):
         self.status("connecting", 0, "handshake")
         self._send("ATZ", timeout=6.0, settle=1.0)
@@ -339,11 +398,37 @@ class Session:
         self.last_atrv = time.monotonic()
         self._voltage_gate(self.adapter_voltage, corrected=True, context="handshake")
         self._expect_ok("ATSP0")
-        first, status = self._send("0100", timeout=15.0)
-        per = isotp_reassemble(first)
-        responders = sorted(h for h, p in per.items() if p.upper().startswith("4100"))
-        if status != "ok" or not responders:
-            raise EcuSilent("0100 -> %s %r" % (status, first[-2:]))
+
+    def _wait_for_ecu(self):
+        """Send 0100 until some ECU answers. A silent bus at connect time
+        (constant power, ignition off) is `ecu_silent` link 1 with the link
+        kept open and the probe schedule, exactly like silence after live."""
+        t0 = time.monotonic()
+        n = 0
+        while True:
+            # 15 s: the ATSP0 search tries every protocol (K-line inits included)
+            lines, status = self._send("0100", timeout=15.0)
+            per = isotp_reassemble(lines)
+            responders = sorted(h for h, p in per.items() if p.upper().startswith("4100"))
+            if status == "ok" and responders:
+                break
+            if n == 0:
+                detail = "0100 -> %s %r" % (status, lines[-2:])
+                self.status("ecu_silent", 1, "%s; probing 0100" % detail[:100])
+                self.audit.write({"kind": "ecu_silent", "ts": time.time(),
+                                  "session": self.gate.session_id, "detail": detail[:160],
+                                  "probe": "0100"}, sync=True)
+            n += 1
+            elapsed = time.monotonic() - t0
+            interval = ecu_silent_probe_interval(elapsed)
+            if n % 6 == 0:
+                self.status("ecu_silent", 1, "no ECU for %.0f s; probing 0100 every %.0f s"
+                            % (elapsed, interval))
+            self._sleep(interval)
+        if n:
+            self.audit.write({"kind": "ecu_resumed", "ts": time.time(),
+                              "session": self.gate.session_id, "probes": n}, sync=True)
+            self.status("probing", 1, "ECU answering after %d probe(s)" % n)
         dpn = " ".join(self._send("ATDPN")[0]).strip().upper()
         dp = " ".join(self._send("ATDP")[0]).strip()
         self.protocol = {"dpn": dpn, "dp": dp}
@@ -352,7 +437,7 @@ class Session:
             self.gate.last_stop = {"ts": time.time(), "reason": "protocol %s" % dpn}
             raise ProtocolRefused("protocol %r (%s) is not ISO 15765-4 CAN (ATDPN 6/7)"
                                   % (dpn, dp))
-        self._first_0100 = (first, per, responders)
+        self._first_0100 = (lines, per, responders)
 
     # ---------------------------------------------------------- probe
     def _probe(self):
@@ -394,6 +479,10 @@ class Session:
         # PID 42 feeds the voltage policy even when module_voltage is not requested
         if "42" in supported_hex and "42" not in plan:
             plan["42"] = []
+        # constant power: PID 0C feeds the policy too (never stop while the
+        # engine runs), one extra request per cycle only when rpm is not polled
+        if self.power_source == "constant" and "0C" in supported_hex and "0C" not in plan:
+            plan["0C"] = []
         self.plan = plan
         self.supported_fields = supported
         powertrain = "unknown"
@@ -419,30 +508,135 @@ class Session:
                           "at1": self.identity["at1"], "dpn": self.protocol["dpn"],
                           "dp": self.protocol["dp"], "mode01_bitmaps": pids_by_ecu_hex,
                           "mode09_bitmaps": mode09, "vin_hash": None,
-                          "power_source": self.args.power_source,
+                          "power_source": self.power_source,
                           "helper_version": HELPER_VERSION,
                           "allowlist_sha256": ALLOWLIST_SHA256}, sync=True)
         self.emit(self.profile)
 
     # ---------------------------------------------------------- voltage
-    def _voltage_gate(self, volts, corrected, context):
-        """Rule 5: stop below V_STOP, resume only above V_RESUME."""
+    def _voltage_gate(self, volts, corrected, context, rpm=None):
+        """Rule 5, start-stop aware. Tracks a low EPISODE (below V_STOP until
+        back above V_RESUME) on both power sources; raises VoltageLow only on
+        constant power after a sustained low with rpm 0/unknown."""
         if volts is None:
             return
         v = volts + (ATRV_OFFSET_V if corrected else 0.0)
-        threshold = V_RESUME if self._voltage_hold else V_STOP
-        if v < threshold:
-            self._voltage_hold = True
-            raise VoltageLow("%.2f V (%s) below %.1f V" % (v, context, threshold))
-        self._voltage_hold = False
+        now = time.monotonic()
+        if v >= V_STOP:
+            self._low_since = None
+            self._low_cycles = 0
+            if self._low_episode and v >= V_RESUME:
+                self._low_episode = False
+                self.log("voltage recovered: %.2f V (%s)" % (v, context))
+            return
+        # below V_STOP
+        if not self._low_episode:
+            self._low_episode = True
+            self.counters["voltage_low_events"] += 1
+            self.audit.write({"kind": "voltage_low", "ts": time.time(),
+                              "session": self.gate.session_id, "volts": round(v, 2),
+                              "source": context, "rpm": rpm,
+                              "power_source": self.power_source}, sync=True)
+            if self.power_source == "switched":
+                self.log("voltage low %.2f V (%s), rpm %s: ignored on switched power (event %d)"
+                         % (v, context, rpm, self.counters["voltage_low_events"]))
+                if self.state == "live":
+                    self.status("live", 2, "voltage low %.2f V (%s) ignored: switched power"
+                                % (v, context))
+            else:
+                self.log("voltage low %.2f V (%s), rpm %s: watching for %.0f s"
+                         % (v, context, rpm, VOLTAGE_SUSTAIN_S))
+        if self.power_source != "constant":
+            return
+        if rpm is not None and rpm > 0:
+            # alternator running: a low reading is never a reason to stop
+            self._low_since = None
+            self._low_cycles = 0
+            return
+        if self._low_since is None:
+            self._low_since = now
+        self._low_cycles += 1
+        if (now - self._low_since >= VOLTAGE_SUSTAIN_S
+                and self._low_cycles >= VOLTAGE_SUSTAIN_CYCLES):
+            raise VoltageLow("%.2f V (%s) below %.1f V for %.0f s, rpm %s"
+                             % (v, context, V_STOP, now - self._low_since,
+                                "0" if rpm == 0 else "unknown"))
 
-    _voltage_hold = False
+    def _voltage_hold_wait(self, exc):
+        """Constant power, sustained low: stop polling, keep the link, one
+        request per VOLTAGE_RECHECK_S until >= V_RESUME."""
+        self.counters["err_voltage"] += 1
+        self._voltage_hold = True
+        self._low_since = None
+        self._low_cycles = 0
+        self.gate.last_stop = {"ts": time.time(), "reason": "voltage: %s" % str(exc)[:80]}
+        self.audit.write({"kind": "voltage_hold", "ts": time.time(),
+                          "session": self.gate.session_id, "detail": str(exc)[:160]}, sync=True)
+        self.status("stopped", 1, "%s; re-check every %.0f s" % (str(exc)[:100], VOLTAGE_RECHECK_S))
+        self.emit_audit()
+        ecu_answers = True
+        n = 0
+        try:
+            while True:
+                self._sleep(VOLTAGE_RECHECK_S)
+                n += 1
+                if ecu_answers:
+                    v, ecu_answers = self._read_pid42()
+                    context = "PID 42"
+                else:
+                    raw = self._read_atrv()
+                    if raw is not None:
+                        self.adapter_voltage = raw
+                    v = raw + ATRV_OFFSET_V if raw is not None else None
+                    context = "ATRV"
+                    ecu_answers = True   # try PID 42 again next time
+                if v is not None and v >= V_RESUME:
+                    self.log("voltage resume: %.2f V (%s) after %d re-check(s)" % (v, context, n))
+                    self.audit.write({"kind": "voltage_resume", "ts": time.time(),
+                                      "session": self.gate.session_id, "volts": round(v, 2),
+                                      "source": context, "rechecks": n}, sync=True)
+                    self._low_episode = False
+                    return
+                self.status("stopped", 1, "voltage %s (%s); re-check every %.0f s"
+                            % ("%.2f V" % v if v is not None else "unknown", context,
+                               VOLTAGE_RECHECK_S))
+        finally:
+            self._voltage_hold = False
+
+    # ---------------------------------------------------------- ECU silent
+    def _ecu_silent_wait(self, exc):
+        """Three misses after the ECU had answered: keep the link, send ONE
+        010C1 probe on the schedule, resume on the first answer."""
+        t0 = time.monotonic()
+        self.status("ecu_silent", 1, "%s; probing %s every %.0f s"
+                    % (str(exc)[:70], ECU_PROBE_CMD, ecu_silent_probe_interval(0)))
+        self.audit.write({"kind": "ecu_silent", "ts": time.time(),
+                          "session": self.gate.session_id, "detail": str(exc)[:160],
+                          "probe": ECU_PROBE_CMD}, sync=True)
+        n = 0
+        while True:
+            elapsed = time.monotonic() - t0
+            interval = ecu_silent_probe_interval(elapsed)
+            self._sleep(interval)
+            lines, status = self._send(ECU_PROBE_CMD)
+            n += 1
+            if status == "ok":
+                _, payload = find_payload(isotp_reassemble(lines), "410C")
+                if payload is not None:
+                    self.log("ECU answering again after %d probe(s), %.0f s" % (n, elapsed))
+                    self.audit.write({"kind": "ecu_resumed", "ts": time.time(),
+                                      "session": self.gate.session_id, "probes": n,
+                                      "silent_s": round(time.monotonic() - t0, 1)}, sync=True)
+                    return
+            if n % 6 == 0:
+                self.status("ecu_silent", 1, "silent %.0f s; probing %s every %.0f s"
+                            % (time.monotonic() - t0, ECU_PROBE_CMD, interval))
 
     # ---------------------------------------------------------- poll loop
     def _poll_loop(self):
         period = 1.0 / self.poll_hz
-        answered = set()
-        dropped = set()
+        answered = self._answered
+        dropped = self._dropped
         consecutive_misses = 0
         cycle_budget = 4 * max(1, len(self.plan)) + 8
         self.status("live", 2, "polling %d PIDs at %.2f Hz" % (len(self.plan), self.poll_hz))
@@ -451,6 +645,7 @@ class Session:
             req0 = self.counters["requests"]
             fields = {}
             module_voltage = None
+            policy_rpm = None
             for pid, names in self.plan.items():
                 if pid in dropped:
                     continue
@@ -469,6 +664,12 @@ class Session:
                         if pid == "42":
                             try:
                                 module_voltage = decode_field("module_voltage", "42", data)
+                                value_ok = True
+                            except (ValueError, IndexError):
+                                pass
+                        if pid == "0C":
+                            try:
+                                policy_rpm = decode_field("rpm", "0C", data)
                                 value_ok = True
                             except (ValueError, IndexError):
                                 pass
@@ -493,15 +694,14 @@ class Session:
                     self.adapter_voltage = self._read_atrv()
                     self.last_atrv = time.monotonic()
 
-            # voltage policy: PID 42 while the ECU answers, else corrected ATRV
+            # voltage policy: PID 42 while the ECU answers, else corrected ATRV.
+            # Emit the sample FIRST so a stop never swallows the cycle's data.
             now = time.monotonic()
-            if module_voltage is not None:
-                self._voltage_gate(module_voltage, corrected=False, context="PID 42")
+            atrv_fresh = False
             if now - self.last_atrv >= ATRV_EVERY_S:
                 self.adapter_voltage = self._read_atrv()
                 self.last_atrv = now
-                if module_voltage is None:
-                    self._voltage_gate(self.adapter_voltage, corrected=True, context="ATRV")
+                atrv_fresh = True
             if now - self.last_identity_check >= IDENTITY_EVERY_S:
                 ati = " ".join(self._send("ATI")[0]).strip()
                 self.last_identity_check = now
@@ -515,6 +715,10 @@ class Session:
                 self.gate._budget_violation("per-cycle budget %d exceeded" % cycle_budget, "cycle")
             if time.monotonic() - self.last_audit_emit >= AUDIT_EVERY_S:
                 self.emit_audit()
+            if module_voltage is not None:
+                self._voltage_gate(module_voltage, corrected=False, context="PID 42", rpm=policy_rpm)
+            elif atrv_fresh and self.adapter_voltage is not None:
+                self._voltage_gate(self.adapter_voltage, corrected=True, context="ATRV", rpm=policy_rpm)
             left = period - (time.monotonic() - cycle_t0)
             if left > 0:
                 self._sleep(left)

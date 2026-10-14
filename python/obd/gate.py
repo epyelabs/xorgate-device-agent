@@ -25,7 +25,8 @@ SESSION_BYTE_CAP = 64 * 1024 * 1024
 
 COUNTER_KEYS = ("requests", "ok", "no_data", "timeouts", "err_adapter",
                 "err_protocol", "err_identity", "err_voltage", "reconnects",
-                "forbidden_attempts", "budget_violations", "bytes_tx")
+                "forbidden_attempts", "budget_violations", "bytes_tx",
+                "voltage_low_events")
 
 
 class Forbidden(Exception):

@@ -11,10 +11,12 @@ import {
   type ObdStreamHandlers,
 } from "../src/hardware/obd.js";
 import {
+  auditLine,
   boundInventory,
   createObdCollector,
   MAX_INVENTORY_KEYS,
   obdReportDue,
+  REPORT_EVERY_AUDITS,
   requestRate,
   type ObdEventLevel,
 } from "../src/agent/collectors/obd.js";
@@ -423,8 +425,38 @@ describe("createObdCollector", () => {
       voltage: 14.12,
       helperVersion: "0.1.0",
       detail: "7E8 answering",
+      voltageLowEvents: 0,
+      auditSeq: 2,
+      lastStop: null,
     });
     expect(typeof st.since).toBe("number");
+    // start-stop fix: the new counter and the last stop reason surface in the status
+    h.feed(
+      '{"type":"audit","ts":1120,"counters":{"requests":1200,"voltage_low_events":2},"last_stop":{"ts":1100,"reason":"voltage: 11.50 V"}}',
+    );
+    expect(c.status()).toMatchObject({ voltageLowEvents: 2, auditSeq: 3, lastStop: "voltage: 11.50 V" });
+  });
+
+  it("logs one compact journal line per audit line (REPORT-P1-CAR issue 3) and resets auditSeq per helper run", async () => {
+    const h = fakeHelper();
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
+    await c.read();
+    h.feed(LINES.statusLive);
+    h.feed(LINES.audit);
+    const logged = (console.log as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((a) => String(a[0]));
+    const line = logged.find((l) => l.includes("audit #1"));
+    expect(line).toBe(
+      "[obd] audit #1: req 600 (— req/s) ok 598 no_data 2 timeouts 0 err 0 forbidden 0 reconnects 1 voltage_low 0 inventory 2 last_stop BUS ERROR",
+    );
+    h.feed('{"type":"audit","ts":1760000120,"counters":{"requests":1200,"voltage_low_events":1}}');
+    expect(c.status().auditSeq).toBe(2);
+    expect(logged.concat((console.log as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((a) => String(a[0]))).some((l) => l.includes("audit #2: req 1200 (10.0 req/s)") && l.includes("voltage_low 1"))).toBe(true);
+    // a helper restart starts the count over
+    h.runs[0]!.exit(0);
+    await settle();
+    vi.advanceTimersByTime(2_000);
+    expect(h.runs).toHaveLength(2);
+    expect(c.status().auditSeq).toBe(0);
   });
 
   it("report(): effective.obd with profile, bounded audit inventory, helper identity", async () => {
@@ -470,6 +502,16 @@ describe("createObdCollector", () => {
 });
 
 describe("pure helpers", () => {
+  it("auditLine renders every counter, the rate and the last stop (null-safe)", () => {
+    const snap = { counters: { requests: 10, ok: 9, no_data: 1 }, inventory: { "010C1": 10 }, last_stop: null, ts: 1 };
+    expect(auditLine(3, snap, 1.25)).toBe(
+      "audit #3: req 10 (1.3 req/s) ok 9 no_data 1 timeouts 0 err 0 forbidden 0 reconnects 0 voltage_low 0 inventory 1 last_stop —",
+    );
+    expect(auditLine(1, { ...snap, counters: { err_voltage: 1, forbidden_attempts: 1, voltage_low_events: 3 }, last_stop: { reason: "voltage: x" } }, null)).toBe(
+      "audit #1: req 0 (— req/s) ok 0 no_data 0 timeouts 0 err 1 forbidden 1 reconnects 0 voltage_low 3 inventory 1 last_stop voltage: x",
+    );
+  });
+
   it("boundInventory keeps the heaviest keys and copies when under the cap", () => {
     expect(boundInventory({ a: 1, b: 5, c: 3 }, 2)).toEqual({ b: 5, c: 3 });
     const small = { x: 1 };
@@ -1020,5 +1062,25 @@ describe("obdReportDue (WP3: effective.obd follows the helper)", () => {
     expect(obdReportDue(st(0, "parked"), st(0, "parked"))).toBe(false);
     expect(obdReportDue(st(0, "parked"), st(0, "starting"))).toBe(true);
     expect(obdReportDue(st(0, "retrying"), st(0, "exited"))).toBe(true);
+  });
+  it("fires on the first audit line of a run, then every REPORT_EVERY_AUDITS-th (start-stop fix: audit reaches the cloud)", () => {
+    const live = (auditSeq: number, extra: Partial<ObdStatus> = {}): ObdStatus => ({ ...st(2, "live"), auditSeq, ...extra });
+    expect(obdReportDue(live(0), live(1))).toBe(true); // the `live` report carried no audit block
+    expect(obdReportDue(live(1), live(2))).toBe(false);
+    expect(obdReportDue(live(9), live(REPORT_EVERY_AUDITS))).toBe(true);
+    expect(obdReportDue(live(REPORT_EVERY_AUDITS), live(REPORT_EVERY_AUDITS + 1))).toBe(false);
+    expect(obdReportDue(live(19), live(20))).toBe(true);
+    expect(obdReportDue(live(5), live(5))).toBe(false);
+    // older state.json without the field: same as 0 → 0, no churn
+    expect(obdReportDue(st(2, "live"), st(2, "live"))).toBe(false);
+  });
+  it("fires on an error / forbidden / voltage-low / last-stop change, not on a rate change", () => {
+    const base = (extra: Partial<ObdStatus>): ObdStatus => ({ ...st(2, "live"), auditSeq: 3, ...extra });
+    expect(obdReportDue(base({ errors: 0 }), base({ errors: 1 }))).toBe(true);
+    expect(obdReportDue(base({ forbidden: 0 }), base({ forbidden: 1 }))).toBe(true);
+    expect(obdReportDue(base({ voltageLowEvents: 0 }), base({ voltageLowEvents: 1 }))).toBe(true);
+    expect(obdReportDue(base({ lastStop: null }), base({ lastStop: "voltage: 11.5 V" }))).toBe(true);
+    expect(obdReportDue(base({ reqPerSec: 17 }), base({ reqPerSec: 18 }))).toBe(false);
+    expect(obdReportDue(base({ voltage: 12 }), base({ voltage: 9.8 }))).toBe(false);
   });
 });

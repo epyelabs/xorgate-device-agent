@@ -495,6 +495,18 @@ describe("per-namespace status", () => {
     const status = buildStatus(desired, { timeSync }, NO_MODEM, at, { clockStepperArmed: false });
     expect(status.timeSync.detail).toMatch(/stood down for this boot/);
   });
+
+  it("notes a held or fallback clock trust gate on timeSync (it outranks the stepper note)", () => {
+    const timeSync = { offlineSources: true };
+    const desired = desiredFrom({ rev: 1, timeSync });
+    const held = buildStatus(desired, { timeSync }, NO_MODEM, at, { clockStepperArmed: true, clockTrust: "held" });
+    expect(held.timeSync).toMatchObject({ state: "applied" });
+    expect(held.timeSync.detail).toMatch(/not trusted yet.*held until NTP/);
+    const fallback = buildStatus(desired, { timeSync }, NO_MODEM, at, { clockStepperArmed: false, clockTrust: "fallback" });
+    expect(fallback.timeSync.detail).toMatch(/untrusted clock/);
+    const trusted = buildStatus(desired, { timeSync }, NO_MODEM, at, { clockStepperArmed: false, clockTrust: "trusted" });
+    expect(trusted.timeSync.detail).toMatch(/stood down for this boot/);
+  });
 });
 
 describe("the report document", () => {

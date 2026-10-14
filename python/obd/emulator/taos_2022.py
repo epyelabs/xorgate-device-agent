@@ -4,8 +4,11 @@ vehicle survey (real raw frames; VIN replaced by the placeholder WVGTESTVIN00000
 Launch (from this directory, see README.md):
     PYTHONPATH=. elm -b /tmp/elm.out <<< $'merge taos_2022\nscenario taos-2022'
 Variants for fault-injection tests: taos-2022-badproto (ATDPN A3, must be
-refused with exit 4) and taos-2022-nodata2f (PID 2F advertised but answers
-NO DATA: must be dropped after one request).
+refused with exit 4), taos-2022-nodata2f (PID 2F advertised but answers
+NO DATA: must be dropped after one request), taos-2022-crank (start-stop
+auto-stop + one crank voltage dip: must not stop) and taos-2022-lowbatt
+(sustained 11.5 V with the engine off: constant power stops then resumes) and
+taos-2022-ignoff (ignition off: 0100 UNABLE TO CONNECT, everything NO DATA).
 """
 import copy
 import time  # noqa: F401  (used by the SEARCHING... exec)
@@ -477,8 +480,69 @@ _NODATA2F = copy.copy(_BASE)
 _NODATA2F['PID_2F'] = {'Request': '^012F' + ELM_FOOTER, 'Descr': 'fuel level: advertised, silent',
                        'Response': ST('NO DATA'), 'Priority': 1}
 
+# Start-stop crank (2026-10-14 drive): engine auto-stopped (rpm 0) for the
+# first four rpm requests; the fourth PID 42 read is the crank dip (9.82 V,
+# one sample, as the Taos showed at 14:44:38Z), then the engine runs at 928 rpm
+# with the alternator at 14.40 V. The helper must not stop on either power
+# source; `voltage_low_events` counts the one episode.
+def _by_count(frames):
+    """ResponseHeader callable: frames[min(n, len) - 1] for the n-th request."""
+    def header(self, cmd, pid, uc_val):
+        n = self.counters.get(pid, 1)
+        return frames[min(n, len(frames)) - 1]
+    return header
+
+
+_RPM_0 = HD('7E8') + SZ('04') + DT('41 0C 00 00')
+_RPM_928 = HD('7E8') + SZ('04') + DT('41 0C 0E 80') + HD('7E9') + SZ('04') + DT('41 0C 0E 80')
+_V_12_10 = HD('7E8') + SZ('04') + DT('41 42 2F 44')
+_V_9_82 = HD('7E8') + SZ('04') + DT('41 42 26 5C')
+_V_14_40 = HD('7E8') + SZ('04') + DT('41 42 38 40')
+_V_11_50 = HD('7E8') + SZ('04') + DT('41 42 2C EC')
+_V_13_40 = HD('7E8') + SZ('04') + DT('41 42 34 58')
+
+_CRANK = copy.copy(_BASE)
+_CRANK['PID_0C'] = {'Request': '^010C' + ELM_FOOTER, 'Descr': 'rpm: auto-stop then crank',
+                    'Response': '',
+                    'ResponseHeader': _by_count([_RPM_0, _RPM_0, _RPM_0, _RPM_0, _RPM_928]),
+                    'Priority': 1}
+_CRANK['PID_42'] = {'Request': '^0142' + ELM_FOOTER, 'Descr': 'module voltage: one crank dip',
+                    'Response': '',
+                    'ResponseHeader': _by_count([_V_12_10, _V_12_10, _V_12_10, _V_9_82, _V_14_40]),
+                    'Priority': 1}
+
+# Sustained low battery with the engine off (constant power, no alternator):
+# 11.50 V for the first eight PID 42 reads, then 13.40 V (charger / engine).
+# On constant power the helper must stop after the sustained window and resume
+# from ONE re-check request; on switched power it must never stop.
+_LOWBATT = copy.copy(_BASE)
+_LOWBATT['PID_0C'] = {'Request': '^010C' + ELM_FOOTER, 'Descr': 'rpm: engine off',
+                      'Response': _RPM_0, 'Priority': 1}
+_LOWBATT['PID_42'] = {'Request': '^0142' + ELM_FOOTER, 'Descr': 'module voltage: low then charged',
+                      'Response': '',
+                      'ResponseHeader': _by_count([_V_11_50] * 8 + [_V_13_40]),
+                      'Priority': 1}
+
+# Ignition off on a CAN-only car, deterministic (the emulator's built-in
+# `engineoff` randomly answers `BUS INIT:ERROR`, a K-line init message the
+# real Vgate never prints under ATSP0; it prints `SEARCHING...` then
+# `UNABLE TO CONNECT`). The adapter answers every AT command, 0100 finds no
+# ECU, every other request is NO DATA. Switch to `taos-2022` to "key on".
+_IGNOFF = {k: v for k, v in _BASE.items() if k.startswith('AT_')}
+_IGNOFF['AT_RESET'] = dict(_BASE['AT_RESET'])
+_IGNOFF['ELM_PIDS_A'] = {
+    'Request': '^0100' + ELM_FOOTER,
+    'Descr': 'Supported PIDs [01-20]: no ECU',
+    'Response': ST('SEARCHING...') + ST('UNABLE TO CONNECT'),
+    'Priority': 1,
+}
+_IGNOFF['NO_DATA'] = dict(_BASE['NO_DATA'])
+
 ObdMessage = {
     'taos-2022': _BASE,
+    'taos-2022-ignoff': _IGNOFF,
     'taos-2022-badproto': _BADPROTO,
     'taos-2022-nodata2f': _NODATA2F,
+    'taos-2022-crank': _CRANK,
+    'taos-2022-lowbatt': _LOWBATT,
 }

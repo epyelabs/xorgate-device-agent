@@ -71,6 +71,13 @@ const SETTINGS_POLL_MS = 1_000;
 export const ADAPTER_ABSENT_REWARN_MS = 600_000;
 /** Bound on `effective.obd.audit.inventory` (the distinct-command table). */
 export const MAX_INVENTORY_KEYS = 200;
+/**
+ * While the helper runs, re-publish the config report every Nth audit line
+ * (N x 60 s) so the cloud's `effective.obd.audit` counters stay within ~10
+ * min of the device without waiting for the hourly heartbeat (REPORT-P1-CAR
+ * open issue 3: the report published at `live` predates the first audit line).
+ */
+export const REPORT_EVERY_AUDITS = 10;
 
 /** Units per field (plan D4). Fields without a unit are plain counts/codes. */
 export const OBD_FIELD_UNITS: Readonly<Record<string, string>> = {
@@ -206,12 +213,25 @@ export function boundInventory(
  * the cloud would keep the boot-time `connecting / link 0` until the hourly
  * heartbeat (WP3 bench finding). A link move (0/1/2) or a park/exit is the
  * signal; the chatty connect/backoff cycle on a missing adapter is not.
+ *
+ * Audit follow-up (start-stop fix): the FIRST audit line of a helper run
+ * (the report published at `live` carried no `audit` block at all), every
+ * REPORT_EVERY_AUDITS-th line after it, and any change in the error /
+ * forbidden / voltage-low counters or the last stop reason also re-publish,
+ * so an incident is in the console within a minute and the counters within
+ * ten, without SSH.
  */
 export function obdReportDue(prev: ObdStatus | null, next: ObdStatus | null): boolean {
   if (!prev || !next) return prev !== next;
   if (prev.link !== next.link) return true;
   const terminal = (s: string): boolean => s === "parked" || s === "exited";
-  return terminal(prev.state) !== terminal(next.state);
+  if (terminal(prev.state) !== terminal(next.state)) return true;
+  const pa = prev.auditSeq ?? 0;
+  const na = next.auditSeq ?? 0;
+  if (na !== pa && (pa === 0 || na % REPORT_EVERY_AUDITS === 0)) return true;
+  if (prev.errors !== next.errors || prev.forbidden !== next.forbidden) return true;
+  if ((prev.voltageLowEvents ?? 0) !== (next.voltageLowEvents ?? 0)) return true;
+  return (prev.lastStop ?? null) !== (next.lastStop ?? null);
 }
 
 /** One line for `xorgate obd status`: protocol · responders · supported/total fields · powertrain. */
@@ -227,6 +247,20 @@ export function profileSummary(profile: ObdProfile | null): string | null {
   ];
   if (profile.adapter?.ati) parts.push(profile.adapter.ati);
   return parts.join(" · ");
+}
+
+/** The journal's 60 s audit line — pure, exported for tests. */
+export function auditLine(seq: number, audit: AuditSnapshot, rate: number | null): string {
+  const c = audit.counters;
+  const n = (v: number | undefined): number => v ?? 0;
+  const errors = n(c.err_adapter) + n(c.err_protocol) + n(c.err_identity) + n(c.err_voltage);
+  const forbidden = n(c.forbidden_attempts) + n(c.budget_violations);
+  return (
+    `audit #${seq}: req ${n(c.requests)} (${rate === null ? "—" : rate.toFixed(1)} req/s) ok ${n(c.ok)} ` +
+    `no_data ${n(c.no_data)} timeouts ${n(c.timeouts)} err ${errors} forbidden ${forbidden} ` +
+    `reconnects ${n(c.reconnects)} voltage_low ${n(c.voltage_low_events)} ` +
+    `inventory ${Object.keys(audit.inventory).length} last_stop ${audit.last_stop?.reason ?? "—"}`
+  );
 }
 
 /** Requests per second between two audit snapshots — pure, exported for tests. */
@@ -279,6 +313,8 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
   let changedMono = mono();
   let audit: AuditSnapshot | null = null;
   let prevAudit: AuditSnapshot | null = null;
+  /** Audit lines received from the CURRENT helper run (reset on spawn). */
+  let auditSeq = 0;
   /** Last `error` line (or stderr) from the current helper run, for the exit event. */
   let lastError: string | null = null;
   /** Open "adapter absent" episode (dedup of the adapter_not_found event). */
@@ -466,6 +502,11 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
           last_stop: msg.last_stop ?? null,
           ts: typeof msg.ts === "number" ? msg.ts : now() / 1000,
         };
+        auditSeq += 1;
+        // The 60 s audit line in the journal (REPORT-P1-CAR open issue 3):
+        // one compact line per helper audit, so `journalctl` alone answers
+        // "was it polling, how fast, any errors, any low-voltage episodes".
+        console.log(`[obd] ${auditLine(auditSeq, audit, requestRate(prevAudit, audit))}`);
         return;
       }
       case "error":
@@ -478,6 +519,7 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
   function spawn(): void {
     if (stopped || !resolved.run) return;
     lastError = null;
+    auditSeq = 0;
     startedAt = now();
     setState("connecting", null);
     handle = spawnHelper(resolved.helper, {
@@ -658,6 +700,9 @@ export function createObdCollector(opts: ObdCollectorOptions = {}): ObdCollector
         helperVersion,
         adapter: resolved.helper.serial ?? resolved.helper.adapter,
         profile: profileSummary(profile),
+        voltageLowEvents: c.voltage_low_events ?? 0,
+        auditSeq,
+        lastStop: audit?.last_stop?.reason ?? null,
       };
     },
     // RUST-PORT: config-report seam — this object is `effective.obd` verbatim.

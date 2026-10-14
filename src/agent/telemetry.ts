@@ -173,6 +173,12 @@ export interface ObdStatus {
   adapter?: string | null;
   /** One-line summary of the last vehicle profile the helper reported (P3), null before a probe. */
   profile?: string | null;
+  /** Low-voltage episodes this helper run (start-stop fix); 0 before the first audit line. */
+  voltageLowEvents?: number;
+  /** Audit lines received this helper run (one per 60 s while it runs); 0 before the first. */
+  auditSeq?: number;
+  /** The helper's `last_stop.reason`, null when it has none. */
+  lastStop?: string | null;
 }
 
 /** One KVS WebRTC master the media runtime supervises (one per signaling channel). */
@@ -252,6 +258,12 @@ export interface RecordingStatus {
    * exhausted. Absent at full operation (and on agents predating the feature).
    */
   powerShed?: string;
+  /**
+   * Telemetry recording is enabled but held because the wall clock is not
+   * trusted yet (agent/clock-trust.ts; at most 5 min after agent start).
+   * ABSENT otherwise — never false.
+   */
+  clockHold?: true;
   /**
    * Why live KVS streaming is parked right now (power_management_improvements
    * plan, Phase 2). ABSENT means live is allowed — consumers must treat absence,

@@ -93,6 +93,11 @@ export async function obdCommand(rest: string[]): Promise<void> {
     console.log(`  helper     ${obd.helperVersion ?? "—"}`);
     if (obd.profile) console.log(`  profile    ${obd.profile}`);
     else console.log("  profile    — (no vehicle probed yet)");
+    if (obd.auditSeq !== undefined) {
+      console.log(
+        `  audit      #${obd.auditSeq}  voltage_low ${obd.voltageLowEvents ?? 0}  last_stop ${obd.lastStop ?? "—"}`,
+      );
+    }
     return;
   }
   console.error(`scanning for ${parsed.seconds} s (never pairs)…`);

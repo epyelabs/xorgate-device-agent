@@ -50,8 +50,18 @@ class DecoderTests(unittest.TestCase):
         self.assertEqual(decode_field("mil", "01", "8307ED00"), 1)
         self.assertEqual(decode_field("dtc_count", "01", "8307ED00"), 3)
 
-    def test_gear_ratio(self):
-        self.assertAlmostEqual(decode_field("gear", "A4", "01000ABC"), 2.748, places=3)
+    def test_gear_from_byte_b(self):
+        # Frames from the bench audit log, 2026-10-14 Taos drive (ECM 7E8): byte B
+        # bits 7-4 step 0..5 with road speed while C,D stay 0000 the whole time.
+        self.assertEqual(decode_field("gear", "A4", "01000000"), 0)   # Park at idle (survey)
+        self.assertEqual(decode_field("gear", "A4", "01100000"), 1)   # stopped in Drive
+        self.assertEqual(decode_field("gear", "A4", "01300000"), 3)   # 32 km/h, 1770 rpm (owner screenshot)
+        self.assertEqual(decode_field("gear", "A4", "01500000"), 5)   # 46-53 km/h
+        # The ratio bytes are not a gear: with them filled the gear still comes from B.
+        self.assertEqual(decode_field("gear", "A4", "03200C80"), 2)
+        # A ratio-only ECU (support bit 0 clear) is a miss, never a gear number.
+        with self.assertRaises(ValueError):
+            decode_field("gear", "A4", "02000C80")
 
     def test_short_data_raises(self):
         with self.assertRaises((ValueError, IndexError)):

@@ -58,6 +58,8 @@ export interface ObdAuditCounters {
   forbidden_attempts: number;
   budget_violations: number;
   bytes_tx: number;
+  /** Low-voltage EPISODES (below 11.8 V until back above 12.4 V), both power sources (helper >= 0.2.0). */
+  voltage_low_events: number;
 }
 
 export interface ObdProfile {

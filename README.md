@@ -364,6 +364,27 @@ under `$XORGATE_HOME/obd/audit/`; the collector only supervises it (2 s backoff,
 30 s cap, 3 quick failures park 60 s; exit 6 = helper software bug, parked with
 an `error` event; exit 4 = protocol refused, parked 10 min).
 
+Start-stop and voltage (helper 0.2.0, after the 2026-10-14 Taos drive): rpm 0
+with the ECU answering is a normal `live` state. Ignition off is three
+consecutive misses; the helper then keeps the RFCOMM link open, reports
+`ecu_silent` (link 1) and sends ONE `010C1` probe every 10 s for 10 min, then
+every 60 s, then every 300 s, resuming on the first answer (a silent bus at
+connect time probes `0100` the same way). The link is torn down only on
+transport errors, stop strings or a signal. Rule 5 (voltage) follows
+`obd.powerSource`: `switched` never stops on voltage (the socket dies with the
+ignition anyway); each episode below 11.8 V is counted in the audit counter
+`voltage_low_events`, logged, and shown in the status detail. `constant` stops
+only after 30 s AND 3 consecutive cycles below 11.8 V with rpm 0 or unknown (a
+single crank dip never stops; a running engine never stops), then reports
+`stopped` (link 1) and sends one request a minute (PID 42, or ATRV when the ECU
+is silent) until 12.4 V, keeping the link; the old 600 s blind backoff is gone.
+The collector logs one `[obd] audit #N: ...` journal line per helper audit line
+(60 s) and re-publishes the config report on the first audit of a run, every
+10th after it, and on any error / forbidden / voltage-low / last-stop change, so
+`effective.obd.audit` reaches the cloud within a minute of an incident.
+`xorgate obd status` prints the audit counter line. Tests: `OBD_TEST_TIMESCALE=0.1`
+scales every helper interval (test-only; never set on a device).
+
 The adapter is a per-vehicle **setting**: the `obd` namespace in settings.json
 (cloud contract `test/config-contract.json`, delivered on the retained config topic
 only to devices whose model declares `peripherals.obd`; local writer `xorgate set
@@ -397,6 +418,20 @@ Precedence:
 | `XORGATE_OBD_POLL_HZ`      | `1`        | Fallback poll cycle (hard cap 20 req/s inside the helper).            |
 | `XORGATE_OBD_FIELDS`       | all        | Fallback CSV of field names to poll.                                  |
 | `XORGATE_OBD_POWER_SOURCE` | `switched` | Fallback `switched` (ignition-switched 12 V) or `constant`.           |
+
+Clock trust gate (`src/agent/clock-trust.ts`, `MODE=real` only): a battery-less
+CM5 boots on the fake-hwclock / timesyncd restore stamp (58 s to 13 h early on
+the bench) until NTP or a GPS/NITZ clock step lands, and everything stamped in
+that window (the live telemetry `ts`, the recorder's session id and header)
+carried that wrong time into the cloud (REPORT-P1-CAR open issue 1). The agent
+now HOLDS the live telemetry publish and the telemetry recorder until
+`timedatectl` reports `NTPSynchronized=yes` (polled every 5 s) or the clock
+stepper applies a GPS/NITZ step, for at most 5 min; past that it publishes
+anyway with a warn event and `hints.clockTrust = "fallback"` in the config
+report (`status.timeSync.detail` names it), clearing the flag when a sync
+lands. state.json, the monitor and `xorgate status` keep updating during the
+hold; `recording.clockHold: true` says the recorder is waiting. An agent in
+`sim`/`replay` mode has no gate (host clock).
 
 Commands (`xorgate/devices/{id}/command`, acked on `.../command/response` like the
 others, TTL + replay ledger): `obd_scan` runs a 25 s BlueZ discovery via the stdlib

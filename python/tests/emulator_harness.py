@@ -119,13 +119,15 @@ class Emulator:
         return False
 
 
-def run_helper(args, seconds, python=None, stop_signal=signal.SIGTERM, until=None):
+def run_helper(args, seconds, python=None, stop_signal=signal.SIGTERM, until=None, env=None):
     """Run obd_read.py with `args` for `seconds` (or until `until(lines)` is
     true), then send `stop_signal`. Returns (exit_code, parsed_lines, stderr).
+    `env` adds to the inherited environment (e.g. OBD_TEST_TIMESCALE).
     """
     python = python or sys.executable
+    proc_env = dict(os.environ, **(env or {}))
     proc = subprocess.Popen([python, HELPER] + list(args), stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
+                            stderr=subprocess.PIPE, text=True, env=proc_env)
     lines, raw_err = [], []
 
     def reader():

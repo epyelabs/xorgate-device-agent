@@ -17,6 +17,7 @@ import { ConfigSync, ensureConfigSyncBaseline } from "./agent/config-sync.js";
 import { reconcileCameraMount, type CameraMountState } from "./hardware/boot-config.js";
 import { migrateMediaEnabled } from "./daemon/settings-migrate.js";
 import { createClockStepper, resolveTimeSyncConfig } from "./agent/clock-step.js";
+import { createClockTrust } from "./agent/clock-trust.js";
 import type { GpsClockReading } from "./agent/collectors/gps.js";
 import type { GnssView } from "./lib/sky-state.js";
 import { createTimeSourceTracker } from "./recording/session.js";
@@ -446,6 +447,23 @@ const timeSource = replay
   ? createTimeSourceTracker(60_000, async () => "ntp" as const)
   : createTimeSourceTracker();
 
+// Clock trust gate (REPORT-P1-CAR open issue 1): until NTP (or a GPS/NITZ
+// step) lands, the live telemetry publish and the telemetry recorder are
+// HELD rather than stamped with the fake-hwclock time, for at most 5 min;
+// past that the clock is used anyway, flagged (warn event + report hint).
+// Real mode only: sim/replay run on the host's clock.
+const clockTrust = config.mode === "real"
+  ? createClockTrust({
+      onEvent: (level, msg) => {
+        const t = Date.now();
+        console[level === "warn" ? "warn" : "log"](`[agent] ${msg}`);
+        store.event(level, msg, t);
+        store.flush(t, true);
+      },
+    })
+  : null;
+clockTrust?.start();
+
 // Reconcile pipelines against the hardware block BEFORE anything reads them:
 // the recording manager's camera set and the media masters both consume the
 // files this (re)renders. Awaited — enumeration is one bounded rpicam exec.
@@ -498,6 +516,9 @@ const recording = new RecordingManager({
   // Replay mode: no PMIC budget or GNSS receiver to consult — the boot defer
   // and the GPS/LTE gate would only arm, time out and fail open 90 s later.
   forceBootPolicyOff: replay !== null,
+  // A telemetry session minted on an untrusted clock gets a wrong UUIDv7 and
+  // header time (the 13 h session 01a137b5); hold the recorder until trusted.
+  clockTrusted: () => clockTrust?.trusted() ?? true,
   sampleGroups: () => source.sampleGroups(),
   // ~1 Hz power reading for the shed policy — the system collector's cached
   // sampler, so the recorder and the shedder share one vcgencmd stream.
@@ -568,6 +589,7 @@ if (config.mode === "real") {
       // cached value stays coherent if NTP happens to land at the same time.
       timeSource.noteStep(stepSource);
       void timeSource.refresh().catch(() => {});
+      clockTrust?.noteStep(stepSource); // a stepped clock is a trusted clock
     },
     onEvent: (level, msg) => {
       const t = Date.now();
@@ -749,6 +771,7 @@ const configSync = new ConfigSync({
       bootDefer: status.bootDefer ?? null,
       powerShed: status.powerShed ?? null,
       clockStepperArmed: clockStepper?.status().armed,
+      clockTrust: clockTrust?.status().state,
     };
   },
   onEvent: (level, msg) => {
@@ -1356,6 +1379,13 @@ client.on("connect", () => {
       if (obdReportDue(lastObdStatus, obdNow)) requestConfigReport?.("boot");
       lastObdStatus = obdNow;
       store.setObd(obdNow);
+      // Clock trust gate: the local snapshot above is kept (monitor, status
+      // line); only the cloud publish is withheld while the wall clock is
+      // untrusted, and never for more than the gate's grace window.
+      if (clockTrust && !clockTrust.trusted()) {
+        clockTrust.noteHeld();
+        return;
+      }
       // The backoff re-probe lives on this tick rather than its own timer: it
       // only ever matters while we are publishing, and this is the publish.
       const reprobe = telemetryScope.noteTick(ts);
@@ -1432,6 +1462,7 @@ function shutdown(sig: string, exitCode = 0): void {
   // Finalize the active recording segment (sync) so a clean stop never leaves
   // an orphan .jsonl for the next boot's crash recovery to mop up.
   recording.stop();
+  clockTrust?.stop();
   store.setRecording(recording.status());
   // SIGINT any KVS master subprocesses so they deregister from their channels
   // cleanly instead of being orphaned/force-killed.

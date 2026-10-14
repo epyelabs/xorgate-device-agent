@@ -187,6 +187,14 @@ export interface RecordingManagerOptions {
    * into every boot. Never set on real hardware.
    */
   forceBootPolicyOff?: boolean;
+  /**
+   * Clock trust gate (agent/clock-trust.ts): the telemetry recorder is not
+   * started while this returns false — a session minted then gets a UUIDv7
+   * and header stamped from the pre-NTP fake-hwclock time. Re-evaluated on
+   * every settings poll; the gate itself is bounded (5 min), so this can
+   * only delay, never prevent, recording. Absent = always trusted.
+   */
+  clockTrusted?: () => boolean;
 }
 
 export class RecordingManager {
@@ -345,6 +353,27 @@ export class RecordingManager {
     // (modem settled, telemetry gone stale, hard cap elapsed) — re-run the
     // video diff, which no-ops unless the effective tuple actually changed.
     this.applyVideo();
+    // ... and the clock trust gate releases on its own too (NTP landed).
+    if (this.cfg.telemetry.enabled && !this.recorder && this.clockOk()) {
+      this.startRecorder();
+      this.notifyStatus();
+    }
+  }
+
+  private clockHoldNoted = false;
+
+  /** The clock trust gate, with its one "held" event per hold. */
+  private clockOk(): boolean {
+    const ok = this.opts.clockTrusted?.() ?? true;
+    if (ok) {
+      this.clockHoldNoted = false;
+      return true;
+    }
+    if (!this.clockHoldNoted) {
+      this.clockHoldNoted = true;
+      this.opts.onEvent?.("info", "telemetry recording held: wall clock not trusted yet (waiting for NTP/GPS/NITZ, 5 min cap)");
+    }
+    return false;
   }
 
   /** Sync shutdown: finalize the active segment, stop all timers. */
@@ -410,6 +439,11 @@ export class RecordingManager {
       ...(this.bootDeferStatus !== null ? { bootDefer: this.bootDeferStatus } : {}),
       // Load-shedding rung (Phase 3); absent at full operation.
       ...(this.shedStatus !== null ? { powerShed: this.shedStatus } : {}),
+      // Clock trust hold: telemetry recording is wanted but waiting for a
+      // trusted wall clock. ABSENT otherwise (fail open for every consumer).
+      ...(this.cfg.telemetry.enabled && this.recorder === null && !(this.opts.clockTrusted?.() ?? true)
+        ? { clockHold: true }
+        : {}),
       // Why live streaming is parked (power management plan, Phase 2); ABSENT
       // — never null, never {} — whenever live is allowed, so every consumer
       // fails open on the field simply not being there.
@@ -439,7 +473,7 @@ export class RecordingManager {
     if (this.recorder && (!want || rateChanged)) {
       this.stopRecorder(rateChanged ? "rateHz changed" : "recording disabled");
     }
-    if (want && !this.recorder) this.startRecorder();
+    if (want && !this.recorder && this.clockOk()) this.startRecorder();
 
     this.applyVideo();
 

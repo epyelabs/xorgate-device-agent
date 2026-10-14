@@ -20,10 +20,10 @@ types missing required fields) are ignored. Types:
 | type | required | notes |
 |---|---|---|
 | `ready` | — | `helper`, `version`, `allowlist_sha256` |
-| `status` | `state` in {connecting, pairing, probing, live, ecu_silent, backoff, stopped, adapter_not_found}, `link` in {0,1,2} | `detail`, `ts` (epoch s); emitted on every transition |
+| `status` | `state` in {connecting, pairing, probing, live, ecu_silent, backoff, stopped, adapter_not_found}, `link` in {0,1,2} | `detail`, `ts` (epoch s); emitted on every transition, and again with the same state when only the detail changed (the agent updates `detail` without an event). Helper 0.2.0: `ecu_silent` and the voltage hold (`stopped`) carry link 1, the RFCOMM link stays open (section 7) |
 | `profile` | — | `adapter{mac,ati,at1}`, `protocol{dpn,dp}`, `responders[]`, `pids_by_ecu{}`, `supported_fields[]`, `unsupported_fields[]`, `powertrain`, `rate_req_s`; after each probe |
 | `sample` | `fields` object | only supported fields, numbers only; `link` always inside; once per poll cycle |
-| `audit` | `counters` object | `inventory{cmd:count}`, `last_stop{ts,reason}|null`; every 60 s and on stop |
+| `audit` | `counters` object | `inventory{cmd:count}`, `last_stop{ts,reason}|null`; every 60 s and on stop. Counters: requests, ok, no_data, timeouts, err_adapter, err_protocol, err_identity, err_voltage, reconnects, forbidden_attempts, budget_violations, bytes_tx, `voltage_low_events` (0.2.0: low-voltage episodes, both power sources) |
 | `error` | `code` number | `error` text; followed by exit with that code |
 
 Exit codes: 0 clean (SIGINT/SIGTERM: the helper sends ATZ, closes, exits),
@@ -92,12 +92,75 @@ on every sample or link change.
 `status()`: state, link, req/s = Δrequests/Δts between the last two audit
 lines (null until two exist, or on a counter reset), errors = err_adapter +
 err_protocol + err_identity + err_voltage, forbidden = forbidden_attempts +
-budget_violations, voltage = latest `module_voltage` else `adapter_voltage`.
+budget_violations, voltage = latest `module_voltage` else `adapter_voltage`,
+`voltageLowEvents` (counter), `auditSeq` (audit lines received from the current
+helper run, reset on spawn), `lastStop` (the helper's `last_stop.reason`).
+
+Every audit line is also ONE journal line, `[obd] audit #N: req R (x.x req/s)
+ok O no_data D timeouts T err E forbidden F reconnects C voltage_low V inventory
+K last_stop <reason|—>` (`auditLine`, pure). Config-report trigger
+(`obdReportDue`, pure): a link move, a park/exit flip, the FIRST audit line of a
+run (`auditSeq` 0 → 1: the report published at `live` predates it), every
+`REPORT_EVERY_AUDITS` (10) audit lines after that, and any change in errors /
+forbidden / voltageLowEvents / lastStop. Never on rate or voltage changes.
 
 `report()` (= `effective.obd`): `{ status, link, adapter:{mac[,serial]},
 profile?, audit?:{counters, inventory (<= 200 heaviest keys), last_stop},
 helper_version?, allowlist_sha256? }`. Reported-only: never a config
 namespace, no `status` entry in the report.
+
+## 7. Start-stop awareness and the voltage policy (helper 0.2.0)
+
+Field finding (2026-10-14 Taos drive, `plans/obd2-bluetooth-integration/
+phase-1/evidence/fix-startstop.md`): with engine start-stop the ECU keeps
+answering at rpm 0 while the battery discharges (12.1 → 11.72 V over 50 s) and
+each restart cranks it to ~9.8 V for one sample. Rule 5 as first implemented
+(one sample below 11.8 V → ATZ, close, 600 s backoff) fired twice in 24 min and
+cost two 10 min blind windows. The policy is now, in `python/obd/session.py`:
+
+- rpm 0 with the ECU answering is `live` link 2. Nothing keys on rpm for
+  ignition state; ignition off is still `ECU_MISS_LIMIT` (3) consecutive
+  misses after the ECU had answered.
+- `ecu_silent` (link 1): the RFCOMM link STAYS OPEN. One probe `010C1` per
+  `ecu_silent_probe_interval(elapsed)`: 10 s for the first 600 s, 60 s until
+  3600 s, 300 s after. The first answered probe resumes the poll loop with the
+  session's plan (the `answered` / `dropped` PID sets survive). A silent bus at
+  connect time (`_wait_for_ecu`, 0100 unanswered) is the same state with `0100`
+  as the probe. The link is torn down only by transport errors (`LinkLost`),
+  stop strings (`StopCondition`), an identity change or a signal.
+- Voltage, by `--power-source`:
+  - episode tracking on both: below `V_STOP` (11.8 V) opens an episode (counter
+    `voltage_low_events` += 1, audit record `voltage_low`, stderr line), back
+    above `V_RESUME` (12.4 V) closes it (hysteresis; a reading between the two
+    does not re-count).
+  - `switched`: never stops. The status detail is refreshed with the same
+    `live` state (no agent event).
+  - `constant`: `VoltageLow` only when the consecutive-low run is >=
+    `VOLTAGE_SUSTAIN_S` (30 s) AND >= `VOLTAGE_SUSTAIN_CYCLES` (3 cycles) AND
+    rpm is 0 or unknown (rpm > 0 resets the run: an alternator is running). PID
+    0C joins the plan on constant power even when `rpm` is not requested, like
+    PID 42. The hold (`_voltage_hold_wait`): counter `err_voltage` += 1,
+    `last_stop` set, audit `voltage_hold`, status `stopped` link 1, link kept
+    open, ONE request per `VOLTAGE_RECHECK_S` (60 s): PID 42 while the ECU
+    answers, ATRV (+0.85 V) when it did not, alternating back to PID 42 so a
+    returning ECU is seen; resume at >= 12.4 V (audit `voltage_resume`, then
+    `live`). A link loss during a hold reconnects with the normal backoff,
+    capped at `VOLTAGE_BACKOFF_CAP_S` (300 s), never 600 s.
+- The sample is emitted BEFORE the voltage gate runs, so the dip sample itself
+  is published (module_voltage 9.82 V shows in the console).
+- `OBD_TEST_TIMESCALE` (env, 0.001..1, default 1) scales every interval above
+  plus the audit/identity/ATRV cadences; tests only.
+
+Audit record kinds added: `voltage_low`, `voltage_hold`, `voltage_resume`,
+`ecu_silent`, `ecu_resumed`. Emulator scenarios: `taos-2022-crank`,
+`taos-2022-lowbatt`, `taos-2022-ignoff` (`python/obd/emulator/README.md`);
+tests: `python/tests/test_session_policy.py` (pure gate + schedule) and
+`test_integration_emulator.py` (end to end over a pty).
+
+Agent side (same commit): `src/agent/clock-trust.ts` holds the live telemetry
+publish and the telemetry recorder until the wall clock is trusted (NTP, or a
+GPS/NITZ step; 5 min cap, then flagged) — not an OBD seam, but the port must
+mirror it or every boot republishes the pre-NTP window under a wrong time.
 
 ## 4. Field table (plan D4)
 

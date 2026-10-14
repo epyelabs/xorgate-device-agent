@@ -583,6 +583,12 @@ export interface ReportHints {
   powerShed?: string | null;
   /** `ClockStepper.status().armed` — false once NTP synced this boot. */
   clockStepperArmed?: boolean;
+  /**
+   * `ClockTrust.status().state` (agent/clock-trust.ts): "held" while the
+   * live publish and the recorder wait for a trusted wall clock, "fallback"
+   * once the 5 min cap passed without one (publishing, flagged), "trusted".
+   */
+  clockTrust?: "trusted" | "held" | "fallback";
 }
 
 /**
@@ -1156,8 +1162,16 @@ function latchDetail(key: string, hints: ReportHints): string | undefined {
     if (hints.powerShed) parts.push(`load shedding is active (${hints.powerShed})`);
     return parts.length > 0 ? `in force, but ${parts.join("; ")}` : undefined;
   }
-  if (key === "timeSync" && hints.clockStepperArmed === false) {
-    return "in force, but the clock stepper stood down for this boot (NTP is synchronized)";
+  if (key === "timeSync") {
+    if (hints.clockTrust === "held") {
+      return "in force, but the wall clock is not trusted yet: telemetry publish and recording are held until NTP/GPS/NITZ lands (5 min cap)";
+    }
+    if (hints.clockTrust === "fallback") {
+      return "in force, but no NTP/GPS/NITZ sync landed within 5 min: publishing on an untrusted clock (timestamps may be early)";
+    }
+    if (hints.clockStepperArmed === false) {
+      return "in force, but the clock stepper stood down for this boot (NTP is synchronized)";
+    }
   }
   return undefined;
 }

@@ -56,6 +56,37 @@ describe("RecordingManager", () => {
     expect(readdirSync(sessionDir).every((n) => n.endsWith(".jsonl.gz"))).toBe(true);
   });
 
+  it("holds the recorder while the clock is untrusted and starts it on the next poll once trusted (clock-trust gate)", async () => {
+    saveSettings({ recording: { telemetry: { enabled: true, rateHz: 20 } } });
+    let trusted = false;
+    const events: string[] = [];
+    manager = new RecordingManager({
+      deviceId: "d",
+      sampleGroups,
+      root,
+      pollMs: 60_000,
+      clockTrusted: () => trusted,
+      onEvent: (_l, msg) => events.push(msg),
+    });
+    await manager.start();
+    await delay(150);
+    expect(manager.status()).toMatchObject({ enabled: false, sessionId: null, clockHold: true });
+    expect(existsSync(join(root, "telemetry"))).toBe(false); // no session minted on the bad clock
+    expect(events.filter((m) => m.includes("recording held"))).toHaveLength(1);
+    manager.reapply(); // settings unchanged, still untrusted: no start, no second event
+    expect(manager.status().clockHold).toBe(true);
+    expect(events.filter((m) => m.includes("recording held"))).toHaveLength(1);
+
+    trusted = true;
+    manager.reapply(); // what the worker's settings poll does every 5 s
+    await delay(150);
+    const st = manager.status();
+    expect(st.enabled).toBe(true);
+    expect(st.sessionId).not.toBeNull();
+    expect(st.clockHold).toBeUndefined(); // absent, never false
+    expect(events.some((m) => m.includes("telemetry recording started"))).toBe(true);
+  });
+
   it("mints a new session when rateHz changes", async () => {
     saveSettings({ recording: { telemetry: { enabled: true, rateHz: 20 } } });
     manager = new RecordingManager({ deviceId: "d", sampleGroups, root, pollMs: 60_000 });

@@ -10,6 +10,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 import unittest
 
 import _path  # noqa: F401
@@ -161,35 +162,212 @@ class EmulatorLifecycleTests(unittest.TestCase):
         self.assertNotIn("010C1", audit["inventory"])
         self.assertNotIn("0120", audit["inventory"])
 
-    def test_ecu_silent_after_three_misses_then_backoff(self):
-        with Emulator("taos-2022") as emu:
-            def until(ls):
-                if len(_by_type(ls, "sample")) == 2 and not getattr(until, "switched", False):
-                    emu.command("scenario engineoff")   # every PID now answers NO DATA
-                    until.switched = True
-                states = [l["state"] for l in _by_type(ls, "status")]
-                return "backoff" in states
-            args = ["--serial", emu.pty, "--poll-hz", "2", "--audit-dir", self.audit_dir]
-            code, lines, err = run_helper(args, 25.0, until=until)
+    # ------------------------------------------------------------------
+    # Start-stop awareness (fix/obd-startstop-voltage, 2026-10-14 drive).
+    # FAST scales every policy interval by 0.1 (30 s sustain -> 3 s, 60 s
+    # re-check -> 6 s, 10 s probe -> 1 s, 60 s audit -> 6 s).
+    # ------------------------------------------------------------------
+    FAST = {"OBD_TEST_TIMESCALE": "0.1"}
+
+    def _run_env(self, scenario, seconds, extra=(), poll_hz="2", until=None, env=None):
+        with Emulator(scenario) as emu:
+            self.emu = emu
+            args = ["--serial", emu.pty, "--poll-hz", poll_hz, "--audit-dir", self.audit_dir] + list(extra)
+            return run_helper(args, seconds, until=until, env=env)
+
+    def _audit_kinds(self):
+        files = os.listdir(self.audit_dir)
+        with open(os.path.join(self.audit_dir, files[0])) as f:
+            return [l.split('"kind":"')[1].split('"')[0] for l in f if '"kind":"' in l]
+
+    def _assert_crank_does_not_stop(self, power_source):
+        code, lines, err = self._run_env(
+            "taos-2022-crank", 25.0, extra=["--power-source", power_source],
+            until=lambda ls: len(_by_type(ls, "sample")) >= 8)
         self.assertEqual(code, 0, err)
         states = [l["state"] for l in _by_type(lines, "status")]
-        self.assertIn("backoff", states)
-        # WP3 joint run: the transition is its own status line, before the backoff
-        self.assertIn("ecu_silent", states)
-        self.assertLess(states.index("ecu_silent"), states.index("backoff"))
-        silent = [l for l in _by_type(lines, "status") if l["state"] == "ecu_silent"][0]
-        self.assertEqual(silent["link"], 1)
-        detail = [l["detail"] for l in _by_type(lines, "status") if l["state"] == "backoff"][0]
-        self.assertIn("ECU silent", detail)
-        audit = _by_type(lines, "audit")[-1]
-        self.assertGreaterEqual(audit["counters"]["no_data"], 3)
-        self.assertEqual(audit["counters"]["forbidden_attempts"], 0)
+        self.assertNotIn("backoff", states)
+        self.assertEqual(states[-1], "stopped")          # only the SIGTERM close
+        self.assertEqual(states.count("stopped"), 1)
         samples = _by_type(lines, "sample")
-        self.assertGreaterEqual(len(samples), 2)
-        for s in samples:   # no partial/None values even in the dying cycle
+        self.assertGreaterEqual(len(samples), 8)
+        rpms = [s["fields"]["rpm"] for s in samples]
+        self.assertIn(0, rpms)                            # auto-stop is a live state
+        self.assertIn(928, rpms)                          # and the restart is seen
+        volts = [s["fields"]["module_voltage"] for s in samples]
+        self.assertIn(9.82, volts)                        # the dip sample is published
+        self.assertIn(14.4, volts)
+        for smp in samples:
+            self.assertEqual(smp["fields"]["link"], 2)
+        audit = _by_type(lines, "audit")[-1]
+        self.assertEqual(audit["counters"]["voltage_low_events"], 1)
+        self.assertEqual(audit["counters"]["err_voltage"], 0)
+        self.assertEqual(audit["counters"]["reconnects"], 0)
+        self.assertEqual(audit["inventory"]["ATZ"], 2)    # handshake + close only
+        self.assertIsNone(audit["last_stop"])
+        kinds = self._audit_kinds()
+        self.assertEqual(kinds.count("voltage_low"), 1)
+        self.assertEqual(kinds.count("close"), 1)
+        return lines, err
+
+    def test_crank_dip_does_not_stop_on_switched_power(self):
+        lines, err = self._assert_crank_does_not_stop("switched")
+        self.assertIn("ignored on switched power", err)
+        details = [l["detail"] for l in _by_type(lines, "status") if l["state"] == "live"]
+        self.assertTrue(any("switched power" in d for d in details), details)
+
+    def test_crank_dip_does_not_stop_on_constant_power(self):
+        _, err = self._assert_crank_does_not_stop("constant")
+        self.assertIn("watching for", err)
+
+    def test_sustained_low_on_constant_stops_keeps_link_and_resumes(self):
+        def until(ls):
+            statuses = _by_type(ls, "status")
+            st = [l["state"] for l in statuses]
+            if "stopped" not in st or st[-1] != "live":
+                return False
+            resumed = statuses[-1]["ts"]
+            return any(s["ts"] > resumed for s in _by_type(ls, "sample"))   # one sample after the resume
+        code, lines, err = self._run_env(
+            "taos-2022-lowbatt", 40.0, extra=["--power-source", "constant"], until=until, env=self.FAST)
+        self.assertEqual(code, 0, err)
+        statuses = _by_type(lines, "status")
+        states = [l["state"] for l in statuses]
+        self.assertNotIn("backoff", states)
+        self.assertIn("stopped", states)
+        held = statuses[states.index("stopped")]
+        self.assertEqual(held["link"], 1)                 # adapter kept, ECU not polled
+        self.assertIn("re-check", held["detail"])
+        self.assertIn("rpm 0", held["detail"])
+        self.assertEqual(states[-2:], ["live", "stopped"]) # resumed, then the SIGTERM close
+        # samples stop during the hold and resume after it
+        hold_ts = held["ts"]
+        live_again = [l for l in statuses if l["state"] == "live" and l["ts"] > hold_ts][0]
+        samples = _by_type(lines, "sample")
+        self.assertFalse([s for s in samples if hold_ts < s["ts"] < live_again["ts"]])
+        self.assertTrue([s for s in samples if s["ts"] > live_again["ts"]])
+        audit = _by_type(lines, "audit")[-1]
+        c = audit["counters"]
+        self.assertEqual(c["err_voltage"], 1)
+        self.assertEqual(c["voltage_low_events"], 1)
+        self.assertEqual(c["reconnects"], 0)
+        self.assertEqual(audit["inventory"]["ATZ"], 2)    # no reconnect: link kept open
+        self.assertIn("voltage", audit["last_stop"]["reason"])
+        kinds = self._audit_kinds()
+        self.assertEqual(kinds.count("voltage_hold"), 1)
+        self.assertEqual(kinds.count("voltage_resume"), 1)
+        self.assertEqual(kinds.count("close"), 1)
+        self.assertIn("voltage resume", err)
+
+    def test_sustained_low_on_switched_never_stops(self):
+        code, lines, err = self._run_env(
+            "taos-2022-lowbatt", 25.0, extra=["--power-source", "switched"],
+            until=lambda ls: len(_by_type(ls, "sample")) >= 12, env=self.FAST)
+        self.assertEqual(code, 0, err)
+        states = [l["state"] for l in _by_type(lines, "status")]
+        self.assertEqual(states.count("stopped"), 1)      # the SIGTERM close only
+        self.assertNotIn("backoff", states)
+        audit = _by_type(lines, "audit")[-1]
+        self.assertEqual(audit["counters"]["err_voltage"], 0)
+        self.assertEqual(audit["counters"]["voltage_low_events"], 1)
+        self.assertIsNone(audit["last_stop"])
+
+    def test_ecu_silent_keeps_link_probes_010c_and_resumes(self):
+        with Emulator("taos-2022") as emu:
+            marks = {}
+
+            def until(ls):
+                st = [l["state"] for l in _by_type(ls, "status")]
+                if len(_by_type(ls, "sample")) == 2 and "off" not in marks:
+                    emu.command("scenario taos-2022-ignoff")   # every PID now answers NO DATA
+                    marks["off"] = True
+                if "ecu_silent" in st and "on" not in marks:
+                    marks["on"] = time.time() + 3.0       # let a few probes go out first
+                if "on" in marks and marks["on"] is not True and time.time() >= marks["on"]:
+                    emu.command("scenario taos-2022")
+                    marks["on"] = True
+                if "ecu_silent" not in st or st[-1] != "live":
+                    return False
+                resumed = _by_type(ls, "status")[-1]["ts"]
+                return any(s["ts"] > resumed for s in _by_type(ls, "sample"))   # one sample after the resume
+            args = ["--serial", emu.pty, "--poll-hz", "2", "--audit-dir", self.audit_dir]
+            code, lines, err = run_helper(args, 40.0, until=until, env=self.FAST)
+        self.assertEqual(code, 0, err)
+        statuses = _by_type(lines, "status")
+        states = [l["state"] for l in statuses]
+        self.assertNotIn("backoff", states)               # the link was never torn down
+        self.assertIn("ecu_silent", states)
+        silent = statuses[states.index("ecu_silent")]
+        self.assertEqual(silent["link"], 1)
+        self.assertIn("010C1", silent["detail"])
+        self.assertEqual(states[-2:], ["live", "stopped"])
+        audit = _by_type(lines, "audit")[-1]
+        c = audit["counters"]
+        self.assertGreaterEqual(c["no_data"], 3 + 2)      # three misses + at least two probes
+        self.assertEqual(c["reconnects"], 0)
+        self.assertEqual(c["forbidden_attempts"], 0)
+        self.assertEqual(audit["inventory"]["ATZ"], 2)
+        samples = _by_type(lines, "sample")
+        self.assertTrue([s for s in samples if s["ts"] > silent["ts"]])   # polling resumed
+        for s in samples:
             for v in s["fields"].values():
                 self.assertIsInstance(v, (int, float))
+        kinds = self._audit_kinds()
+        self.assertEqual(kinds.count("ecu_silent"), 1)
+        self.assertEqual(kinds.count("ecu_resumed"), 1)
+        self.assertEqual(kinds.count("close"), 1)
+        self.assertIn("ECU answering again", err)
 
+    def test_ecu_silent_at_connect_probes_0100_without_reconnecting(self):
+        with Emulator("taos-2022-ignoff") as emu:
+            marks = {}
+
+            def until(ls):
+                st = [l["state"] for l in _by_type(ls, "status")]
+                if "ecu_silent" in st and "on" not in marks:
+                    marks["on"] = time.time() + 2.5
+                if "on" in marks and marks["on"] is not True and time.time() >= marks["on"]:
+                    emu.command("scenario taos-2022")
+                    marks["on"] = True
+                return "live" in st and len(_by_type(ls, "sample")) >= 1
+            args = ["--serial", emu.pty, "--poll-hz", "2", "--audit-dir", self.audit_dir,
+                    "--power-source", "constant"]
+            code, lines, err = run_helper(args, 40.0, until=until, env=self.FAST)
+        self.assertEqual(code, 0, err)
+        types = [l["type"] for l in lines]
+        states = [l["state"] for l in _by_type(lines, "status")]
+        self.assertNotIn("backoff", states)
+        self.assertIn("ecu_silent", states)
+        self.assertLess(types.index("status"), types.index("profile"))
+        silent = [l for l in _by_type(lines, "status") if l["state"] == "ecu_silent"][0]
+        self.assertEqual(silent["link"], 1)
+        self.assertIn("0100", silent["detail"])
+        self.assertIn("profile", types)
+        self.assertGreaterEqual(len(_by_type(lines, "sample")), 1)
+        audit = _by_type(lines, "audit")[-1]
+        self.assertGreaterEqual(audit["inventory"]["0100"], 2)
+        self.assertEqual(audit["inventory"]["ATZ"], 2)
+        self.assertEqual(audit["counters"]["reconnects"], 0)
+        kinds = self._audit_kinds()
+        self.assertEqual(kinds.count("open"), 1)
+        self.assertEqual(kinds.count("ecu_silent"), 1)
+        self.assertEqual(kinds.count("ecu_resumed"), 1)
+
+    def test_audit_line_cadence(self):
+        code, lines, err = self._run_env("taos-2022", 16.0, env=self.FAST)
+        self.assertEqual(code, 0, err)
+        audits = _by_type(lines, "audit")
+        self.assertGreaterEqual(len(audits), 3)           # 6 s cadence + the on-stop line
+        reqs = [a["counters"]["requests"] for a in audits]
+        self.assertEqual(reqs, sorted(reqs))
+        self.assertGreater(reqs[-1], reqs[0])
+        gaps = [b["ts"] - a["ts"] for a, b in zip(audits, audits[1:-1])]
+        for g in gaps:
+            self.assertGreaterEqual(g, 5.0)
+            self.assertLess(g, 9.0)
+        self.assertEqual(lines[-1]["type"], "audit")
+        for a in audits:
+            self.assertIn("voltage_low_events", a["counters"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -42,8 +42,14 @@ def _intake_temp_68(h):
 
 
 def _gear_a4(h):
-    # PID A4: A = support bits, C,D = actual gear ratio /1000 (0 = park/neutral)
-    return round((_b(h, 2) * 256 + _b(h, 3)) / 1000, 3)
+    # PID A4 (J1979-DA): A = support bits (bit 0: gear status in B, bit 1: ratio
+    # in C,D x0.001), B bits 7-4 = actual gear (0 = park/neutral, 1..n). The 2022
+    # Taos answers A=01 and only fills B (01 00 00 00 in Park, 01 30 00 00 in 3rd
+    # at 32 km/h; C,D stay 0000 for the whole drive), so the ratio is never the
+    # gear here. A ratio-only ECU (A bit 0 clear) is a miss, not a gear.
+    if not _b(h, 0) & 0x01:
+        raise ValueError("A4 gear status not supported: %r" % h)
+    return _b(h, 1) >> 4
 
 
 def _odometer_a6(h):

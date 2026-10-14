@@ -182,7 +182,7 @@ mirror it or every boot republishes the pre-NTP window under a wrong time.
 | adapter_voltage | ATRV | V |
 | run_time | 1F | s |
 | odometer | A6 | km |
-| gear | A4 (C,D / 1000; 0 = park/neutral) | — |
+| gear | A4 (B bits 7-4 when A bit 0 is set; 0 = park/neutral, 1..n; C,D ratio ignored, ratio-only ECU = miss) | — |
 | distance_since_clear | 31 | km |
 | mil | 01 bit A7 | 0/1 |
 | dtc_count | 01 A & 0x7F | — |

@@ -187,6 +187,9 @@ mirror it or every boot republishes the pre-NTP window under a wrong time.
 | mil | 01 bit A7 | 0/1 |
 | dtc_count | 01 A & 0x7F | — |
 | link | — | 0 none, 1 adapter only, 2 ECU answering |
+| engine_torque_pct | 62 (A − 125; −125..130, negative = engine braking) | % |
+| reference_torque | 63 (A×256 + B) | Nm |
+| engine_torque | derived: pct / 100 × reference (0.1 Nm), only when 62 and 63 both answered in the SAME cycle; requesting it alone polls 62+63 and emits only the Nm value | Nm |
 
 ## 5. Env (phase 1, now the fallback) and the `xorgate status` line
 

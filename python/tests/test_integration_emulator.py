@@ -68,6 +68,12 @@ class EmulatorLifecycleTests(unittest.TestCase):
             self.assertEqual(s["fields"]["intake_temp"], 38)
             self.assertEqual(s["fields"]["odometer"], 47318.8)
             self.assertAlmostEqual(s["fields"]["fuel_level"], 76.86, places=2)
+            # torque: PID 62 '41 62 84' + PID 63 '41 63 01 18' (survey frames)
+            self.assertEqual(s["fields"]["engine_torque_pct"], 7)
+            self.assertEqual(s["fields"]["reference_torque"], 280)
+            self.assertEqual(s["fields"]["engine_torque"], 19.6)
+        for f in ("engine_torque_pct", "reference_torque", "engine_torque"):
+            self.assertIn(f, profile["supported_fields"])
         states = [l["state"] for l in _by_type(lines, "status")]
         self.assertEqual(states[-1], "stopped")
         self.assertIn("live", states)
@@ -129,6 +135,19 @@ class EmulatorLifecycleTests(unittest.TestCase):
         self.assertNotIn("01051", inv)
         self.assertIn("01421", inv)   # PID 42 still polled for the voltage policy
         self.assertIn("bogus", err)
+
+    def test_derived_torque_alone_polls_62_63_and_emits_only_nm(self):
+        code, lines, err = self._run("taos-2022", 8.0, extra=["--fields", "rpm,engine_torque"],
+                                     until=lambda ls: len(_by_type(ls, "sample")) >= 2)
+        self.assertEqual(code, 0, err)
+        profile = _by_type(lines, "profile")[0]
+        self.assertEqual(profile["supported_fields"], ["rpm", "engine_torque", "link"])
+        for sample in _by_type(lines, "sample"):
+            self.assertEqual(set(sample["fields"]), {"rpm", "engine_torque", "link"})
+            self.assertEqual(sample["fields"]["engine_torque"], 19.6)
+        inv = _by_type(lines, "audit")[-1]["inventory"]
+        self.assertIn("01621", inv)
+        self.assertIn("01631", inv)
 
     def test_unsupported_pid_answering_no_data_is_dropped(self):
         code, lines, err = self._run("taos-2022-nodata2f", 9.0,

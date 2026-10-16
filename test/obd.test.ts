@@ -269,6 +269,24 @@ describe("createObdCollector", () => {
     expect(JSON.stringify(fields)).not.toContain("null");
   });
 
+  it("maps the torque fields with %/Nm units, negative values included", async () => {
+    const h = fakeHelper();
+    const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });
+    await c.read();
+    h.feed(LINES.ready);
+    h.feed(LINES.profile);
+    h.feed(LINES.statusLive);
+    h.feed(
+      '{"type":"sample","ts":10,"fields":{"engine_torque_pct":-5,"reference_torque":280,"engine_torque":-14,"link":2}}',
+    );
+    expect(await c.read()).toEqual({
+      link: { value: 2 },
+      engine_torque_pct: { value: -5, unit: "%" },
+      reference_torque: { value: 280, unit: "Nm" },
+      engine_torque: { value: -14, unit: "Nm" },
+    });
+  });
+
   it("drops a stale sample (>= 5 s) but keeps link", async () => {
     const h = fakeHelper();
     const c = createObdCollector({ env: ENV, settings: () => undefined, spawn: h.spawn, onEvent });

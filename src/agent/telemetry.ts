@@ -138,6 +138,12 @@ export interface TelemetryMetrics {
     mil?: MetricLeaf;
     /** PID 01 A & 0x7F. */
     dtc_count?: MetricLeaf;
+    /** PID 62, % of reference torque (A - 125; negative = engine braking). */
+    engine_torque_pct?: MetricLeaf;
+    /** PID 63, Nm (engine reference torque, constant per engine). */
+    reference_torque?: MetricLeaf;
+    /** Derived, Nm = engine_torque_pct / 100 x reference_torque, same poll cycle only. */
+    engine_torque?: MetricLeaf;
   };
 }
 

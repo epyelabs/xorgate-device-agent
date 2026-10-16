@@ -31,7 +31,7 @@ import uuid
 
 from . import HELPER_VERSION
 from .allowlist import ALLOWLIST_SHA256
-from .decoders import FIELDS, DEFAULT_FIELDS, decode_field, plan_fields
+from .decoders import FIELDS, DEFAULT_FIELDS, apply_derived, decode_field, plan_fields
 from .gate import Gate, Forbidden, BudgetExceeded, StopCondition, LinkLost, new_counters
 from .isotp import isotp_reassemble, supported_bitmap, find_payload
 from .transport import TransportError, NoBluetooth, RfcommTransport, SerialTransport
@@ -709,6 +709,7 @@ class Session:
                     raise IdentityChanged("ATI %r != session %r" % (ati, self.identity["ati"]))
             if "adapter_voltage" in self.requested and self.adapter_voltage is not None:
                 fields["adapter_voltage"] = self.adapter_voltage
+            apply_derived(fields, self.requested)
             fields["link"] = 2
             self.emit({"type": "sample", "ts": round(time.time(), 3), "fields": fields})
             if self.counters["requests"] - req0 > cycle_budget:

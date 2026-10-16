@@ -58,6 +58,22 @@ def _odometer_a6(h):
     return round(int(h[:8], 16) / 10, 1)
 
 
+def _torque_pct_62(h):
+    # PID 62 (J1979): actual engine - percent torque, A - 125 (-125..130 %);
+    # negative while the engine is driven (engine braking). Taos idle: 84 -> 7.
+    return _b(h, 0) - 125
+
+
+def _reference_torque_63(h):
+    # PID 63: engine reference torque, A*256 + B Nm. Taos: 01 18 -> 280.
+    return _u16(h)
+
+
+def _engine_torque(pct, reference):
+    """Derived engine torque, Nm = pct / 100 * reference (0.1 Nm)."""
+    return round(pct * reference / 100.0, 1)
+
+
 def _mil(h):
     return 1 if _b(h, 0) & 0x80 else 0
 
@@ -67,12 +83,14 @@ def _dtc_count(h):
 
 
 class FieldSpec:
-    __slots__ = ("name", "unit", "pids", "decoders", "source")
+    __slots__ = ("name", "unit", "pids", "decoders", "source", "inputs", "derive")
 
-    def __init__(self, name, unit, pids=(), decoders=None, source="pid"):
+    def __init__(self, name, unit, pids=(), decoders=None, source="pid", inputs=(), derive=None):
         self.name, self.unit, self.pids = name, unit, tuple(pids)
         self.decoders = decoders or {}
-        self.source = source   # "pid" | "atrv" | "link"
+        self.source = source   # "pid" | "atrv" | "link" | "derived"
+        # "derived": computed from other PID fields of the SAME poll cycle
+        self.inputs, self.derive = tuple(inputs), derive
 
 
 FIELDS = OrderedDict()
@@ -98,11 +116,17 @@ for _spec in (
     FieldSpec("mil", "", ["01"], {"01": _mil}),
     FieldSpec("dtc_count", "", ["01"], {"01": _dtc_count}),
     FieldSpec("link", "", source="link"),
+    # torque (POST_INTEGRATION 2026-10-16), after link like the cloud vocabulary
+    FieldSpec("engine_torque_pct", "%", ["62"], {"62": _torque_pct_62}),
+    FieldSpec("reference_torque", "Nm", ["63"], {"63": _reference_torque_63}),
+    FieldSpec("engine_torque", "Nm", source="derived",
+              inputs=("engine_torque_pct", "reference_torque"), derive=_engine_torque),
 ):
     FIELDS[_spec.name] = _spec
 
 DEFAULT_FIELDS = tuple(FIELDS.keys())
 POLL_FIELDS = tuple(n for n, s in FIELDS.items() if s.source == "pid")
+DERIVED_FIELDS = tuple(n for n, s in FIELDS.items() if s.source == "derived")
 
 
 def decode_field(name, pid, data_hex):
@@ -114,12 +138,18 @@ def decode_field(name, pid, data_hex):
     return value
 
 
+def _pid_for(spec, supported_pids):
+    return next((p for p in spec.pids if p in supported_pids), None)
+
+
 def plan_fields(requested, supported_pids):
     """Split requested field names into supported / unsupported and build the
     poll plan: OrderedDict pid -> [field names decoded from that PID].
 
     `supported_pids` is the set of PID strings ("0C") any ECU advertised.
-    Unknown names are ignored by the caller (they are not fields).
+    Unknown names are ignored by the caller (they are not fields). A derived
+    field is supported when every input's PID is; its inputs are then polled
+    even when not requested themselves (`apply_derived` strips them again).
     """
     supported, unsupported = [], []
     plan = OrderedDict()
@@ -130,10 +160,46 @@ def plan_fields(requested, supported_pids):
         if spec.source in ("atrv", "link"):
             supported.append(name)
             continue
-        pid = next((p for p in spec.pids if p in supported_pids), None)
+        if spec.source == "derived":
+            pids = [(i, _pid_for(FIELDS[i], supported_pids)) for i in spec.inputs]
+            if any(p is None for _, p in pids):
+                unsupported.append(name)
+                continue
+            supported.append(name)
+            for inp, pid in pids:
+                names = plan.setdefault(pid, [])
+                if inp not in names:
+                    names.append(inp)
+            continue
+        pid = _pid_for(spec, supported_pids)
         if pid is None:
             unsupported.append(name)
             continue
         supported.append(name)
-        plan.setdefault(pid, []).append(name)
+        names = plan.setdefault(pid, [])
+        if name not in names:
+            names.append(name)
     return supported, unsupported, plan
+
+
+def apply_derived(fields, requested):
+    """Add every requested derived field whose inputs all decoded in THIS
+    cycle's `fields`, then drop inputs polled only for a derivation (not
+    requested). Mutates and returns `fields`. A missing input is a miss for
+    the derived field (never a stale or guessed value)."""
+    for name in requested:
+        spec = FIELDS.get(name)
+        if spec is None or spec.source != "derived":
+            continue
+        if all(i in fields for i in spec.inputs):
+            try:
+                value = spec.derive(*(fields[i] for i in spec.inputs))
+            except (ValueError, ArithmeticError):
+                continue
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            fields[name] = value
+    for name in list(fields):
+        if name not in requested and FIELDS.get(name) is not None and FIELDS[name].source == "pid":
+            del fields[name]
+    return fields

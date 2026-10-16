@@ -98,6 +98,9 @@ export const OBD_FIELD_UNITS: Readonly<Record<string, string>> = {
   run_time: "s",
   odometer: "km",
   distance_since_clear: "km",
+  engine_torque_pct: "%",
+  reference_torque: "Nm",
+  engine_torque: "Nm",
 };
 
 /** Supervisor-side states, beyond the helper's own (hardware/obd.ts). */

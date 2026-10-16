@@ -356,7 +356,9 @@ pattern as the IMU helper) and publishes `metrics.obd.*`: `link` (0 no adapter,
 `coolant_temp`, `engine_load`, `throttle`, `pedal`, `intake_temp`,
 `ambient_temp`, `intake_map`, `baro`, `fuel_level`, `fuel_rate`,
 `module_voltage`, `adapter_voltage`, `run_time`, `odometer`, `gear`,
-`distance_since_clear`, `mil`, `dtc_count`, each only when the car supports the
+`distance_since_clear`, `mil`, `dtc_count`, `engine_torque_pct` (PID 62, %),
+`reference_torque` (PID 63, Nm) and the derived `engine_torque` (Nm, only when
+both answered in the same cycle), each only when the car supports the
 PID and the helper's last sample is under 5 s old (never a null leaf). Without
 the block nothing changes. The helper owns the one allowlist gate every byte to
 the car passes through, its own reconnect backoff, and the append-only audit log

@@ -460,6 +460,11 @@ function ObdDetail({ snapshot }: DetailProps) {
             {leaf(m.ambient_temp, 0)}
           </Text>
           <Text>
+            <Text color="gray">torque </Text>
+            {leaf(m.engine_torque, 1)} · {leaf(m.engine_torque_pct, 0)} of{" "}
+            {leaf(m.reference_torque, 0)}
+          </Text>
+          <Text>
             <Text color="gray">fuel   </Text>
             {leaf(m.fuel_level, 1)} · rate {leaf(m.fuel_rate, 2)}
           </Text>

@@ -14,7 +14,14 @@
  */
 import { LedDriver } from "../hardware/led.js";
 import { readModemTelemetry } from "../hardware/modem.js";
-import { resolveLedState, rung, type LedSignals, type LedState } from "../lib/led-state.js";
+import {
+  encodeLedTelemetry,
+  resolveLedState,
+  rung,
+  type LedSignals,
+  type LedState,
+  type LedTelemetry,
+} from "../lib/led-state.js";
 
 /** How stale the cached LTE status may get before another read is kicked off. */
 const LTE_REFRESH_MS = 1000;
@@ -39,6 +46,12 @@ export class LedManager {
   private readonly log: (msg: string) => void;
 
   private current: LedState | null = null;
+  /**
+   * Last state the ladder resolved, and the signals it was resolved from —
+   * kept on EVERY host, LED or not (plans/include-led-status-in-telemetry D4):
+   * telemetry reports the device's state, not the light's. Never the overlay.
+   */
+  private resolved: { state: LedState; signals: LedSignals } | null = null;
   private overlayRunning = false;
   private stopped = false;
 
@@ -79,23 +92,48 @@ export class LedManager {
     this.render(rung("starting"));
   }
 
-  /** Called from the worker's 1 Hz loop. Re-renders only on a real change. */
+  /**
+   * Called from the worker's 1 Hz loop. Resolves the state on every host (the
+   * telemetry needs it even where there is no LED to drive), then re-renders
+   * only on a real change and only when there is hardware to render to.
+   */
   tick(): void {
-    if (this.stopped || !this.driver.available) return;
-    // The overlay owns the LED until its flashes finish; a state change during
-    // it is picked up by the re-render that follows.
-    if (this.overlayRunning) return;
+    if (this.stopped) return;
     void this.refreshLte();
     let next: LedState;
+    let signals: LedSignals;
     try {
-      next = resolveLedState({ ...this.signals(), lte: this.lte });
+      signals = { ...this.signals(), lte: this.lte };
+      next = resolveLedState(signals);
     } catch (err) {
       // Fail open (README principle 1): a signal-gathering bug must not light
-      // red and must not take the worker down with it.
+      // red and must not take the worker down with it. The last resolved state
+      // is held for telemetry too.
       this.log(`signal read failed, holding: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
+    this.resolved = { state: next, signals };
+    // Hardware gate: inert driver (dev box, CM4 without a status LED, replay
+    // container) stops here, after the state is known.
+    if (!this.driver.available) return;
+    // The overlay owns the LED until its flashes finish; a state change during
+    // it is picked up by the re-render that follows.
+    if (this.overlayRunning) return;
     this.render(next);
+  }
+
+  /**
+   * The last resolved state and its inputs, or null before the first tick.
+   * The config-applied overlay never appears here: it is a flash over the
+   * state, and telemetry reports the state underneath.
+   */
+  snapshot(): { state: LedState; signals: LedSignals } | null {
+    return this.resolved;
+  }
+
+  /** `system.led_state` / `system.health_flags` for the last tick, or null before the first. */
+  telemetry(): LedTelemetry | null {
+    return this.resolved ? encodeLedTelemetry(this.resolved.state, this.resolved.signals) : null;
   }
 
   /**

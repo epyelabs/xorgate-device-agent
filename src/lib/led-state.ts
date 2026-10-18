@@ -197,3 +197,97 @@ export function resolveLedState(s: LedSignals): LedState {
 
   return state("healthy");
 }
+
+// ---------------------------------------------------------------------------
+// Telemetry encoding (plans/include-led-status-in-telemetry, D2/D3).
+//
+// FROZEN CONTRACT: the core service, @xorgate/react, xorgate-web, alocate-web
+// and alocate-mobile all decode these two numbers. Never renumber; only append.
+//
+// RUST-PORT: telemetry type seam — `system.led_state` / `system.health_flags`
+// were added after the parity pin (JS 89b5c64); port with the js-to-rust
+// catch-up, alongside the Phase 4 LED manager.
+// ---------------------------------------------------------------------------
+
+/**
+ * `system.led_state` — a SEVERITY-ASCENDING code, deliberately NOT the ladder's
+ * `pri` numbering (which is precedence, descending). Ascending means `max` is
+ * the right bucket aggregate ("worst state in the bucket") and `> 0` means
+ * "struggling", the same convention as `lte.gnss_health`.
+ *
+ * Keyed by `LedState.reason`. `config-applied` is absent on purpose: it is a
+ * ~0.5 s overlay, not a state, and telemetry reports the state underneath it.
+ * `agent-down` (6) is reserved — painted by systemd after a crash, so the agent
+ * can never observe itself in it; the cloud may synthesise it.
+ */
+export const LED_STATE_CODES: Readonly<Record<string, number>> = Object.freeze({
+  healthy: 0,
+  starting: 1,
+  "gps-wait": 2,
+  network: 3,
+  thermal: 4,
+  undervoltage: 5,
+  "agent-down": 6,
+});
+
+/**
+ * `system.health_flags` — bitmask of the RAW inputs the ladder sees, so the
+ * conditions a first-match-wins ladder collapses stay visible (a network outage
+ * hides an unfixed GPS; a power shed hides the GPS gate). Several bits may be
+ * set while `led_state` shows only one state. Values are the bit's mask.
+ */
+export const HEALTH_FLAG_BITS = Object.freeze({
+  /** `recording.liveBlock.reason === "undervoltage"`. */
+  undervoltage: 1 << 0,
+  /** `recording.liveBlock.reason === "thermal"`. */
+  thermal: 1 << 1,
+  /** LTE daemon status `disconnected` or `connecting`. */
+  lte_down: 1 << 2,
+  /** Cloud (MQTT) link not `connected`. */
+  mqtt_down: 1 << 3,
+  /** GNSS receiver present and without a fix (`gnss: null` = no receiver = clear). */
+  gps_no_fix: 1 << 4,
+  /** `recording.liveBlock.reason === "gps-gate"`. */
+  gps_gate_hold: 1 << 5,
+  /** LTE daemon status `dead_zone` (a settled verdict: suppresses the network rung). */
+  dead_zone: 1 << 6,
+  /** `recording.powerShed` is set (any stage, any cause). */
+  power_shed: 1 << 7,
+  /** `recording.liveBlock` is present (any reason, including ones we do not know). */
+  live_block: 1 << 8,
+} as const);
+
+export interface LedTelemetry {
+  led_state: number;
+  health_flags: number;
+}
+
+/**
+ * Encode a resolved state plus the signals it was resolved from as the two
+ * numeric telemetry leaves. Pure. The flags are read from the same inputs the
+ * ladder consumed — no new facts are derived here (see the doctrine at the top
+ * of this file).
+ *
+ * An unknown reason (only possible via a typo or a future rung this build does
+ * not know) encodes as 0 — fail open, like the ladder itself.
+ */
+export function encodeLedTelemetry(state: LedState, s: LedSignals): LedTelemetry {
+  const led_state = LED_STATE_CODES[state.reason] ?? 0;
+
+  const block = s.recording?.liveBlock;
+  const blockReason = typeof block?.reason === "string" ? block.reason : null;
+  const lteStatus = typeof s.lte?.status === "string" ? s.lte.status : null;
+
+  let flags = 0;
+  if (blockReason === "undervoltage") flags |= HEALTH_FLAG_BITS.undervoltage;
+  if (blockReason === "thermal") flags |= HEALTH_FLAG_BITS.thermal;
+  if (lteStatus === "disconnected" || lteStatus === "connecting") flags |= HEALTH_FLAG_BITS.lte_down;
+  if (s.connection !== "connected") flags |= HEALTH_FLAG_BITS.mqtt_down;
+  if (s.gnss != null && s.gnss.fix === false) flags |= HEALTH_FLAG_BITS.gps_no_fix;
+  if (blockReason === "gps-gate") flags |= HEALTH_FLAG_BITS.gps_gate_hold;
+  if (lteStatus === "dead_zone") flags |= HEALTH_FLAG_BITS.dead_zone;
+  if (typeof s.recording?.powerShed === "string") flags |= HEALTH_FLAG_BITS.power_shed;
+  if (block != null && typeof block === "object") flags |= HEALTH_FLAG_BITS.live_block;
+
+  return { led_state, health_flags: flags };
+}

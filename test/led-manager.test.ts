@@ -251,11 +251,71 @@ describe("LedManager", () => {
     expect(logs.some((l) => l.includes("→ healthy"))).toBe(true);
   });
 
-  it("never calls the signal function when inert — no wasted work", async () => {
+  it("still resolves the state when inert, for telemetry — but never touches a pin", async () => {
+    // plans/include-led-status-in-telemetry D4: CM4 kits, dev boxes and replay
+    // containers have no LED, yet the state is the device's, not the light's.
+    let signals = healthy({ gnss: { fix: false, sky: "open" } });
+    const { led, writes } = harness(() => signals, false);
+    await led.start();
+    expect(led.telemetry()).toBeNull(); // nothing resolved before the first tick
+    led.tick();
+    await settle();
+    expect(led.snapshot()?.state.reason).toBe("gps-wait");
+    expect(led.telemetry()).toEqual({ led_state: 2, health_flags: 16 });
+
+    signals = healthy({ connection: "closed" });
+    led.tick();
+    await settle();
+    expect(led.telemetry()).toEqual({ led_state: 3, health_flags: 8 });
+    expect(writes).toEqual([]);
+  });
+
+  it("telemetry carries the LTE status the manager read for itself", async () => {
+    const { led } = harness(() => healthy(), false, async () => ({ status: "disconnected" }));
+    await led.start();
+    led.tick(); // kicks off the read
+    await settle(30);
+    led.tick(); // resolves with it
+    expect(led.telemetry()).toEqual({ led_state: 3, health_flags: 4 });
+  });
+
+  it("the config-applied overlay never shows in telemetry; the state underneath does", async () => {
+    let signals = healthy();
+    const { led } = harness(() => signals);
+    await led.start();
+    await settle();
+    led.tick();
+    expect(led.telemetry()).toEqual({ led_state: 0, health_flags: 0 });
+    led.configApplied();
+    // A change during the flash is resolved (telemetry follows) even though
+    // the pins stay with the overlay until it ends.
+    signals = healthy({ connection: "closed" });
+    led.tick();
+    expect(led.snapshot()?.state.reason).toBe("network");
+    expect(led.telemetry()).toEqual({ led_state: 3, health_flags: 8 });
+    await settle(700);
+  });
+
+  it("holds the last resolved telemetry when signal gathering throws", async () => {
+    let boom = false;
+    const { led } = harness(() => {
+      if (boom) throw new Error("collector exploded");
+      return healthy({ gnss: { fix: false, sky: "open" } });
+    }, false);
+    await led.start();
+    led.tick();
+    boom = true;
+    led.tick();
+    expect(led.telemetry()).toEqual({ led_state: 2, health_flags: 16 });
+  });
+
+  it("stops resolving after stop()", async () => {
     const signals = vi.fn(() => healthy());
     const { led } = harness(signals, false);
     await led.start();
+    led.stop();
     led.tick();
     expect(signals).not.toHaveBeenCalled();
+    expect(led.telemetry()).toBeNull();
   });
 });

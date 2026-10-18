@@ -788,6 +788,24 @@ ExecStopPost=-/usr/local/bin/xorgate led exit-state  # $SERVICE_RESULT: clean st
 
 Both are `-` prefixed so a failing LED can never stop the agent.
 
+### LED state in telemetry
+
+Every live payload and every recorded `system` sample (1 Hz) carries two
+unit-less numeric leaves in the `system` group
+(plans/include-led-status-in-telemetry):
+
+| Leaf | Meaning |
+|---|---|
+| `system.led_state` | severity-ascending code: 0 healthy, 1 starting, 2 gps_wait, 3 network, 4 thermal, 5 undervoltage, 6 agent_down (reserved, never emitted by the agent). NOT the ladder's `pri`. The config-applied flash is an overlay and is never reported. |
+| `system.health_flags` | bitmask of the raw ladder inputs: 1 undervoltage, 2 thermal, 4 lte_down, 8 mqtt_down, 16 gps_no_fix, 32 gps_gate_hold, 64 dead_zone, 128 power_shed, 256 live_block. Several bits can be set while `led_state` shows one state. |
+
+Tables + encoder: `LED_STATE_CODES`, `HEALTH_FLAG_BITS`, `encodeLedTelemetry`
+in `src/lib/led-state.ts`; merged in the worker by `src/agent/led-telemetry.ts`
+(not in `createCollector`). The state is resolved on every host, LED or not
+(CM4, dev box); only the pin writes are gated. Simulator: always `0 / 0`.
+Replay: the recorded `system.*` passes through untouched. Check on a device:
+`jq '.latest.metrics.system | {led_state, health_flags}' /var/lib/xorgate/state.json`.
+
 ## Audio (I2S mic) — present on the board, not used
 
 The Argus carrier has an input-only I2S MEMS microphone (GPIO18/19/20), but

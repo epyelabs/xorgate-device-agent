@@ -57,6 +57,13 @@ import { s3Put } from "./recording/s3-put.js";
 import { RecordingManager, type RecordingUploadOptions } from "./recording/manager.js";
 import { LedManager } from "./agent/led-manager.js";
 import { LedDriver } from "./hardware/led.js";
+import type { LedTelemetry } from "./lib/led-state.js";
+import {
+  LED_TELEMETRY_SIM,
+  LED_TELEMETRY_STARTING,
+  withLedLeaves,
+  withLedSampleGroups,
+} from "./agent/led-telemetry.js";
 import {
   hardwareBlocksEqual,
   loadHardwareBlock,
@@ -357,6 +364,20 @@ const source: {
         };
       })();
 
+/**
+ * LED state for telemetry (plans/include-led-status-in-telemetry, D4): the two
+ * `system` leaves ride every live and recorded sample. Real mode reads the LED
+ * manager (which resolves on every host, LED or not); the simulator is always
+ * healthy; replay passes the recorded `system.*` through untouched (null).
+ * The manager is created further down, so it is late-bound here.
+ */
+let ledTelemetrySource: (() => LedTelemetry | null) | null = null;
+function ledTelemetryNow(): LedTelemetry | null {
+  if (config.mode === "real") return ledTelemetrySource?.() ?? LED_TELEMETRY_STARTING;
+  if (replay) return null;
+  return LED_TELEMETRY_SIM;
+}
+
 const now0 = Date.now();
 
 // When launched directly (e.g. by systemd's `node dist/worker.js`) rather than
@@ -519,7 +540,8 @@ const recording = new RecordingManager({
   // A telemetry session minted on an untrusted clock gets a wrong UUIDv7 and
   // header time (the 13 h session 01a137b5); hold the recorder until trusted.
   clockTrusted: () => clockTrust?.trusted() ?? true,
-  sampleGroups: () => source.sampleGroups(),
+  // The LED leaves join the `system` group here, not in createCollector.
+  sampleGroups: async () => withLedSampleGroups(await source.sampleGroups(), ledTelemetryNow()),
   // ~1 Hz power reading for the shed policy — the system collector's cached
   // sampler, so the recorder and the shedder share one vcgencmd stream.
   // Absent in sim mode (no real power to measure → shedding inert).
@@ -670,6 +692,7 @@ const led = new LedManager({
 // startup must never wait on — or be blocked by — an indicator light. Ticks
 // before it resolves are no-ops (the driver reports unavailable).
 void led.start().catch(() => {});
+ledTelemetrySource = () => led.telemetry();
 
 // Heartbeat: while not yet connected (or reconnecting/closed), force a state
 // flush so a healthy-but-still-connecting daemon never shows as "stale".
@@ -1353,7 +1376,8 @@ client.on("connect", () => {
         deviceId: config.deviceId,
         ts,
         seq: seq++,
-        metrics,
+        // `system.led_state` / `system.health_flags` on every live sample.
+        metrics: withLedLeaves(metrics, ledTelemetryNow()),
         media: {
           ...media,
           recording: { value: video.recording },

@@ -81,6 +81,22 @@ export interface TelemetryMetrics {
     rail_5v?: MetricLeaf;
     /** PSU max current negotiated at boot (mA): 5000 on a 5V/5A PD supply, 3000 otherwise. */
     psu_max_current?: MetricLeaf;
+    /**
+     * Status-LED state as a severity-ascending code (no unit):
+     * 0 healthy · 1 starting · 2 gps_wait · 3 network · 4 thermal ·
+     * 5 undervoltage · 6 agent_down (reserved, never emitted by the agent).
+     * Merged in by the worker, NOT the system collector, on every live and
+     * recorded sample — also on hosts with no LED. Table: LED_STATE_CODES.
+     *
+     * RUST-PORT: telemetry type seam — added after the parity pin (89b5c64).
+     */
+    led_state?: MetricLeaf;
+    /**
+     * Bitmask of the raw inputs the LED ladder saw (no unit): 1 undervoltage ·
+     * 2 thermal · 4 lte_down · 8 mqtt_down · 16 gps_no_fix · 32 gps_gate_hold ·
+     * 64 dead_zone · 128 power_shed · 256 live_block. Table: HEALTH_FLAG_BITS.
+     */
+    health_flags?: MetricLeaf;
   };
   /**
    * OBD2 vehicle data (obd2-bluetooth-integration P1, plan D4): standard Mode
